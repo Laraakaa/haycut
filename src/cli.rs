@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::commands;
@@ -32,10 +32,27 @@ pub enum Commands {
 
     /// Run a command and capture trace information
     Trace {
+        /// Compactor to use for prompt-facing output
+        #[arg(long, value_enum)]
+        compactor: Option<CompactorMode>,
+
         /// Command and arguments to run
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
     },
+
+    /// Show context reduction information for captured runs
+    Report {
+        /// Report on the most recent run
+        #[arg(long)]
+        last: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompactorMode {
+    Native,
+    Rtk,
 }
 
 pub fn run() -> i32 {
@@ -50,7 +67,10 @@ impl Cli {
                 commands::init::run(force);
                 0
             }
-            Some(Commands::Trace { command }) => commands::trace::run(command),
+            Some(Commands::Trace { compactor, command }) => {
+                commands::trace::run(command, compactor)
+            }
+            Some(Commands::Report { last }) => commands::report::run(last),
             None => 0,
         }
     }

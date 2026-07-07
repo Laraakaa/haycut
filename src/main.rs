@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod compactor;
 mod config;
 
 fn main() {
