@@ -1,6 +1,6 @@
 use std::{
     env, fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -15,6 +15,7 @@ use crate::{
         CompactPacket, CompactionInput, NativeHeuristicCompactor, OutputCompactor, RtkCompactor,
     },
     config::Config,
+    store::{self, NewArtifact, NewRun, RUN_STORE_PATH},
 };
 
 const ARTIFACT_ROOT: &str = ".haycut/runs";
@@ -83,7 +84,14 @@ pub fn run(command: Vec<String>, compactor: Option<CompactorMode>) -> i32 {
         Ok(trace) => {
             match store_artifacts(&trace) {
                 Ok(mut artifacts) => match compact_trace(&trace, &mut artifacts, compactor) {
-                    Ok(packet) => print_trace(&trace, &artifacts, &packet),
+                    Ok(packet) => {
+                        if let Err(error) = store_run(&trace, &artifacts, &packet) {
+                            eprintln!("Error storing trace run: {error}");
+                            return 1;
+                        }
+
+                        print_trace(&trace, &artifacts, &packet);
+                    }
                     Err(error) => {
                         eprintln!("Error compacting trace output: {error}");
                         return 1;
@@ -241,6 +249,95 @@ fn store_compact_packet(
     fs::write(&artifacts.compact_json, json)?;
 
     Ok(())
+}
+
+fn store_run(
+    trace: &CommandTrace,
+    artifacts: &ArtifactPaths,
+    packet: &CompactPacket,
+) -> io::Result<()> {
+    store_run_in(trace, artifacts, packet, Path::new(RUN_STORE_PATH))
+}
+
+fn store_run_in(
+    trace: &CommandTrace,
+    artifacts: &ArtifactPaths,
+    packet: &CompactPacket,
+    db_path: &Path,
+) -> io::Result<()> {
+    let manifest = RunManifest::load(&artifacts.run_json)?;
+    let token_estimate = estimate_raw_tokens(trace);
+    let mut artifact_rows = vec![
+        new_artifact(&manifest.id, "run_manifest", &artifacts.run_json, None),
+        new_artifact(
+            &manifest.id,
+            "stdout",
+            &artifacts.stdout,
+            Some(to_i64(token_estimate.stdout, "stdout token estimate")?),
+        ),
+        new_artifact(
+            &manifest.id,
+            "stderr",
+            &artifacts.stderr,
+            Some(to_i64(token_estimate.stderr, "stderr token estimate")?),
+        ),
+        new_artifact(
+            &manifest.id,
+            "compact_json",
+            &artifacts.compact_json,
+            Some(to_i64(packet.packet_tokens, "packet token estimate")?),
+        ),
+    ];
+
+    if let Some(compact_text) = artifacts.compact_text.as_deref() {
+        artifact_rows.push(new_artifact(
+            &manifest.id,
+            "compact_text",
+            compact_text,
+            Some(to_i64(packet.packet_tokens, "packet token estimate")?),
+        ));
+    }
+
+    store::insert_run(
+        db_path,
+        &NewRun {
+            id: &manifest.id,
+            command: &manifest.command,
+            cwd: &manifest.cwd,
+            exit_code: Some(manifest.exit_code),
+            duration_ms: to_i64(manifest.duration_ms, "duration")?,
+            raw_tokens: to_i64(manifest.estimated_raw_tokens, "raw token estimate")?,
+            packet_tokens: to_i64(packet.packet_tokens, "packet token estimate")?,
+            created_at: &manifest.created_at.to_rfc3339(),
+            artifacts: artifact_rows,
+        },
+    )
+}
+
+fn new_artifact(
+    run_id: &str,
+    kind: &'static str,
+    path: &Path,
+    estimated_tokens: Option<i64>,
+) -> NewArtifact<'static> {
+    NewArtifact {
+        id: format!("{run_id}:{kind}"),
+        kind,
+        path: path.display().to_string(),
+        estimated_tokens,
+    }
+}
+
+fn to_i64<T>(value: T, label: &str) -> io::Result<i64>
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} does not fit in SQLite integer"),
+        )
+    })
 }
 
 fn run_id(start_time: DateTime<Utc>) -> String {
@@ -437,6 +534,68 @@ mod tests {
         assert_eq!(manifest.stdout_bytes, trace.stdout.len());
         assert_eq!(manifest.stderr_bytes, trace.stderr.len());
         assert_eq!(manifest.estimated_raw_tokens, 2);
+
+        fs::remove_dir_all(artifact_root).expect("test artifacts should be removed");
+    }
+
+    #[test]
+    fn stores_completed_run_in_sqlite() {
+        let trace = CommandTrace {
+            command: "test-command".to_string(),
+            args: vec!["--flag".to_string()],
+            start_time: Utc::now(),
+            duration: Duration::from_millis(42),
+            exit_code: 3,
+            stdout: b"abcdefgh".to_vec(),
+            stderr: b"abcd".to_vec(),
+            working_directory: env::current_dir().expect("current directory should exist"),
+        };
+        let artifact_root = env::temp_dir().join(format!(
+            "haycut-sqlite-artifacts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let db_path = artifact_root.join("haycut.sqlite3");
+        let artifacts = store_artifacts_in(&trace, &artifact_root).expect("artifacts should store");
+        let packet = CompactPacket {
+            compactor: "native".to_string(),
+            rtk_version: None,
+            command: "test-command".to_string(),
+            exit_code: 3,
+            duration_ms: 42,
+            failed: true,
+            stdout_artifact: artifacts.stdout.display().to_string(),
+            stderr_artifact: artifacts.stderr.display().to_string(),
+            compact_artifact: None,
+            raw_stdout_tokens: 2,
+            raw_stderr_tokens: 1,
+            raw_tokens: 3,
+            packet_tokens: 2,
+            preserved_items: Vec::new(),
+            omitted_items: Vec::new(),
+            notes: Vec::new(),
+            compact_text: None,
+        };
+
+        store_run_in(&trace, &artifacts, &packet, &db_path).expect("run should store in SQLite");
+
+        let stored_run = crate::store::latest_run(&db_path).expect("latest run should load");
+        let manifest = RunManifest::load(&artifacts.run_json).expect("manifest should load");
+
+        assert_eq!(stored_run.id, manifest.id);
+        assert_eq!(stored_run.command, "test-command --flag");
+        assert_eq!(stored_run.exit_code, Some(3));
+        assert_eq!(stored_run.raw_tokens, Some(3));
+        assert_eq!(stored_run.packet_tokens, Some(2));
+        assert_eq!(
+            stored_run
+                .artifact_path("run_manifest")
+                .expect("run manifest artifact should exist"),
+            artifacts.run_json.display().to_string()
+        );
 
         fs::remove_dir_all(artifact_root).expect("test artifacts should be removed");
     }

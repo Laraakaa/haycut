@@ -6,9 +6,8 @@ use std::{
 use crate::{
     commands::trace::RunManifest,
     compactor::{CompactPacket, PreservedKind},
+    store::{self, RUN_STORE_PATH},
 };
-
-const ARTIFACT_ROOT: &str = ".haycut/runs";
 
 pub fn run(last: bool) -> i32 {
     if !last {
@@ -16,7 +15,7 @@ pub fn run(last: bool) -> i32 {
         return 2;
     }
 
-    match load_last_report(Path::new(ARTIFACT_ROOT)) {
+    match load_last_report(Path::new(RUN_STORE_PATH)) {
         Ok(report) => {
             print_report(&report);
             0
@@ -36,9 +35,19 @@ struct Report {
 }
 
 fn load_last_report(root: &Path) -> io::Result<Report> {
-    let run_directory = latest_run_directory(root)?;
-    let manifest = RunManifest::load(&run_directory.join("run.json"))?;
-    let compact_path = run_directory.join(&manifest.compact);
+    let stored_run = store::latest_run(root)?;
+    let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
+    let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
+    let run_directory = run_json_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run manifest has no parent directory",
+            )
+        })?;
+    let manifest = RunManifest::load(&run_json_path)?;
     let compact_contents = fs::read_to_string(&compact_path)?;
     let packet = serde_json::from_str(&compact_contents).map_err(|error| {
         io::Error::new(
@@ -52,26 +61,6 @@ fn load_last_report(root: &Path) -> io::Result<Report> {
         manifest,
         packet,
     })
-}
-
-fn latest_run_directory(root: &Path) -> io::Result<PathBuf> {
-    fs::read_dir(root)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_dir() {
-                Some(entry.path())
-            } else {
-                None
-            }
-        })
-        .max_by_key(|path| path.file_name().map(|name| name.to_os_string()))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no runs found in {}", root.display()),
-            )
-        })
 }
 
 fn print_report(report: &Report) {
@@ -160,18 +149,41 @@ mod tests {
 
     use super::*;
     use crate::compactor::{OmittedItem, OutputSource, PreservedItem};
+    use crate::store::{NewArtifact, NewRun, insert_run};
 
     #[test]
-    fn finds_latest_run_directory_by_run_id() {
-        let root = temp_run_root("latest-run");
-        fs::create_dir_all(root.join("2026-07-07T152900Z-111111"))
-            .expect("older run should be created");
-        let latest = root.join("2026-07-07T153000Z-a1b2c3");
-        fs::create_dir_all(&latest).expect("latest run should be created");
+    fn loads_last_report_from_sqlite() {
+        let root = temp_run_root("sqlite-last-run");
+        let older = root.join("older");
+        let latest = root.join("latest");
+        let db_path = root.join("haycut.sqlite3");
+        write_report_artifacts(&older, "older", "older command", 20)
+            .expect("older artifacts should be written");
+        write_report_artifacts(&latest, "newer", "newer command", 10)
+            .expect("newer artifacts should be written");
+        insert_report_run(
+            &db_path,
+            "older",
+            "older command",
+            "2026-07-07T15:29:00+00:00",
+            &older,
+        )
+        .expect("older run should insert");
+        insert_report_run(
+            &db_path,
+            "newer",
+            "newer command",
+            "2026-07-07T15:30:00+00:00",
+            &latest,
+        )
+        .expect("newer run should insert");
 
-        let found = latest_run_directory(&root).expect("latest run should be found");
+        let report = load_last_report(&db_path).expect("last report should load from SQLite");
 
-        assert_eq!(found, latest);
+        assert_eq!(report.run_directory, latest);
+        assert_eq!(report.manifest.id, "newer");
+        assert_eq!(report.manifest.command, "newer command");
+        assert_eq!(report.packet.packet_tokens, 10);
 
         fs::remove_dir_all(root).expect("test run root should be removed");
     }
@@ -251,5 +263,95 @@ mod tests {
                 .expect("system clock should be after Unix epoch")
                 .as_nanos()
         ))
+    }
+
+    fn write_report_artifacts(
+        run_directory: &Path,
+        id: &str,
+        command: &str,
+        packet_tokens: usize,
+    ) -> io::Result<()> {
+        fs::create_dir_all(run_directory)?;
+        let manifest = RunManifest {
+            id: id.to_string(),
+            command: command.to_string(),
+            args: Vec::new(),
+            cwd: "/tmp".to_string(),
+            exit_code: 0,
+            duration_ms: 42,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            estimated_raw_tokens: 100,
+            raw_stdout_tokens_estimated: 80,
+            raw_stderr_tokens_estimated: 20,
+            created_at: Utc::now(),
+            stdout: "stdout.txt".to_string(),
+            stderr: "stderr.txt".to_string(),
+            compact: "compact.json".to_string(),
+        };
+        let packet = CompactPacket {
+            compactor: "native".to_string(),
+            rtk_version: None,
+            command: command.to_string(),
+            exit_code: 0,
+            duration_ms: 42,
+            failed: false,
+            stdout_artifact: run_directory.join("stdout.txt").display().to_string(),
+            stderr_artifact: run_directory.join("stderr.txt").display().to_string(),
+            compact_artifact: None,
+            raw_stdout_tokens: 80,
+            raw_stderr_tokens: 20,
+            raw_tokens: 100,
+            packet_tokens,
+            preserved_items: Vec::new(),
+            omitted_items: Vec::new(),
+            notes: Vec::new(),
+            compact_text: None,
+        };
+
+        fs::write(
+            run_directory.join("run.json"),
+            serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
+        )?;
+        fs::write(
+            run_directory.join("compact.json"),
+            serde_json::to_string_pretty(&packet).map_err(io::Error::other)?,
+        )
+    }
+
+    fn insert_report_run(
+        db_path: &Path,
+        id: &str,
+        command: &str,
+        created_at: &str,
+        run_directory: &Path,
+    ) -> io::Result<()> {
+        insert_run(
+            db_path,
+            &NewRun {
+                id,
+                command,
+                cwd: "/tmp",
+                exit_code: Some(0),
+                duration_ms: 42,
+                raw_tokens: 100,
+                packet_tokens: 10,
+                created_at,
+                artifacts: vec![
+                    NewArtifact {
+                        id: format!("{id}:run_manifest"),
+                        kind: "run_manifest",
+                        path: run_directory.join("run.json").display().to_string(),
+                        estimated_tokens: None,
+                    },
+                    NewArtifact {
+                        id: format!("{id}:compact_json"),
+                        kind: "compact_json",
+                        path: run_directory.join("compact.json").display().to_string(),
+                        estimated_tokens: Some(10),
+                    },
+                ],
+            },
+        )
     }
 }
