@@ -1,7 +1,9 @@
 pub mod files;
 pub mod index;
 pub mod init;
+pub mod packet;
 pub mod read_symbol;
+pub mod read_window;
 pub mod report;
 pub mod runs;
 pub mod search;

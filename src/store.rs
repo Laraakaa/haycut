@@ -132,15 +132,31 @@ pub fn insert_run(db_path: &Path, run: &NewRun<'_>) -> io::Result<()> {
 }
 
 pub fn latest_run(db_path: &Path) -> io::Result<StoredRun> {
+    load_latest_run_where(db_path, "1 = 1", "no runs found in SQLite")
+}
+
+pub fn latest_failed_run(db_path: &Path) -> io::Result<StoredRun> {
+    load_latest_run_where(
+        db_path,
+        "exit_code IS NOT NULL AND exit_code != 0",
+        "no failed runs found in SQLite",
+    )
+}
+
+fn load_latest_run_where(
+    db_path: &Path,
+    where_clause: &str,
+    empty_message: &str,
+) -> io::Result<StoredRun> {
     let conn = open_migrated(db_path)?;
-    let mut statement = conn
-        .prepare(
-            "SELECT id, command, cwd, exit_code, duration_ms, raw_tokens, packet_tokens, created_at
-            FROM runs
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1",
-        )
-        .map_err(io::Error::other)?;
+    let query = format!(
+        "SELECT id, command, cwd, exit_code, duration_ms, raw_tokens, packet_tokens, created_at
+        FROM runs
+        WHERE {where_clause}
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1"
+    );
+    let mut statement = conn.prepare(&query).map_err(io::Error::other)?;
 
     let run = statement
         .query_row([], |row| {
@@ -158,7 +174,7 @@ pub fn latest_run(db_path: &Path) -> io::Result<StoredRun> {
         })
         .optional()
         .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no runs found in SQLite"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, empty_message))?;
 
     Ok(StoredRun {
         artifacts: load_artifacts(&conn, &run.id)?,

@@ -24,11 +24,11 @@ const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
 ];
 
 #[derive(Debug)]
-struct SymbolMatch {
-    path: String,
-    symbol: Symbol,
-    code: String,
-    estimated_tokens: usize,
+pub struct SymbolMatch {
+    pub path: String,
+    pub symbol: Symbol,
+    pub code: String,
+    pub estimated_tokens: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,7 +54,7 @@ pub fn run(target: String) -> i32 {
     }
 }
 
-fn read_symbol(root: &Path, target: &str) -> io::Result<SymbolMatch> {
+pub fn read_symbol(root: &Path, target: &str) -> io::Result<SymbolMatch> {
     let target = parse_target(target);
     let matches = find_symbol_matches(root, &target)?;
 

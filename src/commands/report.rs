@@ -4,18 +4,19 @@ use std::{
 };
 
 use crate::{
+    commands::read_symbol::{self, SymbolMatch},
     commands::trace::RunManifest,
     compactor::{CompactPacket, PreservedKind},
     store::{self, RUN_STORE_PATH},
 };
 
-pub fn run(last: bool) -> i32 {
+pub fn run(last: bool, symbols: Vec<String>) -> i32 {
     if !last {
         eprintln!("Error: report currently requires --last");
         return 2;
     }
 
-    match load_last_report(Path::new(RUN_STORE_PATH)) {
+    match load_last_report(Path::new(RUN_STORE_PATH), &symbols) {
         Ok(report) => {
             print_report(&report);
             0
@@ -32,9 +33,10 @@ struct Report {
     run_directory: PathBuf,
     manifest: RunManifest,
     packet: CompactPacket,
+    symbols: Vec<SymbolMatch>,
 }
 
-fn load_last_report(root: &Path) -> io::Result<Report> {
+fn load_last_report(root: &Path, symbol_targets: &[String]) -> io::Result<Report> {
     let stored_run = store::latest_run(root)?;
     let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
     let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
@@ -55,43 +57,108 @@ fn load_last_report(root: &Path) -> io::Result<Report> {
             format!("invalid compact packet {}: {error}", compact_path.display()),
         )
     })?;
+    let symbols = load_symbols(Path::new(&manifest.cwd), symbol_targets)?;
 
     Ok(Report {
         run_directory,
         manifest,
         packet,
+        symbols,
     })
 }
 
 fn print_report(report: &Report) {
-    let raw_stdout = report.packet.raw_stdout_tokens;
-    let raw_stderr = report.packet.raw_stderr_tokens;
-    let raw_total = report.packet.raw_tokens;
-    let packet_tokens = report.packet.packet_tokens;
+    print!("{}", evidence_packet(report));
+}
 
-    println!("Run: {}", report.manifest.id);
-    println!("Command: {}", report.manifest.command);
-    println!("Raw output:");
-    println!("  stdout: {} estimated tokens", format_count(raw_stdout));
-    println!("  stderr: {} estimated tokens", format_count(raw_stderr));
-    println!("  total: {} estimated tokens", format_count(raw_total));
-    println!("HayCut packet:");
-    println!("  {} estimated tokens", format_count(packet_tokens));
-    println!("Reduction:");
-    println!("  {:.1}%", reduction_percent(raw_total, packet_tokens));
-    println!("Full raw output:");
-    println!(
-        "  stdout: {}",
-        report.run_directory.join(&report.manifest.stdout).display()
-    );
-    println!(
-        "  stderr: {}",
-        report.run_directory.join(&report.manifest.stderr).display()
-    );
-    println!("Preserved:");
-    for item in preserved_summary(report) {
-        println!("  {item}");
+fn evidence_packet(report: &Report) -> String {
+    let packet_tokens = evidence_packet_tokens(report);
+    let raw_tokens_avoided = report.packet.raw_tokens.saturating_sub(packet_tokens);
+    let stdout_path = report.run_directory.join(&report.manifest.stdout);
+    let stderr_path = report.run_directory.join(&report.manifest.stderr);
+    let compact_path = report.run_directory.join(&report.manifest.compact);
+    let mut output = String::new();
+
+    output.push_str("EVIDENCE PACKET\n");
+    output.push_str(&format!("Run:      {}\n", report.manifest.id));
+    output.push_str(&format!(
+        "Command:  {}  exit code: {}\n",
+        report.manifest.command, report.manifest.exit_code
+    ));
+    output.push_str(&format!(
+        "Likely failure:  {}\n",
+        likely_failure(report).unwrap_or("none detected")
+    ));
+    output.push_str("Relevant symbols:\n");
+    if report.symbols.is_empty() {
+        output.push_str("  none requested\n");
+    } else {
+        for symbol in &report.symbols {
+            output.push_str(&format!(
+                "  {}::{} lines {}-{}  estimated tokens: {}\n",
+                symbol.path,
+                symbol.symbol.name,
+                symbol.symbol.start_line,
+                symbol.symbol.end_line,
+                format_count(symbol.estimated_tokens)
+            ));
+            output.push_str("  <code>\n");
+            for line in symbol.code.lines() {
+                output.push_str("  ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push_str("  </code>\n");
+        }
     }
+    output.push_str("Context budget:\n");
+    output.push_str(&format!(
+        "  packet tokens: {}\n",
+        format_count(packet_tokens)
+    ));
+    output.push_str(&format!(
+        "  raw source/log tokens avoided: {}\n",
+        format_count(raw_tokens_avoided)
+    ));
+    output.push_str(&format!(
+        "  reduction: {:.1}%\n",
+        reduction_percent(report.packet.raw_tokens, packet_tokens)
+    ));
+    output.push_str("Full handles:\n");
+    output.push_str(&format!("  stdout: {}\n", stdout_path.display()));
+    output.push_str(&format!("  stderr: {}\n", stderr_path.display()));
+    output.push_str(&format!("  compact: {}\n", compact_path.display()));
+    output.push_str("Preserved:\n");
+    for item in preserved_summary(report) {
+        output.push_str(&format!("  {item}\n"));
+    }
+
+    output
+}
+
+fn load_symbols(root: &Path, symbol_targets: &[String]) -> io::Result<Vec<SymbolMatch>> {
+    symbol_targets
+        .iter()
+        .map(|target| read_symbol::read_symbol(root, target))
+        .collect()
+}
+
+fn evidence_packet_tokens(report: &Report) -> usize {
+    report.packet.packet_tokens
+        + report
+            .symbols
+            .iter()
+            .map(|symbol| symbol.estimated_tokens)
+            .sum::<usize>()
+}
+
+fn likely_failure(report: &Report) -> Option<&str> {
+    report
+        .packet
+        .preserved_items
+        .iter()
+        .find(|item| item.kind == PreservedKind::ErrorLine && !item.line.trim().is_empty())
+        .map(|item| item.line.as_str())
 }
 
 fn reduction_percent(raw_tokens: usize, packet_tokens: usize) -> f64 {
@@ -150,6 +217,7 @@ mod tests {
     use super::*;
     use crate::compactor::{OmittedItem, OutputSource, PreservedItem};
     use crate::store::{NewArtifact, NewRun, insert_run};
+    use crate::symbols::{Symbol, SymbolKind};
 
     #[test]
     fn loads_last_report_from_sqlite() {
@@ -178,7 +246,7 @@ mod tests {
         )
         .expect("newer run should insert");
 
-        let report = load_last_report(&db_path).expect("last report should load from SQLite");
+        let report = load_last_report(&db_path, &[]).expect("last report should load from SQLite");
 
         assert_eq!(report.run_directory, latest);
         assert_eq!(report.manifest.id, "newer");
@@ -243,6 +311,7 @@ mod tests {
                 notes: Vec::new(),
                 compact_text: None,
             },
+            symbols: Vec::new(),
         };
 
         let summary = preserved_summary(&report);
@@ -252,6 +321,138 @@ mod tests {
         assert!(summary.contains(&"failing lines"));
         assert!(summary.contains(&"stack trace frames"));
         assert!(summary.contains(&"full output handle"));
+    }
+
+    #[test]
+    fn formats_evidence_packet_with_command_budget_and_handles() {
+        let report = Report {
+            run_directory: PathBuf::from(".haycut/runs/run-1"),
+            manifest: RunManifest {
+                id: "run-1".to_string(),
+                command: "cargo test auth".to_string(),
+                args: vec!["test".to_string(), "auth".to_string()],
+                cwd: "/tmp".to_string(),
+                exit_code: 101,
+                duration_ms: 42,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                estimated_raw_tokens: 1000,
+                raw_stdout_tokens_estimated: 800,
+                raw_stderr_tokens_estimated: 200,
+                created_at: Utc::now(),
+                stdout: "stdout.txt".to_string(),
+                stderr: "stderr.txt".to_string(),
+                compact: "compact.json".to_string(),
+            },
+            packet: CompactPacket {
+                compactor: "native".to_string(),
+                rtk_version: None,
+                command: "cargo test auth".to_string(),
+                exit_code: 101,
+                duration_ms: 42,
+                failed: true,
+                stdout_artifact: "stdout.txt".to_string(),
+                stderr_artifact: "stderr.txt".to_string(),
+                compact_artifact: None,
+                raw_stdout_tokens: 800,
+                raw_stderr_tokens: 200,
+                raw_tokens: 1000,
+                packet_tokens: 60,
+                preserved_items: vec![PreservedItem {
+                    source: OutputSource::Stderr,
+                    kind: PreservedKind::ErrorLine,
+                    line: "tests/auth/session_test.rs:52 expected expired session to be rejected"
+                        .to_string(),
+                }],
+                omitted_items: Vec::new(),
+                notes: Vec::new(),
+                compact_text: None,
+            },
+            symbols: Vec::new(),
+        };
+
+        let packet = evidence_packet(&report);
+
+        assert!(packet.contains("EVIDENCE PACKET"));
+        assert!(packet.contains("Command:  cargo test auth  exit code: 101"));
+        assert!(packet.contains("Likely failure:  tests/auth/session_test.rs:52"));
+        assert!(packet.contains("packet tokens: 60"));
+        assert!(packet.contains("raw source/log tokens avoided: 940"));
+        assert!(packet.contains("stdout: .haycut/runs/run-1/stdout.txt"));
+        assert!(packet.contains("stderr: .haycut/runs/run-1/stderr.txt"));
+        assert!(packet.contains("compact: .haycut/runs/run-1/compact.json"));
+    }
+
+    #[test]
+    fn formats_evidence_packet_with_symbol_snippets() {
+        let mut report = report_fixture();
+        report.symbols.push(SymbolMatch {
+            path: "src/auth/session.rs".to_string(),
+            symbol: Symbol {
+                kind: SymbolKind::Function,
+                name: "validate_session".to_string(),
+                start_line: 88,
+                end_line: 90,
+                start_byte: 0,
+                end_byte: 0,
+            },
+            code: "fn validate_session() -> bool {\n    false\n}".to_string(),
+            estimated_tokens: 12,
+        });
+
+        let packet = evidence_packet(&report);
+
+        assert!(packet.contains("src/auth/session.rs::validate_session lines 88-90"));
+        assert!(packet.contains("fn validate_session() -> bool"));
+        assert!(packet.contains("packet tokens: 72"));
+    }
+
+    fn report_fixture() -> Report {
+        Report {
+            run_directory: PathBuf::from(".haycut/runs/run-1"),
+            manifest: RunManifest {
+                id: "run-1".to_string(),
+                command: "cargo test auth".to_string(),
+                args: vec!["test".to_string(), "auth".to_string()],
+                cwd: "/tmp".to_string(),
+                exit_code: 101,
+                duration_ms: 42,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                estimated_raw_tokens: 1000,
+                raw_stdout_tokens_estimated: 800,
+                raw_stderr_tokens_estimated: 200,
+                created_at: Utc::now(),
+                stdout: "stdout.txt".to_string(),
+                stderr: "stderr.txt".to_string(),
+                compact: "compact.json".to_string(),
+            },
+            packet: CompactPacket {
+                compactor: "native".to_string(),
+                rtk_version: None,
+                command: "cargo test auth".to_string(),
+                exit_code: 101,
+                duration_ms: 42,
+                failed: true,
+                stdout_artifact: "stdout.txt".to_string(),
+                stderr_artifact: "stderr.txt".to_string(),
+                compact_artifact: None,
+                raw_stdout_tokens: 800,
+                raw_stderr_tokens: 200,
+                raw_tokens: 1000,
+                packet_tokens: 60,
+                preserved_items: vec![PreservedItem {
+                    source: OutputSource::Stderr,
+                    kind: PreservedKind::ErrorLine,
+                    line: "tests/auth/session_test.rs:52 expected expired session to be rejected"
+                        .to_string(),
+                }],
+                omitted_items: Vec::new(),
+                notes: Vec::new(),
+                compact_text: None,
+            },
+            symbols: Vec::new(),
+        }
     }
 
     fn temp_run_root(label: &str) -> PathBuf {

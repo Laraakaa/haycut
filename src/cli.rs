@@ -71,12 +71,41 @@ pub enum Commands {
         /// Report on the most recent run
         #[arg(long)]
         last: bool,
+
+        /// Include a symbol snippet, e.g. src/main.rs::main
+        #[arg(long = "symbol")]
+        symbols: Vec<String>,
+    },
+
+    /// Build an evidence packet from a captured run
+    Packet {
+        /// Use the most recent failed run
+        #[arg(long)]
+        last: bool,
     },
 
     /// Read one parsed symbol by name or path::name
     ReadSymbol {
         /// Symbol name or path-qualified symbol, e.g. main or src/main.rs::main
         target: String,
+    },
+
+    /// Read a small line window from a file
+    ReadWindow {
+        /// File to read from
+        path: PathBuf,
+
+        /// Center line for the window
+        #[arg(long)]
+        line: usize,
+
+        /// Number of lines to include before and after the center line
+        #[arg(long, default_value_t = commands::read_window::DEFAULT_RADIUS)]
+        radius: usize,
+
+        /// Allow extremely large windows
+        #[arg(long)]
+        force: bool,
     },
 
     /// Search repository files for an exact string
@@ -120,8 +149,15 @@ impl Cli {
                 }
             },
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
-            Some(Commands::Report { last }) => commands::report::run(last),
+            Some(Commands::Report { last, symbols }) => commands::report::run(last, symbols),
+            Some(Commands::Packet { last }) => commands::packet::run(last),
             Some(Commands::ReadSymbol { target }) => commands::read_symbol::run(target),
+            Some(Commands::ReadWindow {
+                path,
+                line,
+                radius,
+                force,
+            }) => commands::read_window::run(path, line, radius, force),
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             None => 0,
         }
