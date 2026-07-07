@@ -1,0 +1,7 @@
+[token]
+soft_budget = 40000
+hard_budget = 80000
+
+[trace]
+max_output_bytes = 1000000
+store_full_output = true
