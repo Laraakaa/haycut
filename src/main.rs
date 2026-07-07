@@ -3,5 +3,5 @@ mod commands;
 mod config;
 
 fn main() {
-    cli::run();
+    std::process::exit(cli::run());
 }

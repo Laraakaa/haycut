@@ -12,6 +12,7 @@ HayCut takes the opposite approach:
 
 The goal is not just to compress context. The goal is to avoid useless context in the first place.
 
+
 ## Vision
 
 HayCut treats tokens as a first-class engineering resource.
@@ -24,7 +25,7 @@ HayCut is designed around a simple principle:
 
 A cheap broken patch is not efficient. HayCut optimises for verified useful work per token.
 
-## What HayCut does
+## What HayCut does
 
 HayCut provides a harness around coding agents and model workflows with:
 

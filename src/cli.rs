@@ -30,25 +30,28 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Trace token/context usage
-    Trace,
+    /// Run a command and capture trace information
+    Trace {
+        /// Command and arguments to run
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
 }
 
-pub fn run() {
+pub fn run() -> i32 {
     let cli = Cli::parse();
-    cli.execute();
+    cli.execute()
 }
 
 impl Cli {
-    pub fn execute(self) {
+    pub fn execute(self) -> i32 {
         match self.command {
             Some(Commands::Init { force }) => {
                 commands::init::run(force);
+                0
             }
-            Some(Commands::Trace) => {
-                commands::trace::run();
-            }
-            None => {}
+            Some(Commands::Trace { command }) => commands::trace::run(command),
+            None => 0,
         }
     }
 }
