@@ -5,22 +5,43 @@ use std::{
 };
 
 use crate::{
+    budget::BudgetUsage,
     commands::trace::RunManifest,
     compactor::{CompactPacket, OutputSource, PreservedItem, PreservedKind, estimate_tokens},
+    config::{Config, TokenConfig},
     store::{self, RUN_STORE_PATH},
 };
 
 const EXCERPT_RADIUS: usize = 2;
 
-pub fn run(last: bool) -> i32 {
+pub fn run(last: bool, budget: Option<usize>, force: bool) -> i32 {
     if !last {
         eprintln!("Error: packet currently requires --last");
         return 2;
     }
 
+    let config = match Config::load_from_current_dir() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error loading config: {error}");
+            return 1;
+        }
+    };
+
     match load_last_failed_packet(Path::new(RUN_STORE_PATH)) {
-        Ok(packet) => {
-            print!("{}", packet.render());
+        Ok(mut packet) => {
+            if let Some(budget) = budget {
+                packet.prune_to_budget(budget);
+            }
+
+            let budget = packet.budget_usage(&config.token);
+            if let Some(error) = budget.hard_error().filter(|_| !force) {
+                eprint!("{}", budget.render());
+                eprintln!("Error: {error}");
+                return 2;
+            }
+
+            print!("{}", packet.render(&config.token));
             0
         }
         Err(error) => {
@@ -36,6 +57,8 @@ pub struct EvidencePacket {
     pub summary: Vec<String>,
     pub items: Vec<ContextItem>,
     pub omitted: Vec<OmittedItem>,
+    pub raw_token_estimate: usize,
+    pub base_token_estimate: usize,
     pub token_estimate: usize,
     pub full_handles: Vec<ArtifactHandle>,
 }
@@ -83,6 +106,7 @@ pub struct OmittedItem {
     pub source: SourceRef,
     pub reason: String,
     pub count: usize,
+    pub token_estimate: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -125,7 +149,7 @@ struct LineExcerpt {
 }
 
 impl EvidencePacket {
-    fn render(&self) -> String {
+    fn render(&self, token_config: &TokenConfig) -> String {
         let mut output = String::new();
 
         output.push_str(&self.title);
@@ -133,6 +157,15 @@ impl EvidencePacket {
         for line in &self.summary {
             output.push_str(line);
             output.push('\n');
+        }
+        output.push_str("Included context:\n");
+        for item in &self.items {
+            output.push_str(&format!(
+                "  - source: {}  tokens: {}  reason: {}\n",
+                item.source.label(),
+                format_count(item.token_estimate),
+                item.reason
+            ));
         }
         output.push_str("Files mentioned:\n");
         let file_references = self.file_references();
@@ -174,10 +207,16 @@ impl EvidencePacket {
             "  packet tokens: {}\n",
             format_count(self.token_estimate)
         ));
+        output.push_str(&self.budget_usage(token_config).render());
         if !self.omitted.is_empty() {
             output.push_str("Omitted:\n");
             for item in &self.omitted {
-                output.push_str(&format!("  {} lines: {}\n", item.count, item.reason));
+                output.push_str(&format!(
+                    "  - source: {}  tokens: {}  reason: {}\n",
+                    item.source.label(),
+                    format_count(item.token_estimate),
+                    item.reason
+                ));
             }
         }
         output.push_str("Full handles:\n");
@@ -190,6 +229,44 @@ impl EvidencePacket {
         }
 
         output
+    }
+
+    fn budget_usage(&self, token_config: &TokenConfig) -> BudgetUsage {
+        BudgetUsage::from_config(token_config, self.raw_token_estimate, self.token_estimate)
+    }
+
+    fn prune_to_budget(&mut self, budget: usize) {
+        let mut fixed_items = Vec::new();
+        let mut prunable_items = Vec::new();
+        for (index, item) in self.items.drain(..).enumerate() {
+            if item.is_prunable_context() {
+                prunable_items.push((index, item));
+            } else {
+                fixed_items.push((index, item));
+            }
+        }
+
+        prunable_items.sort_by_key(|(index, item)| (item.priority.prune_rank(), *index));
+        let mut token_estimate = self.base_token_estimate;
+        let mut kept_items = fixed_items;
+
+        for (index, item) in prunable_items {
+            if token_estimate + item.token_estimate <= budget {
+                token_estimate += item.token_estimate;
+                kept_items.push((index, item));
+            } else {
+                self.omitted.push(OmittedItem {
+                    source: item.source,
+                    reason: format!("over budget; {}", item.reason),
+                    count: 0,
+                    token_estimate: item.token_estimate,
+                });
+            }
+        }
+
+        kept_items.sort_by_key(|(index, item)| (item.priority.render_rank(), *index));
+        self.items = kept_items.into_iter().map(|(_, item)| item).collect();
+        self.token_estimate = token_estimate;
     }
 
     fn file_references(&self) -> Vec<&ContextItem> {
@@ -215,12 +292,50 @@ impl EvidencePacket {
     }
 }
 
+impl ContextItem {
+    fn is_prunable_context(&self) -> bool {
+        matches!(
+            self.kind,
+            ContextKind::FileReference | ContextKind::CodeWindow
+        )
+    }
+}
+
+impl Priority {
+    fn prune_rank(self) -> u8 {
+        match self {
+            Priority::High => 0,
+            Priority::Medium => 1,
+            Priority::Low => 2,
+        }
+    }
+
+    fn render_rank(self) -> u8 {
+        self.prune_rank()
+    }
+}
+
 impl ArtifactKind {
     fn label(self) -> &'static str {
         match self {
             ArtifactKind::Stdout => "stdout",
             ArtifactKind::Stderr => "stderr",
             ArtifactKind::Compact => "compact",
+        }
+    }
+}
+
+impl SourceRef {
+    fn label(&self) -> String {
+        match self {
+            SourceRef::Run { id } => format!("run {id}"),
+            SourceRef::Output { kind } => kind.label().to_string(),
+            SourceRef::File { path, line } => format!("{path}:{line}"),
+            SourceRef::CodeWindow {
+                path,
+                start_line,
+                end_line,
+            } => format!("{path} lines {start_line}-{end_line}"),
         }
     }
 }
@@ -296,6 +411,7 @@ fn build_evidence_packet(
         .map(|item| item.token_estimate)
         .sum::<usize>();
     let token_estimate = compact.packet_tokens + mention_tokens;
+    let base_token_estimate = compact.packet_tokens;
     let full_handles = artifact_handles(&run_directory, &manifest, &compact);
     let omitted = compact
         .omitted_items
@@ -304,6 +420,7 @@ fn build_evidence_packet(
             source: source_ref_for_output(item.source),
             reason: item.reason.clone(),
             count: item.count,
+            token_estimate: omitted_token_estimate(&compact, item.source),
         })
         .collect();
 
@@ -312,8 +429,18 @@ fn build_evidence_packet(
         summary,
         items,
         omitted,
+        raw_token_estimate: compact.raw_tokens,
+        base_token_estimate,
         token_estimate,
         full_handles,
+    }
+}
+
+fn omitted_token_estimate(compact: &CompactPacket, source: OutputSource) -> usize {
+    match source {
+        OutputSource::Stdout => compact.raw_stdout_tokens,
+        OutputSource::Stderr => compact.raw_stderr_tokens,
+        OutputSource::Rtk => compact.packet_tokens,
     }
 }
 
@@ -854,13 +981,132 @@ mod tests {
             }],
         );
 
-        let rendered = packet.render();
+        let rendered = packet.render(&token_config());
 
         assert!(rendered.contains("Command:  cargo test auth  exit code: 101"));
+        assert!(rendered.contains("Included context:"));
+        for item in &packet.items {
+            assert!(!item.reason.trim().is_empty());
+            let expected = format!(
+                "  - source: {}  tokens: {}  reason: {}",
+                item.source.label(),
+                format_count(item.token_estimate),
+                item.reason
+            );
+            assert!(
+                rendered.contains(&expected),
+                "missing included context row: {expected}"
+            );
+        }
         assert!(rendered.contains("tests/auth/session_test.rs:52"));
         assert!(rendered.contains("<excerpt lines 50-52>"));
         assert!(rendered.contains("assert!(validate_session(session).is_err());"));
         assert!(rendered.contains("packet tokens:"));
+        assert!(rendered.contains("Budget:  soft: 40,000  hard: 80,000"));
+        assert!(rendered.contains("Status: packet is within budget"));
+    }
+
+    #[test]
+    fn detects_hard_budget_exceeded_for_packet() {
+        let compact = CompactPacket {
+            compactor: "native".to_string(),
+            rtk_version: None,
+            command: "cargo test auth".to_string(),
+            exit_code: 101,
+            duration_ms: 42,
+            failed: true,
+            stdout_artifact: "stdout.txt".to_string(),
+            stderr_artifact: "stderr.txt".to_string(),
+            compact_artifact: None,
+            raw_stdout_tokens: 50,
+            raw_stderr_tokens: 50,
+            raw_tokens: 100,
+            packet_tokens: 90_000,
+            preserved_items: Vec::new(),
+            omitted_items: Vec::new(),
+            notes: Vec::new(),
+            compact_text: None,
+        };
+        let packet = build_evidence_packet(
+            PathBuf::from(".haycut/runs/run-1"),
+            manifest_fixture("run-1", "cargo test auth", 101, "/tmp"),
+            compact,
+            Vec::new(),
+        );
+
+        assert!(packet.budget_usage(&token_config()).hard_error().is_some());
+    }
+
+    #[test]
+    fn prunes_lower_priority_context_to_fit_budget() {
+        let mut packet = EvidencePacket {
+            title: "EVIDENCE PACKET".to_string(),
+            summary: vec!["Run:      run-1".to_string()],
+            items: vec![
+                ContextItem {
+                    kind: ContextKind::CommandSummary,
+                    content: "cargo test exited with 101".to_string(),
+                    source: SourceRef::Run {
+                        id: "run-1".to_string(),
+                    },
+                    reason: "summarizes the captured command run".to_string(),
+                    priority: Priority::High,
+                    token_estimate: 6,
+                },
+                context_window_item("src/high.rs", 1, 20, Priority::High),
+                context_window_item("src/medium.rs", 1, 15, Priority::Medium),
+                context_window_item("src/low.rs", 1, 10, Priority::Low),
+            ],
+            omitted: Vec::new(),
+            raw_token_estimate: 200,
+            base_token_estimate: 10,
+            token_estimate: 55,
+            full_handles: Vec::new(),
+        };
+
+        packet.prune_to_budget(45);
+        let rendered = packet.render(&token_config());
+
+        assert_eq!(packet.token_estimate, 45);
+        assert!(rendered.contains("source: src/high.rs lines 1-1"));
+        assert!(rendered.contains("source: src/medium.rs lines 1-1"));
+        assert!(
+            !rendered.contains(
+                "source: src/low.rs lines 1-1  tokens: 10  reason: nearby source context"
+            )
+        );
+        assert!(rendered.contains("Omitted:"));
+        assert!(rendered.contains(
+            "source: src/low.rs lines 1-1  tokens: 10  reason: over budget; nearby source context"
+        ));
+        assert!(rendered.contains("packet tokens: 45"));
+    }
+
+    fn context_window_item(
+        path: &str,
+        start_line: usize,
+        token_estimate: usize,
+        priority: Priority,
+    ) -> ContextItem {
+        ContextItem {
+            kind: ContextKind::CodeWindow,
+            content: path.to_string(),
+            source: SourceRef::CodeWindow {
+                path: path.to_string(),
+                start_line,
+                end_line: start_line,
+            },
+            reason: "nearby source context".to_string(),
+            priority,
+            token_estimate,
+        }
+    }
+
+    fn token_config() -> TokenConfig {
+        TokenConfig {
+            soft_budget: 40_000,
+            hard_budget: 80_000,
+        }
     }
 
     fn temp_root(label: &str) -> PathBuf {

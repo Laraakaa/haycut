@@ -72,6 +72,14 @@ pub enum Commands {
         #[arg(long)]
         last: bool,
 
+        /// Emit a machine-readable JSON report
+        #[arg(long)]
+        json: bool,
+
+        /// Emit a Markdown report for issues, pull requests, and benchmark docs
+        #[arg(long)]
+        markdown: bool,
+
         /// Include a symbol snippet, e.g. src/main.rs::main
         #[arg(long = "symbol")]
         symbols: Vec<String>,
@@ -82,6 +90,14 @@ pub enum Commands {
         /// Use the most recent failed run
         #[arg(long)]
         last: bool,
+
+        /// Prune additional context to fit this token budget when possible
+        #[arg(long)]
+        budget: Option<usize>,
+
+        /// Allow packets that exceed the hard token budget
+        #[arg(long)]
+        force: bool,
     },
 
     /// Read one parsed symbol by name or path::name
@@ -149,8 +165,17 @@ impl Cli {
                 }
             },
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
-            Some(Commands::Report { last, symbols }) => commands::report::run(last, symbols),
-            Some(Commands::Packet { last }) => commands::packet::run(last),
+            Some(Commands::Report {
+                last,
+                json,
+                markdown,
+                symbols,
+            }) => commands::report::run(last, json, markdown, symbols),
+            Some(Commands::Packet {
+                last,
+                budget,
+                force,
+            }) => commands::packet::run(last, budget, force),
             Some(Commands::ReadSymbol { target }) => commands::read_symbol::run(target),
             Some(Commands::ReadWindow {
                 path,
