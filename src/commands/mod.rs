@@ -5,6 +5,8 @@ pub mod packet;
 pub mod read_symbol;
 pub mod read_window;
 pub mod report;
+pub mod run_context;
 pub mod runs;
 pub mod search;
+pub mod suggest;
 pub mod trace;

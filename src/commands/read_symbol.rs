@@ -6,7 +6,10 @@ use std::{
 
 use ignore::{DirEntry, WalkBuilder};
 
-use crate::symbols::{Symbol, SymbolLanguage, parse_symbols};
+use crate::{
+    symbols::{Symbol, SymbolLanguage, parse_symbols},
+    util::estimate_tokens,
+};
 
 const HUGE_SYMBOL_TOKEN_WARNING: usize = 2_000;
 const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
@@ -93,7 +96,7 @@ fn find_symbol_matches(root: &Path, target: &SymbolTarget) -> io::Result<Vec<Sym
                     io::Error::new(io::ErrorKind::InvalidData, "symbol byte range is invalid")
                 })?
                 .to_string();
-            let estimated_tokens = estimate_tokens(&code);
+            let estimated_tokens = estimate_tokens(code.as_bytes());
             matches.push(SymbolMatch {
                 path: relative_path.clone(),
                 symbol,
@@ -199,10 +202,6 @@ fn normalize_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 4
 }
 
 #[cfg(test)]

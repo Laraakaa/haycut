@@ -1,15 +1,13 @@
 use std::{io, path::Path};
 
-use crate::store::{self, FileInventoryEntry, RUN_STORE_PATH};
+use crate::{
+    store::{self, FileInventoryEntry, RUN_STORE_PATH},
+    util::format_count,
+};
 
 pub const DEFAULT_LIMIT: usize = 20;
 
-pub fn run(largest: bool, limit: usize) -> i32 {
-    if !largest {
-        eprintln!("Error: files currently requires --largest");
-        return 2;
-    }
-
+pub fn run(limit: usize) -> i32 {
     match load_largest_files(Path::new(RUN_STORE_PATH), limit) {
         Ok(files) => {
             print_files(&files);
@@ -33,8 +31,8 @@ fn print_files(files: &[FileInventoryEntry]) {
         println!(
             "{:<32}  {:>7}  {:>11}",
             truncate(&file.path, 32),
-            format_count(file.line_count),
-            format_count(file.estimated_tokens),
+            format_count(file.line_count as usize),
+            format_count(file.estimated_tokens as usize),
         );
     }
 }
@@ -50,20 +48,6 @@ fn truncate(value: &str, max_width: usize) -> String {
         .collect::<String>();
     truncated.push_str("...");
     truncated
-}
-
-fn format_count(count: i64) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
 }
 
 #[cfg(test)]

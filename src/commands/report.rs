@@ -1,26 +1,26 @@
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
 };
 
 use crate::{
     budget::{BudgetStatus, BudgetUsage},
-    commands::read_symbol::{self, SymbolMatch},
-    commands::trace::RunManifest,
+    commands::{
+        read_symbol::{self, SymbolMatch},
+        run_context::RunContext,
+        trace::RunManifest,
+    },
     compactor::{CompactPacket, OmittedItem, OutputSource, PreservedItem, PreservedKind},
     config::{Config, TokenConfig},
-    store::{self, RUN_STORE_PATH},
+    store::RUN_STORE_PATH,
+    util::format_count,
 };
 use serde::Serialize;
 
 const MAX_PRESERVED_ITEMS: usize = 8;
 const MAX_OMITTED_ITEMS: usize = 8;
 
-pub fn run(last: bool, json: bool, markdown: bool, symbols: Vec<String>) -> i32 {
-    if !last {
-        eprintln!("Error: report currently requires --last");
-        return 2;
-    }
+pub fn run(json: bool, markdown: bool, symbols: Vec<String>) -> i32 {
     let format = match ReportFormat::from_flags(json, markdown) {
         Ok(format) => format,
         Err(error) => {
@@ -79,32 +79,12 @@ impl ReportFormat {
 }
 
 fn load_last_report(root: &Path, symbol_targets: &[String]) -> io::Result<Report> {
-    let stored_run = store::latest_run(root)?;
-    let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
-    let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
-    let run_directory = run_json_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "run manifest has no parent directory",
-            )
-        })?;
-    let manifest = RunManifest::load(&run_json_path)?;
-    let compact_contents = fs::read_to_string(&compact_path)?;
-    let packet = serde_json::from_str(&compact_contents).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid compact packet {}: {error}", compact_path.display()),
-        )
-    })?;
-    let symbols = load_symbols(Path::new(&manifest.cwd), symbol_targets)?;
-
+    let ctx = RunContext::load_last(root)?;
+    let symbols = load_symbols(Path::new(&ctx.manifest.cwd), symbol_targets)?;
     Ok(Report {
-        run_directory,
-        manifest,
-        packet,
+        run_directory: ctx.run_directory,
+        manifest: ctx.manifest,
+        packet: ctx.compact,
         symbols,
     })
 }
@@ -562,12 +542,92 @@ fn evidence_packet_tokens(report: &Report) -> usize {
 }
 
 fn likely_failure(report: &Report) -> Option<&str> {
-    report
+    // Deterministically promote the primary failure from the compacted evidence.
+    // Prefer, in order (HC-041):
+    //   1. compiler errors (e.g. error[E0063])
+    //   2. test assertion failures
+    //   3. panic lines
+    //   4. traceback / exception lines
+    //   5. first high-signal preserved item
+    // Classification is purely lexical; no LLM is involved. All preserved items
+    // are considered, not just native error lines, so RTK-filtered output is
+    // promoted too.
+    let candidates: Vec<&str> = report
         .packet
         .preserved_items
         .iter()
-        .find(|item| item.kind == PreservedKind::ErrorLine && !item.line.trim().is_empty())
         .map(|item| item.line.as_str())
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    const CLASSIFIERS: [fn(&str) -> bool; 5] = [
+        is_compiler_error,
+        is_assertion_failure,
+        is_panic_line,
+        is_traceback_exception,
+        is_high_signal,
+    ];
+
+    for classify in CLASSIFIERS {
+        if let Some(line) = candidates.iter().copied().find(|line| classify(line)) {
+            return Some(line);
+        }
+    }
+
+    None
+}
+
+/// Rust/TypeScript compiler diagnostics carrying an error code, e.g.
+/// `error[E0063]: ...` or `error TS2322: ...`.
+fn is_compiler_error(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error[") || trimmed.starts_with("error TS")
+}
+
+/// Test-framework assertion failures across Rust, pytest, and JS runners.
+fn is_assertion_failure(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("assertion")
+        || lower.contains("assert ")
+        || lower.contains("assert(")
+        || (lower.contains("expected") && lower.contains("actual"))
+}
+
+/// Runtime panic lines, e.g. `thread 'main' panicked at ...`.
+fn is_panic_line(line: &str) -> bool {
+    line.contains("panicked at") || line.to_ascii_lowercase().contains("panic")
+}
+
+/// Python-style tracebacks and typed exception lines, e.g. `ValueError: ...`.
+fn is_traceback_exception(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("Traceback (") || trimmed.to_ascii_lowercase().contains("traceback") {
+        return true;
+    }
+
+    if let Some((head, _)) = trimmed.split_once(':') {
+        let name = head.rsplit(['.', ' ']).next().unwrap_or(head);
+        return name.ends_with("Error") || name.ends_with("Exception");
+    }
+
+    false
+}
+
+/// Catch-all for any remaining high-signal line worth surfacing.
+fn is_high_signal(line: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "error",
+        "fail",
+        "panic",
+        "exception",
+        "assert",
+        "expected",
+        "actual",
+        "traceback",
+    ];
+
+    let lower = line.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 fn reduction_percent(raw_tokens: usize, packet_tokens: usize) -> f64 {
@@ -628,24 +688,10 @@ fn preserved_kind_label(kind: PreservedKind) -> &'static str {
     }
 }
 
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        env,
+        env, fs,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -856,6 +902,74 @@ mod tests {
         assert!(packet.contains("src/auth/session.rs::validate_session lines 88-90"));
         assert!(packet.contains("fn validate_session() -> bool"));
         assert!(packet.contains("token: 72 packet tokens"));
+    }
+
+    fn rtk_item(line: &str) -> PreservedItem {
+        PreservedItem {
+            source: OutputSource::Rtk,
+            kind: PreservedKind::RtkFiltered,
+            line: line.to_string(),
+        }
+    }
+
+    #[test]
+    fn promotes_compiler_error_from_rtk_filtered_evidence() {
+        let mut report = report_fixture();
+        // Mirrors a failing `cargo test` compacted through RTK, where every
+        // preserved item is RtkFiltered rather than a native ErrorLine.
+        report.packet.preserved_items = vec![
+            rtk_item("cargo test: 1 errors, 0 warnings (1 crates)"),
+            rtk_item("error[E0063]: missing field `model` in initializer of `config::Config`"),
+            rtk_item("  --> src/config.rs:54:9"),
+            rtk_item("54 |         Config {"),
+        ];
+
+        assert_eq!(
+            likely_failure(&report),
+            Some("error[E0063]: missing field `model` in initializer of `config::Config`")
+        );
+    }
+
+    #[test]
+    fn likely_failure_prefers_compiler_error_over_panic_and_assertion() {
+        let mut report = report_fixture();
+        report.packet.preserved_items = vec![
+            rtk_item("thread 'main' panicked at src/lib.rs:10:5"),
+            rtk_item("assertion `left == right` failed"),
+            rtk_item("error[E0277]: the trait bound is not satisfied"),
+        ];
+
+        assert_eq!(
+            likely_failure(&report),
+            Some("error[E0277]: the trait bound is not satisfied")
+        );
+    }
+
+    #[test]
+    fn likely_failure_falls_back_through_priority_tiers() {
+        let mut report = report_fixture();
+
+        // No compiler error: an assertion failure wins over a later panic line.
+        report.packet.preserved_items = vec![
+            rtk_item("running 3 tests"),
+            rtk_item("assertion `left == right` failed"),
+            rtk_item("thread 'main' panicked at src/lib.rs:10:5"),
+        ];
+        assert_eq!(
+            likely_failure(&report),
+            Some("assertion `left == right` failed")
+        );
+
+        // No compiler error or assertion: a Python traceback exception wins.
+        report.packet.preserved_items = vec![
+            rtk_item("Traceback (most recent call last):"),
+            rtk_item("  File \"app.py\", line 3, in <module>"),
+            rtk_item("ValueError: invalid literal for int()"),
+        ];
+        assert_eq!(
+            likely_failure(&report),
+            Some("Traceback (most recent call last):")
+        );
     }
 
     #[test]

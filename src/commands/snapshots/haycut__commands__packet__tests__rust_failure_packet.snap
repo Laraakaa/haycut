@@ -1,5 +1,6 @@
 ---
 source: src/commands/packet.rs
+assertion_line: 1149
 expression: rendered
 ---
 EVIDENCE PACKET
@@ -63,11 +64,11 @@ Files mentioned:
 Context budget:
   packet tokens: 280
 Budget:  soft: 40,000  hard: 80,000
-This run: raw output: 380 (0.9% of soft, 0.5% of hard)  packet: 280 (0.7% of soft, 0.4% of hard)
-Status: packet is within budget; raw output would have used 0.9% of soft budget
+This run: raw output: 381 (1.0% of soft, 0.5% of hard)  packet: 280 (0.7% of soft, 0.4% of hard)
+Status: packet is within budget; raw output would have used 1.0% of soft budget
 Omitted:
   - source: stdout  tokens: 0  reason: non-error output omitted from compact packet
-  - source: stderr  tokens: 380  reason: non-error output omitted from compact packet
+  - source: stderr  tokens: 381  reason: non-error output omitted from compact packet
 Full handles:
   stdout: .haycut/runs/golden-rust/stdout.txt
   stderr: .haycut/runs/golden-rust/stderr.txt

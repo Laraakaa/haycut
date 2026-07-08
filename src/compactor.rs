@@ -7,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::util::estimate_tokens;
+
 #[derive(Debug)]
 pub struct CompactionInput<'a> {
     pub command: &'a str,
@@ -246,10 +248,6 @@ fn rtk_filter_name(input: &CompactionInput<'_>) -> Option<&'static str> {
         ("npx", Some("prettier")) => Some("prettier"),
         _ => None,
     }
-}
-
-pub fn estimate_tokens(output: &[u8]) -> usize {
-    String::from_utf8_lossy(output).chars().count() / 4
 }
 
 fn collect_native_items(

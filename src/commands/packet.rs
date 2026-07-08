@@ -6,20 +6,16 @@ use std::{
 
 use crate::{
     budget::BudgetUsage,
-    commands::trace::RunManifest,
-    compactor::{CompactPacket, OutputSource, PreservedItem, PreservedKind, estimate_tokens},
+    commands::{run_context::RunContext, trace::RunManifest},
+    compactor::{CompactPacket, OutputSource, PreservedItem, PreservedKind},
     config::{Config, TokenConfig},
-    store::{self, RUN_STORE_PATH},
+    store::RUN_STORE_PATH,
+    util::{estimate_tokens, format_count},
 };
 
 const EXCERPT_RADIUS: usize = 2;
 
-pub fn run(last: bool, budget: Option<usize>, force: bool) -> i32 {
-    if !last {
-        eprintln!("Error: packet currently requires --last");
-        return 2;
-    }
-
+pub fn run(budget: Option<usize>, force: bool) -> i32 {
     let config = match Config::load_from_current_dir() {
         Ok(config) => config,
         Err(error) => {
@@ -362,37 +358,17 @@ impl SourceRef {
 }
 
 fn load_last_failed_packet(db_path: &Path) -> io::Result<EvidencePacket> {
-    let stored_run = store::latest_failed_run(db_path)?;
-    let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
-    let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
-    let run_directory = run_json_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "run manifest has no parent directory",
-            )
-        })?;
-    let manifest = RunManifest::load(&run_json_path)?;
-    let compact_contents = fs::read_to_string(&compact_path)?;
-    let compact: CompactPacket = serde_json::from_str(&compact_contents).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid compact packet {}: {error}", compact_path.display()),
-        )
-    })?;
-    let stdout = read_lossy(&run_directory.join(&manifest.stdout))?;
-    let stderr = read_lossy(&run_directory.join(&manifest.stderr))?;
+    let ctx = RunContext::load_last_failed(db_path)?;
+    let stdout = ctx.read_stdout_lossy()?;
+    let stderr = ctx.read_stderr_lossy()?;
     let mentions = file_mentions(
-        Path::new(&manifest.cwd),
-        &[stdout, stderr, compact_lines(&compact)],
+        Path::new(&ctx.manifest.cwd),
+        &[stdout, stderr, compact_lines(&ctx.compact)],
     );
-
     Ok(build_evidence_packet(
-        run_directory,
-        manifest,
-        compact,
+        ctx.run_directory,
+        ctx.manifest,
+        ctx.compact,
         mentions,
     ))
 }
@@ -803,24 +779,6 @@ fn compact_lines(compact: &CompactPacket) -> String {
         .map(|item| item.line.as_str())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn read_lossy(path: &Path) -> io::Result<String> {
-    fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
 }
 
 #[cfg(test)]

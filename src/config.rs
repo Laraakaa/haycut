@@ -9,6 +9,32 @@ const CONFIG_FILE_NAME: &str = "haycut.toml";
 pub struct Config {
     pub token: TokenConfig,
     pub trace: TraceConfig,
+    #[serde(default)]
+    pub model: Option<ModelConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ModelConfig {
+    /// Base URL of an OpenAI-compatible completions API, without trailing slash.
+    /// Example: `https://api.openai.com/v1`
+    pub base_url: String,
+    /// Model identifier to pass in the request body.
+    pub model: String,
+    /// Name of the environment variable that holds the API key.
+    pub api_key_env_var: String,
+    /// Per-request timeout in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            timeout_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +60,7 @@ impl Default for Config {
                 max_output_bytes: 1_000_000,
                 store_full_output: true,
             },
+            model: None,
         }
     }
 }

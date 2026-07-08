@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use crate::compactor::estimate_tokens;
+use crate::util::estimate_tokens;
 
 pub const DEFAULT_RADIUS: usize = 20;
 const MAX_WINDOW_LINES: usize = 400;

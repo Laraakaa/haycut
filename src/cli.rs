@@ -6,17 +6,6 @@ use crate::commands;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
-    /// Optional name to operate on
-    pub name: Option<String>,
-
-    /// Sets a custom config file
-    #[arg(short, long, value_name = "FILE")]
-    pub config: Option<PathBuf>,
-
-    /// Turn debugging information on
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub debug: u8,
-
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -30,12 +19,8 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Show indexed repository files
+    /// Show indexed repository files by estimated token count
     Files {
-        /// Show largest files by estimated token count
-        #[arg(long)]
-        largest: bool,
-
         /// Maximum number of files to show
         #[arg(long, default_value_t = commands::files::DEFAULT_LIMIT)]
         limit: usize,
@@ -68,10 +53,6 @@ pub enum Commands {
 
     /// Show context reduction information for captured runs
     Report {
-        /// Report on the most recent run
-        #[arg(long)]
-        last: bool,
-
         /// Emit a machine-readable JSON report
         #[arg(long)]
         json: bool,
@@ -87,10 +68,6 @@ pub enum Commands {
 
     /// Build an evidence packet from a captured run
     Packet {
-        /// Use the most recent failed run
-        #[arg(long)]
-        last: bool,
-
         /// Prune additional context to fit this token budget when possible
         #[arg(long)]
         budget: Option<usize>,
@@ -124,6 +101,9 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Suggest the next token-efficient debugging action without executing it
+    Suggest,
+
     /// Search repository files for an exact string
     Search {
         /// Maximum number of matches to show
@@ -154,28 +134,18 @@ impl Cli {
                 commands::init::run(force);
                 0
             }
-            Some(Commands::Files { largest, limit }) => commands::files::run(largest, limit),
+            Some(Commands::Files { limit }) => commands::files::run(limit),
             Some(Commands::Index { max_file_size }) => commands::index::run(max_file_size),
-            Some(Commands::Trace { compactor, command }) => match trace_list_limit(&command) {
-                Ok(Some(limit)) => commands::runs::run(limit),
-                Ok(None) => commands::trace::run(command, compactor),
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    2
-                }
-            },
+            Some(Commands::Trace { compactor, command }) => {
+                commands::trace::run(command, compactor)
+            }
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
             Some(Commands::Report {
-                last,
                 json,
                 markdown,
                 symbols,
-            }) => commands::report::run(last, json, markdown, symbols),
-            Some(Commands::Packet {
-                last,
-                budget,
-                force,
-            }) => commands::packet::run(last, budget, force),
+            }) => commands::report::run(json, markdown, symbols),
+            Some(Commands::Packet { budget, force }) => commands::packet::run(budget, force),
             Some(Commands::ReadSymbol { target }) => commands::read_symbol::run(target),
             Some(Commands::ReadWindow {
                 path,
@@ -183,61 +153,9 @@ impl Cli {
                 radius,
                 force,
             }) => commands::read_window::run(path, line, radius, force),
+            Some(Commands::Suggest) => commands::suggest::run(),
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             None => 0,
         }
-    }
-}
-
-fn trace_list_limit(command: &[String]) -> Result<Option<usize>, String> {
-    if command.first().map(String::as_str) != Some("list") {
-        return Ok(None);
-    }
-
-    let mut limit = commands::runs::DEFAULT_LIMIT;
-    let mut args = command.iter().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--limit" {
-            let value = args
-                .next()
-                .ok_or_else(|| "trace list --limit requires a value".to_string())?;
-            limit = parse_limit(value)?;
-        } else if let Some(value) = arg.strip_prefix("--limit=") {
-            limit = parse_limit(value)?;
-        } else {
-            return Err(format!("unknown trace list argument: {arg}"));
-        }
-    }
-
-    Ok(Some(limit))
-}
-
-fn parse_limit(value: &str) -> Result<usize, String> {
-    value.parse().map_err(|_| format!("invalid limit: {value}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_trace_list_limit() {
-        let command = vec!["list".to_string(), "--limit".to_string(), "5".to_string()];
-
-        assert_eq!(trace_list_limit(&command), Ok(Some(5)));
-    }
-
-    #[test]
-    fn parses_trace_list_limit_equals_form() {
-        let command = vec!["list".to_string(), "--limit=7".to_string()];
-
-        assert_eq!(trace_list_limit(&command), Ok(Some(7)));
-    }
-
-    #[test]
-    fn leaves_regular_trace_command_alone() {
-        let command = vec!["cargo".to_string(), "test".to_string()];
-
-        assert_eq!(trace_list_limit(&command), Ok(None));
     }
 }

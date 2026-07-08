@@ -2,6 +2,8 @@ use std::{io, process::Command};
 
 use serde_json::Value;
 
+use crate::util::{estimate_tokens, format_count};
+
 pub const DEFAULT_LIMIT: usize = 20;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,7 +102,7 @@ fn parse_rg_matches(output: &[u8], limit: usize) -> io::Result<Vec<SearchMatch>>
         matches.push(SearchMatch {
             path: path.to_string(),
             line_number,
-            estimated_tokens: estimate_tokens(&line),
+            estimated_tokens: estimate_tokens(line.as_bytes()),
             line,
         });
     }
@@ -144,10 +146,6 @@ fn print_matches(matches: &[SearchMatch]) {
     println!("Estimated token cost: {}", format_count(total_tokens));
 }
 
-fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 4
-}
-
 fn truncate(value: &str, max_width: usize) -> String {
     if value.chars().count() <= max_width {
         return value.to_string();
@@ -159,20 +157,6 @@ fn truncate(value: &str, max_width: usize) -> String {
         .collect::<String>();
     truncated.push_str("...");
     truncated
-}
-
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
 }
 
 #[cfg(test)]

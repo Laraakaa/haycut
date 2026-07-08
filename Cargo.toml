@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.95"
 camino = "1.2.4"
+ureq = { version = "2", features = ["json"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
@@ -18,6 +20,9 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 uuid = { version = "1.10.0", features = ["v4"] }
+
+[features]
+test-utils = []
 
 [dev-dependencies]
 insta = "1"

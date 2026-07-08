@@ -10,7 +10,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use ignore::{DirEntry, WalkBuilder};
 
-use crate::store::{self, FileInventoryEntry, RUN_STORE_PATH};
+use crate::{
+    store::{self, FileInventoryEntry, RUN_STORE_PATH},
+    util::estimate_tokens,
+};
 
 pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 1_000_000;
 
@@ -160,10 +163,6 @@ fn count_lines(text: &str) -> usize {
     }
 
     text.lines().count()
-}
-
-fn estimate_tokens(contents: &[u8]) -> usize {
-    String::from_utf8_lossy(contents).chars().count() / 4
 }
 
 fn modified_at(metadata: &fs::Metadata) -> Option<String> {

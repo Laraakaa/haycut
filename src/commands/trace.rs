@@ -16,6 +16,7 @@ use crate::{
     },
     config::Config,
     store::{self, NewArtifact, NewRun, RUN_STORE_PATH},
+    util::{estimate_tokens, format_count},
 };
 
 const ARTIFACT_ROOT: &str = ".haycut/runs";
@@ -372,24 +373,6 @@ fn estimate_raw_tokens(trace: &CommandTrace) -> TokenEstimate {
         stderr,
         total: stdout + stderr,
     }
-}
-
-fn estimate_tokens(output: &[u8]) -> usize {
-    String::from_utf8_lossy(output).chars().count() / 4
-}
-
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
 }
 
 fn print_trace(trace: &CommandTrace, artifacts: &ArtifactPaths, packet: &CompactPacket) {

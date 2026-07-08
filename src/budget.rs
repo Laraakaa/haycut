@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::config::TokenConfig;
+use crate::util::format_count;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetStatus {
@@ -102,20 +103,6 @@ fn percent_used(tokens: usize, budget: usize) -> f64 {
     }
 
     tokens as f64 / budget as f64 * 100.0
-}
-
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
 }
 
 #[cfg(test)]
