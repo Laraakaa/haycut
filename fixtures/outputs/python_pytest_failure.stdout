@@ -1,0 +1,37 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.4, pytest-8.2.2, pluggy-1.5.0
+rootdir: /repo/service
+collected 128 items / 127 deselected / 1 selected
+
+tests/test_auth.py noise 001: database fixture booted
+tests/test_auth.py noise 002: seeding user account
+tests/test_auth.py noise 003: issuing expired token
+tests/test_auth.py noise 004: request middleware loaded
+tests/test_auth.py noise 005: response logger enabled
+
+tests/test_auth.py F                                                     [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_expired_token_rejected _________________________
+
+    def test_expired_token_rejected(client):
+        response = client.get("/session", headers={"Authorization": "Bearer expired"})
+>       assert response.status_code == 401
+E       assert 200 == 401
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/test_auth.py:27: AssertionError
+----------------------------- Captured stdout call -----------------------------
+noise tail 001: request id req-001
+noise tail 002: request id req-002
+noise tail 003: request id req-003
+noise tail 004: request id req-004
+noise tail 005: request id req-005
+noise tail 006: request id req-006
+noise tail 007: request id req-007
+noise tail 008: request id req-008
+noise tail 009: request id req-009
+noise tail 010: request id req-010
+=========================== short test summary info ============================
+FAILED tests/test_auth.py::test_expired_token_rejected - assert 200 == 401
+====================== 1 failed, 127 deselected in 0.42s =======================

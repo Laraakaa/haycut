@@ -334,10 +334,32 @@ fn is_error_line(line: &str) -> bool {
         || lower.contains("failed")
         || lower.contains("failure")
         || lower.contains("panic")
+        || lower.contains("assert")
+        || lower.contains("assertion")
         || lower.contains("exception")
         || lower.contains("traceback")
         || lower.contains("expected")
         || lower.contains("actual")
+        || line.trim_start().starts_with("left:")
+        || line.trim_start().starts_with("right:")
+        || contains_source_location(line)
+}
+
+fn contains_source_location(line: &str) -> bool {
+    const SOURCE_EXTENSIONS: [&str; 8] = [
+        ".rs:", ".py:", ".ts:", ".tsx:", ".js:", ".jsx:", ".go:", ".java:",
+    ];
+
+    SOURCE_EXTENSIONS.iter().any(|extension| {
+        line.find(extension)
+            .map(|index| {
+                line[index + extension.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit())
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn stack_trace_location(line: &str) -> Option<String> {
@@ -383,13 +405,15 @@ fn node_stack_location(line: &str) -> Option<String> {
 
 fn file_line_location(location: &str) -> Option<String> {
     let without_column = trim_trailing_number_segment(location)?;
-    let without_line = trim_trailing_number_segment(without_column)?;
+    if trim_trailing_number_segment(without_column).is_some() {
+        return Some(without_column.to_string());
+    }
 
-    if without_line.is_empty() {
+    if without_column.is_empty() {
         return None;
     }
 
-    Some(without_column.to_string())
+    Some(location.to_string())
 }
 
 fn trim_trailing_number_segment(location: &str) -> Option<&str> {
@@ -546,6 +570,7 @@ mod tests {
         assert_eq!(
             preserved_stdout,
             vec![
+                "previous context 1",
                 "previous context 2",
                 "tests/auth/session.test.ts:52",
                 "Expected expired token to be rejected",
@@ -596,6 +621,150 @@ mod tests {
             stack_trace.line,
             "Likely stack trace: - tests/auth/session_test.py:52 - src/auth/session.rs:117 - /repo/src/auth/session.ts:117 - /repo/tests/auth/session.test.ts:52"
         );
+    }
+
+    #[test]
+    fn native_compactor_preserves_rust_assertion_details() {
+        let stdout = [
+            "running 1 test",
+            "test commands::packet::tests::renders_packet ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- commands::packet::tests::renders_packet stdout ----",
+            "thread 'commands::packet::tests::renders_packet' panicked at src/commands/packet.rs:612:9:",
+            "assertion `left == right` failed",
+            "  left: 1",
+            " right: 2",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "",
+            "failures:",
+            "    commands::packet::tests::renders_packet",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.00s",
+        ]
+        .join("\n");
+        let args = vec!["test".to_string()];
+        let stdout_artifact = PathBuf::from("stdout.txt");
+        let stderr_artifact = PathBuf::from("stderr.txt");
+
+        let packet = NativeHeuristicCompactor
+            .compact(&input(
+                stdout.as_bytes(),
+                b"",
+                101,
+                &args,
+                &stdout_artifact,
+                &stderr_artifact,
+            ))
+            .expect("native compaction should work");
+
+        let preserved_lines: Vec<&str> = packet
+            .preserved_items
+            .iter()
+            .map(|item| item.line.as_str())
+            .collect();
+
+        assert!(preserved_lines.contains(&"assertion `left == right` failed"));
+        assert!(preserved_lines.contains(&"  left: 1"));
+        assert!(preserved_lines.contains(&" right: 2"));
+        assert!(
+            preserved_lines
+                .iter()
+                .any(|line| line.contains("src/commands/packet.rs:612"))
+        );
+    }
+
+    #[test]
+    fn rust_panic_location_accepts_path_line_without_column() {
+        assert_eq!(
+            rust_panic_location("thread 'main' panicked at src/main.rs:10"),
+            Some("src/main.rs:10".to_string())
+        );
+    }
+
+    #[test]
+    fn native_compactor_preserves_fixture_failure_lines() {
+        let cases = [
+            FixtureCase {
+                command: "cargo",
+                args: &["test"],
+                stdout: b"",
+                stderr: include_bytes!("../fixtures/outputs/rust_test_failure.stderr"),
+                expected_lines: &[
+                    "thread 'commands::packet::tests::renders_packet' panicked at src/commands/packet.rs:612:9:",
+                    "assertion `left == right` failed",
+                    "  left: \"packet source\"",
+                    " right: \"useful source excerpt\"",
+                    "error: test failed, to rerun pass `--bin haycut`",
+                ],
+            },
+            FixtureCase {
+                command: "pytest",
+                args: &[],
+                stdout: include_bytes!("../fixtures/outputs/python_pytest_failure.stdout"),
+                stderr: b"",
+                expected_lines: &[
+                    ">       assert response.status_code == 401",
+                    "E       assert 200 == 401",
+                    "tests/test_auth.py:27: AssertionError",
+                    "FAILED tests/test_auth.py::test_expired_token_rejected - assert 200 == 401",
+                ],
+            },
+            FixtureCase {
+                command: "vitest",
+                args: &[],
+                stdout: include_bytes!("../fixtures/outputs/node_vitest_failure.stdout"),
+                stderr: b"",
+                expected_lines: &[
+                    " FAIL  tests/session.test.ts > session policy > rejects expired token",
+                    "AssertionError: expected true to be false // Object.is equality",
+                    "- Expected",
+                    "+ Received",
+                    " ❯ tests/session.test.ts:44:28",
+                ],
+            },
+        ];
+
+        for case in cases {
+            let args: Vec<String> = case.args.iter().map(|arg| (*arg).to_string()).collect();
+            let stdout_artifact = PathBuf::from("stdout.txt");
+            let stderr_artifact = PathBuf::from("stderr.txt");
+            let input = CompactionInput {
+                command: case.command,
+                args: &args,
+                exit_code: 1,
+                duration: Duration::from_millis(42),
+                stdout: case.stdout,
+                stderr: case.stderr,
+                stdout_artifact: &stdout_artifact,
+                stderr_artifact: &stderr_artifact,
+            };
+
+            let packet = NativeHeuristicCompactor
+                .compact(&input)
+                .expect("native compaction should work for fixture");
+            let preserved_lines: Vec<&str> = packet
+                .preserved_items
+                .iter()
+                .map(|item| item.line.as_str())
+                .collect();
+
+            assert!(
+                packet.raw_tokens > packet.packet_tokens,
+                "{} fixture should produce a smaller packet: raw={}, packet={}",
+                case.command,
+                packet.raw_tokens,
+                packet.packet_tokens
+            );
+            for expected_line in case.expected_lines {
+                assert!(
+                    preserved_lines.contains(expected_line),
+                    "{} fixture did not preserve expected line: {expected_line}",
+                    case.command
+                );
+            }
+        }
     }
 
     #[test]
@@ -664,5 +833,13 @@ mod tests {
                 "{command} {args:?}"
             );
         }
+    }
+
+    struct FixtureCase {
+        command: &'static str,
+        args: &'static [&'static str],
+        stdout: &'static [u8],
+        stderr: &'static [u8],
+        expected_lines: &'static [&'static str],
     }
 }

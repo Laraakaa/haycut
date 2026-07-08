@@ -167,6 +167,15 @@ impl EvidencePacket {
                 item.reason
             ));
         }
+        output.push_str("Compact evidence:\n");
+        let evidence_items = self.compact_evidence_items();
+        if evidence_items.is_empty() {
+            output.push_str("  none detected\n");
+        } else {
+            for item in evidence_items {
+                output.push_str(&format!("  - {}: {}\n", item.source.label(), item.content));
+            }
+        }
         output.push_str("Files mentioned:\n");
         let file_references = self.file_references();
         if file_references.is_empty() {
@@ -289,6 +298,18 @@ impl EvidencePacket {
             }
             _ => false,
         })
+    }
+
+    fn compact_evidence_items(&self) -> Vec<&ContextItem> {
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    ContextKind::FailureLine | ContextKind::StackFrame | ContextKind::Note
+                ) && !item.content.trim().is_empty()
+            })
+            .collect()
     }
 }
 
@@ -563,8 +584,26 @@ fn preserved_reason(kind: PreservedKind) -> &'static str {
 fn likely_failure_from_items(items: &[ContextItem]) -> Option<&str> {
     items
         .iter()
-        .find(|item| item.kind == ContextKind::FailureLine && !item.content.trim().is_empty())
+        .filter(|item| item.kind == ContextKind::FailureLine && !item.content.trim().is_empty())
+        .max_by_key(|item| likely_failure_rank(&item.content))
         .map(|item| item.content.as_str())
+}
+
+fn likely_failure_rank(line: &str) -> u8 {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("assertion") || lower.contains(" panicked at ") {
+        5
+    } else if trimmed.starts_with("left:") || trimmed.starts_with("right:") {
+        4
+    } else if lower.contains("error") || lower.contains("failed") || lower.contains("failure") {
+        3
+    } else if lower.contains("expected") || lower.contains("actual") {
+        2
+    } else {
+        1
+    }
 }
 
 fn file_mentions(root: &Path, texts: &[String]) -> Vec<FileMention> {
@@ -788,14 +827,14 @@ fn format_count(count: usize) -> String {
 mod tests {
     use std::{
         env,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use chrono::Utc;
 
     use super::*;
     use crate::{
-        compactor::{OutputSource, PreservedItem},
+        compactor::{NativeHeuristicCompactor, OutputCompactor, OutputSource, PreservedItem},
         store::{NewArtifact, NewRun, insert_run},
     };
 
@@ -985,6 +1024,15 @@ mod tests {
 
         assert!(rendered.contains("Command:  cargo test auth  exit code: 101"));
         assert!(rendered.contains("Included context:"));
+        assert!(
+            rendered.contains(
+                "Likely failure:  tests/auth/session_test.rs:52 expected expired session"
+            )
+        );
+        assert!(rendered.contains("Compact evidence:"));
+        assert!(
+            rendered.contains("  - stderr: tests/auth/session_test.rs:52 expected expired session")
+        );
         for item in &packet.items {
             assert!(!item.reason.trim().is_empty());
             let expected = format!(
@@ -1082,6 +1130,64 @@ mod tests {
         assert!(rendered.contains("packet tokens: 45"));
     }
 
+    #[test]
+    fn renders_golden_packet_for_rust_failure_fixture() {
+        let root = temp_root("golden-rust-packet");
+        fs::create_dir_all(root.join("src/commands")).expect("source directory should be created");
+        fs::write(
+            root.join("src/commands/packet.rs"),
+            source_with_line(
+                610,
+                &[
+                    "#[test]",
+                    "fn renders_packet() {",
+                    "    assert_eq!(actual.source(), \"useful source excerpt\");",
+                    "}",
+                    "",
+                ],
+            ),
+        )
+        .expect("source fixture should be written");
+
+        let stderr = include_bytes!("../../fixtures/outputs/rust_test_failure.stderr");
+        let args = vec![
+            "test".to_string(),
+            "commands::packet::tests::renders_packet".to_string(),
+        ];
+        let stdout_artifact = PathBuf::from("stdout.txt");
+        let stderr_artifact = PathBuf::from("stderr.txt");
+        let input = crate::compactor::CompactionInput {
+            command: "cargo",
+            args: &args,
+            exit_code: 101,
+            duration: Duration::from_millis(42),
+            stdout: b"",
+            stderr,
+            stdout_artifact: &stdout_artifact,
+            stderr_artifact: &stderr_artifact,
+        };
+        let compact = NativeHeuristicCompactor
+            .compact(&input)
+            .expect("fixture should compact");
+        let stderr_text = String::from_utf8_lossy(stderr).into_owned();
+        let mentions = file_mentions(&root, &[stderr_text, compact_lines(&compact)]);
+        let packet = build_evidence_packet(
+            PathBuf::from(".haycut/runs/golden-rust"),
+            manifest_fixture(
+                "golden-rust",
+                "cargo test commands::packet::tests::renders_packet",
+                101,
+                &root.display().to_string(),
+            ),
+            compact,
+            mentions,
+        );
+        let rendered = packet.render(&token_config());
+
+        fs::remove_dir_all(root).expect("test root should be removed");
+        insta::assert_snapshot!("rust_failure_packet", rendered);
+    }
+
     fn context_window_item(
         path: &str,
         start_line: usize,
@@ -1118,6 +1224,18 @@ mod tests {
                 .expect("system clock should be after Unix epoch")
                 .as_nanos()
         ))
+    }
+
+    fn source_with_line(target_line: usize, lines: &[&str]) -> String {
+        let mut source = String::new();
+        for line in 1..target_line {
+            source.push_str(&format!("// filler line {line}\n"));
+        }
+        for line in lines {
+            source.push_str(line);
+            source.push('\n');
+        }
+        source
     }
 
     fn write_run_artifacts(

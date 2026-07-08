@@ -1,0 +1,45 @@
+
+ RUN  v2.1.1 /repo/app
+
+stdout | tests/session.test.ts > session policy > rejects expired token
+noise 001: mounting test app
+noise 002: installing fake clock
+noise 003: hydrating auth store
+noise 004: creating router
+noise 005: dispatching request
+
+ ❯ tests/session.test.ts (18 tests | 1 failed) 42ms
+   × session policy > rejects expired token 12ms
+     → expected true to be false // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  tests/session.test.ts > session policy > rejects expired token
+AssertionError: expected true to be false // Object.is equality
+
+- Expected
++ Received
+
+- false
++ true
+
+ ❯ tests/session.test.ts:44:28
+     42|   const result = validateSession(expiredToken)
+     43|
+     44|   expect(result.ok).toBe(false)
+       |                            ^
+     45| })
+
+noise tail 001: transform cache unchanged
+noise tail 002: watcher disabled
+noise tail 003: browser pool closed
+noise tail 004: coverage skipped
+noise tail 005: teardown complete
+noise tail 006: teardown complete
+noise tail 007: teardown complete
+noise tail 008: teardown complete
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 17 passed (18)
+   Start at  10:17:23
+   Duration  853ms (transform 90ms, setup 20ms, collect 160ms, tests 42ms, environment 300ms, prepare 80ms)

@@ -1,0 +1,36 @@
+Compiling haycut v0.1.0 (/repo/haycut)
+Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+Running unittests src/main.rs (target/debug/deps/haycut-abc123)
+running 1 test
+setup noise 001: collecting cargo test harness output
+setup noise 002: compiling dependencies already cached
+setup noise 003: running filtered test target
+setup noise 004: preparing temporary project root
+setup noise 005: recording environment variables
+test commands::packet::tests::renders_packet ... FAILED
+
+failures:
+
+---- commands::packet::tests::renders_packet stdout ----
+thread 'commands::packet::tests::renders_packet' panicked at src/commands/packet.rs:612:9:
+assertion `left == right` failed
+  left: "packet source"
+ right: "useful source excerpt"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+tail noise 001: cargo wrote standard test epilogue
+tail noise 002: target directory unchanged
+tail noise 003: no doctests were executed
+tail noise 004: shell prompt would resume here
+tail noise 005: background output should be omitted
+tail noise 006: background output should be omitted
+tail noise 007: background output should be omitted
+tail noise 008: background output should be omitted
+tail noise 009: background output should be omitted
+tail noise 010: background output should be omitted
+
+failures:
+    commands::packet::tests::renders_packet
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.00s
+error: test failed, to rerun pass `--bin haycut`
