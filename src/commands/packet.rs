@@ -1236,6 +1236,17 @@ mod tests {
         fs::write(
             run_directory.join("compact.json"),
             serde_json::to_string_pretty(&compact).map_err(io::Error::other)?,
+        )?;
+        let evidence = crate::evidence::build(
+            id,
+            exit_code,
+            &compact,
+            "",
+            "error at tests/auth/session_test.rs:52:9\n",
+        );
+        fs::write(
+            run_directory.join("evidence.json"),
+            serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?,
         )
     }
 
@@ -1271,6 +1282,12 @@ mod tests {
                         path: run_directory.join("compact.json").display().to_string(),
                         estimated_tokens: Some(5),
                     },
+                    NewArtifact {
+                        id: format!("{id}:evidence_json"),
+                        kind: "evidence_json",
+                        path: run_directory.join("evidence.json").display().to_string(),
+                        estimated_tokens: Some(5),
+                    },
                 ],
             },
         )
@@ -1293,6 +1310,7 @@ mod tests {
             stdout: "stdout.txt".to_string(),
             stderr: "stderr.txt".to_string(),
             compact: "compact.json".to_string(),
+            evidence: "evidence.json".to_string(),
         }
     }
 }

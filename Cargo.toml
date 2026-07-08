@@ -25,4 +25,4 @@ uuid = { version = "1.10.0", features = ["v4"] }
 test-utils = []
 
 [dev-dependencies]
-insta = "1"
+insta = { version = "1", features = ["json"] }

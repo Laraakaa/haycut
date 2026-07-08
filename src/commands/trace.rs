@@ -15,6 +15,7 @@ use crate::{
         CompactPacket, CompactionInput, NativeHeuristicCompactor, OutputCompactor, RtkCompactor,
     },
     config::Config,
+    evidence::{self, EvidencePacket},
     store::{self, NewArtifact, NewRun, RUN_STORE_PATH},
     util::{estimate_tokens, format_count},
 };
@@ -41,6 +42,8 @@ pub struct ArtifactPaths {
     pub stderr: PathBuf,
     pub compact_json: PathBuf,
     pub compact_text: Option<PathBuf>,
+    pub evidence_json: PathBuf,
+    pub evidence_text: PathBuf,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -60,6 +63,7 @@ pub struct RunManifest {
     pub stdout: String,
     pub stderr: String,
     pub compact: String,
+    pub evidence: String,
 }
 
 impl RunManifest {
@@ -86,7 +90,15 @@ pub fn run(command: Vec<String>, compactor: Option<CompactorMode>) -> i32 {
             match store_artifacts(&trace) {
                 Ok(mut artifacts) => match compact_trace(&trace, &mut artifacts, compactor) {
                     Ok(packet) => {
-                        if let Err(error) = store_run(&trace, &artifacts, &packet) {
+                        let evidence = match store_evidence(&trace, &artifacts, &packet) {
+                            Ok(evidence) => evidence,
+                            Err(error) => {
+                                eprintln!("Error building evidence packet: {error}");
+                                return 1;
+                            }
+                        };
+
+                        if let Err(error) = store_run(&trace, &artifacts, &packet, &evidence) {
                             eprintln!("Error storing trace run: {error}");
                             return 1;
                         }
@@ -136,16 +148,18 @@ fn capture_command(command: Vec<String>) -> io::Result<CommandTrace> {
 }
 
 fn store_artifacts(trace: &CommandTrace) -> io::Result<ArtifactPaths> {
-    store_artifacts_in(trace, &PathBuf::from(ARTIFACT_ROOT))
+    store_artifacts_in(trace, Path::new(ARTIFACT_ROOT))
 }
 
-fn store_artifacts_in(trace: &CommandTrace, artifact_root: &PathBuf) -> io::Result<ArtifactPaths> {
+fn store_artifacts_in(trace: &CommandTrace, artifact_root: &Path) -> io::Result<ArtifactPaths> {
     let id = run_id(trace.start_time);
     let run_directory = artifact_root.join(&id);
     let run_json = run_directory.join("run.json");
     let stdout = run_directory.join("stdout.txt");
     let stderr = run_directory.join("stderr.txt");
     let compact_json = run_directory.join("compact.json");
+    let evidence_json = run_directory.join("evidence.json");
+    let evidence_text = run_directory.join("evidence.txt");
 
     fs::create_dir_all(&run_directory)?;
     fs::write(&stdout, &trace.stdout)?;
@@ -168,6 +182,7 @@ fn store_artifacts_in(trace: &CommandTrace, artifact_root: &PathBuf) -> io::Resu
         stdout: "stdout.txt".to_string(),
         stderr: "stderr.txt".to_string(),
         compact: "compact.json".to_string(),
+        evidence: "evidence.json".to_string(),
     };
     let metadata = serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?;
     fs::write(&run_json, metadata)?;
@@ -180,6 +195,8 @@ fn store_artifacts_in(trace: &CommandTrace, artifact_root: &PathBuf) -> io::Resu
         stderr,
         compact_json,
         compact_text: None,
+        evidence_json,
+        evidence_text,
     })
 }
 
@@ -252,22 +269,50 @@ fn store_compact_packet(
     Ok(())
 }
 
+fn store_evidence(
+    trace: &CommandTrace,
+    artifacts: &ArtifactPaths,
+    packet: &CompactPacket,
+) -> io::Result<EvidencePacket> {
+    let manifest = RunManifest::load(&artifacts.run_json)?;
+    let stdout = String::from_utf8_lossy(&trace.stdout);
+    let stderr = String::from_utf8_lossy(&trace.stderr);
+
+    let evidence = evidence::build(&manifest.id, trace.exit_code, packet, &stdout, &stderr);
+
+    let json = serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?;
+    fs::write(&artifacts.evidence_json, json)?;
+    fs::write(&artifacts.evidence_text, evidence.render_text())?;
+
+    Ok(evidence)
+}
+
 fn store_run(
     trace: &CommandTrace,
     artifacts: &ArtifactPaths,
     packet: &CompactPacket,
+    evidence: &EvidencePacket,
 ) -> io::Result<()> {
-    store_run_in(trace, artifacts, packet, Path::new(RUN_STORE_PATH))
+    store_run_in(
+        trace,
+        artifacts,
+        packet,
+        evidence,
+        Path::new(RUN_STORE_PATH),
+    )
 }
 
 fn store_run_in(
     trace: &CommandTrace,
     artifacts: &ArtifactPaths,
     packet: &CompactPacket,
+    evidence: &EvidencePacket,
     db_path: &Path,
 ) -> io::Result<()> {
     let manifest = RunManifest::load(&artifacts.run_json)?;
     let token_estimate = estimate_raw_tokens(trace);
+    let evidence_tokens =
+        estimate_tokens(serde_json::to_vec(evidence).unwrap_or_default().as_slice());
     let mut artifact_rows = vec![
         new_artifact(&manifest.id, "run_manifest", &artifacts.run_json, None),
         new_artifact(
@@ -287,6 +332,12 @@ fn store_run_in(
             "compact_json",
             &artifacts.compact_json,
             Some(to_i64(packet.packet_tokens, "packet token estimate")?),
+        ),
+        new_artifact(
+            &manifest.id,
+            "evidence_json",
+            &artifacts.evidence_json,
+            Some(to_i64(evidence_tokens, "evidence token estimate")?),
         ),
     ];
 
@@ -411,6 +462,7 @@ fn print_trace(trace: &CommandTrace, artifacts: &ArtifactPaths, packet: &Compact
     println!("artifact directory: {}", artifacts.run_directory.display());
     println!("run metadata: {}", artifacts.run_json.display());
     println!("compact packet: {}", artifacts.compact_json.display());
+    println!("evidence packet: {}", artifacts.evidence_json.display());
     println!("stdout artifact: {}", artifacts.stdout.display());
     println!("stderr artifact: {}", artifacts.stderr.display());
     if let Some(compact_text) = artifacts.compact_text.as_deref() {
@@ -563,7 +615,10 @@ mod tests {
             compact_text: None,
         };
 
-        store_run_in(&trace, &artifacts, &packet, &db_path).expect("run should store in SQLite");
+        let evidence =
+            store_evidence(&trace, &artifacts, &packet).expect("evidence should be built");
+        store_run_in(&trace, &artifacts, &packet, &evidence, &db_path)
+            .expect("run should store in SQLite");
 
         let stored_run = crate::store::latest_run(&db_path).expect("latest run should load");
         let manifest = RunManifest::load(&artifacts.run_json).expect("manifest should load");
@@ -578,6 +633,12 @@ mod tests {
                 .artifact_path("run_manifest")
                 .expect("run manifest artifact should exist"),
             artifacts.run_json.display().to_string()
+        );
+        assert_eq!(
+            stored_run
+                .artifact_path("evidence_json")
+                .expect("evidence artifact should exist"),
+            artifacts.evidence_json.display().to_string()
         );
 
         fs::remove_dir_all(artifact_root).expect("test artifacts should be removed");

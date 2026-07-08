@@ -53,6 +53,10 @@ pub enum Commands {
 
     /// Show context reduction information for captured runs
     Report {
+        /// Report on the most recent run (default behaviour)
+        #[arg(long)]
+        last: bool,
+
         /// Emit a machine-readable JSON report
         #[arg(long)]
         json: bool,
@@ -141,10 +145,14 @@ impl Cli {
             }
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
             Some(Commands::Report {
+                last,
                 json,
                 markdown,
                 symbols,
-            }) => commands::report::run(json, markdown, symbols),
+            }) => {
+                let _ = last;
+                commands::report::run(json, markdown, symbols)
+            }
             Some(Commands::Packet { budget, force }) => commands::packet::run(budget, force),
             Some(Commands::ReadSymbol { target }) => commands::read_symbol::run(target),
             Some(Commands::ReadWindow {

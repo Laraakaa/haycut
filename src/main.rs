@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod compactor;
 mod config;
+pub mod evidence;
 pub mod extract;
 pub mod model;
 mod store;

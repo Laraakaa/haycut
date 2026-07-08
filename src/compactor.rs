@@ -139,8 +139,7 @@ impl RtkCompactor {
         let output = Command::new("rtk").arg("--version").output()?;
 
         if !output.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
@@ -178,8 +177,7 @@ impl OutputCompactor for RtkCompactor {
         let output = child.wait_with_output()?;
 
         if !output.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
@@ -261,18 +259,18 @@ fn collect_native_items(
     let mut stack_locations = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
-        if let Some(location) = stack_trace_location(line) {
-            if !stack_locations.contains(&location) {
-                stack_locations.push(location);
-            }
+        if let Some(location) = stack_trace_location(line)
+            && !stack_locations.contains(&location)
+        {
+            stack_locations.push(location);
         }
 
         if is_error_line(line) {
             let start = index.saturating_sub(2);
             let end = (index + 5).min(lines.len().saturating_sub(1));
 
-            for keep_index in start..=end {
-                keep[keep_index] = true;
+            for slot in keep.iter_mut().take(end + 1).skip(start) {
+                *slot = true;
             }
         }
     }

@@ -1,0 +1,61 @@
+---
+source: src/evidence.rs
+assertion_line: 474
+expression: evidence
+---
+{
+  "schema_version": 1,
+  "run_id": "2026-07-08T082655Z-13e58c",
+  "outcome": {
+    "exit_code": 101,
+    "status": "failure"
+  },
+  "likely_failure": {
+    "kind": "test_failure",
+    "summary": "Test commands::packet::tests::renders_packet failed",
+    "confidence": "high"
+  },
+  "primary_diagnostic": {
+    "source": "stderr",
+    "message": "assertion `left == right` failed",
+    "file": "src/commands/packet.rs",
+    "line": 612,
+    "column": 9
+  },
+  "diagnostics": [
+    {
+      "kind": "test_failure",
+      "severity": "error",
+      "message": "test commands::packet::tests::renders_packet failed"
+    },
+    {
+      "kind": "panic",
+      "severity": "error",
+      "message": "assertion `left == right` failed",
+      "file": "src/commands/packet.rs",
+      "line": 612,
+      "column": 9
+    }
+  ],
+  "file_refs": [
+    {
+      "file": "src/commands/packet.rs",
+      "line": 612,
+      "column": 9,
+      "reason": "source file location"
+    }
+  ],
+  "context_items": [
+    {
+      "kind": "file_window",
+      "target": "src/commands/packet.rs:602-622",
+      "reason": "Primary compiler diagnostic location"
+    }
+  ],
+  "token_summary": {
+    "raw_tokens": 381,
+    "packet_tokens": 252,
+    "saved_tokens": 129,
+    "reduction_percent": 33.9
+  }
+}

@@ -3,15 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{commands::trace::RunManifest, compactor::CompactPacket, store};
+use crate::{
+    commands::trace::RunManifest, compactor::CompactPacket, evidence::EvidencePacket, store,
+};
 
-/// Shared context loaded from a stored run: manifest, compact packet, and run
-/// directory.  Centralises the repeated "find last run → load manifest → load
-/// compact" pattern used by `packet`, `report`, and `suggest`.
+/// Shared context loaded from a stored run: manifest, compact packet, evidence
+/// packet, and run directory.  Centralises the repeated "find last run → load
+/// manifest → load compact" pattern used by `packet`, `report`, and `suggest`.
 pub struct RunContext {
     pub run_directory: PathBuf,
     pub manifest: RunManifest,
     pub compact: CompactPacket,
+    pub evidence: EvidencePacket,
 }
 
 impl RunContext {
@@ -34,6 +37,7 @@ impl RunContext {
 
         let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
         let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
+        let evidence_path = PathBuf::from(stored_run.artifact_path("evidence_json")?);
         let run_directory = run_json_path
             .parent()
             .map(Path::to_path_buf)
@@ -53,10 +57,23 @@ impl RunContext {
             )
         })?;
 
+        let evidence_contents = fs::read_to_string(&evidence_path)?;
+        let evidence: EvidencePacket =
+            serde_json::from_str(&evidence_contents).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid evidence packet {}: {error}",
+                        evidence_path.display()
+                    ),
+                )
+            })?;
+
         Ok(Self {
             run_directory,
             manifest,
             compact,
+            evidence,
         })
     }
 

@@ -78,10 +78,10 @@ fn find_symbol_matches(root: &Path, target: &SymbolTarget) -> io::Result<Vec<Sym
     let mut matches = Vec::new();
     for (path, language) in symbol_files(root) {
         let relative_path = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        if let Some(target_path) = target.path.as_deref() {
-            if relative_path != target_path {
-                continue;
-            }
+        if let Some(target_path) = target.path.as_deref()
+            && relative_path != target_path
+        {
+            continue;
         }
 
         let source = fs::read_to_string(&path)?;
@@ -133,13 +133,14 @@ fn symbol_files(root: &Path) -> Vec<(PathBuf, SymbolLanguage)> {
 }
 
 fn parse_target(target: &str) -> SymbolTarget {
-    if let Some((path, name)) = target.rsplit_once("::") {
-        if SymbolLanguage::from_path(Path::new(path)).is_some() && !name.is_empty() {
-            return SymbolTarget {
-                path: Some(path.to_string()),
-                name: name.to_string(),
-            };
-        }
+    if let Some((path, name)) = target.rsplit_once("::")
+        && SymbolLanguage::from_path(Path::new(path)).is_some()
+        && !name.is_empty()
+    {
+        return SymbolTarget {
+            path: Some(path.to_string()),
+            name: name.to_string(),
+        };
     }
 
     SymbolTarget {

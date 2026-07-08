@@ -1,0 +1,58 @@
+---
+source: src/evidence.rs
+assertion_line: 465
+expression: evidence
+---
+{
+  "schema_version": 1,
+  "run_id": "2026-07-08T082655Z-13e58c",
+  "outcome": {
+    "exit_code": 101,
+    "status": "failure"
+  },
+  "likely_failure": {
+    "kind": "compile_error",
+    "summary": "Missing field `model` in initializer of `config::Config`",
+    "confidence": "high"
+  },
+  "primary_diagnostic": {
+    "source": "stderr",
+    "message": "missing field `model` in initializer of `config::Config`",
+    "code": "E0063",
+    "file": "src/config.rs",
+    "line": 54,
+    "column": 9
+  },
+  "diagnostics": [
+    {
+      "kind": "rust_compile_error",
+      "severity": "error",
+      "code": "E0063",
+      "message": "missing field `model` in initializer of `config::Config`",
+      "file": "src/config.rs",
+      "line": 54,
+      "column": 9
+    }
+  ],
+  "file_refs": [
+    {
+      "file": "src/config.rs",
+      "line": 54,
+      "column": 9,
+      "reason": "compiler diagnostic location"
+    }
+  ],
+  "context_items": [
+    {
+      "kind": "file_window",
+      "target": "src/config.rs:44-64",
+      "reason": "Primary compiler diagnostic location"
+    }
+  ],
+  "token_summary": {
+    "raw_tokens": 82,
+    "packet_tokens": 116,
+    "saved_tokens": 0,
+    "reduction_percent": 0.0
+  }
+}

@@ -5,7 +5,7 @@
 ///   - General path:col:     `src/lib.rs:12:5`
 ///   - Path:line only:       `tests/test_config.py:42`
 ///   - Python traceback:     `File "...", line 123`
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FileReference {
@@ -17,6 +17,298 @@ pub struct FileReference {
     pub source: String,
     /// Human-readable description of why this location was extracted.
     pub reason: &'static str,
+}
+
+/// Severity of an extracted [`Diagnostic`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+/// Category of an extracted [`Diagnostic`], from most to least specific.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticKind {
+    RustCompileError,
+    TestFailure,
+    Panic,
+    Generic,
+}
+
+/// A structured diagnostic extracted from raw command output.
+///
+/// This is the semantic unit HayCut derives evidence from. Extraction runs in
+/// layers (see [`extract_diagnostics`]): a Rust compiler layer, a test-failure
+/// layer, and a generic fallback layer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Diagnostic {
+    pub kind: DiagnosticKind,
+    pub severity: Severity,
+    pub code: Option<String>,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    /// Which output stream the diagnostic was found in (e.g. "stderr").
+    pub source: String,
+    /// Test name for [`DiagnosticKind::TestFailure`] diagnostics.
+    pub test_name: Option<String>,
+}
+
+/// Extract structured diagnostics from `stdout` and `stderr`.
+///
+/// Runs three layers in priority order:
+/// 1. Rust compiler diagnostics (`error[E0063]: ...` + `--> file:line:col`).
+/// 2. Test failures (`test NAME ... FAILED`, `panicked at file:line:col`).
+/// 3. Generic fallback (obvious error/warning/panic lines) — only when the
+///    first two layers found nothing, keeping structured output clean.
+///
+/// `stderr` is scanned before `stdout` because failures usually surface there.
+pub fn extract_diagnostics(stdout: &str, stderr: &str, _exit_code: i32) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for (text, source) in [(stderr, "stderr"), (stdout, "stdout")] {
+        diagnostics.extend(rust_compiler_diagnostics(text, source));
+        diagnostics.extend(test_failure_diagnostics(text, source));
+    }
+
+    if diagnostics.is_empty() {
+        for (text, source) in [(stderr, "stderr"), (stdout, "stdout")] {
+            diagnostics.extend(generic_diagnostics(text, source));
+        }
+    }
+
+    dedupe_diagnostics(diagnostics)
+}
+
+// ── Rust compiler layer ───────────────────────────────────────────────────────
+
+/// Detect `error[E0063]: message` / `warning: message` headers and attach the
+/// location from the following `--> file:line:col` arrow line.
+fn rust_compiler_diagnostics(text: &str, source: &str) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut diagnostics = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let Some((severity, code, message)) = parse_rust_header(line) else {
+            continue;
+        };
+
+        // Look ahead a few lines for the `--> file:line:col` arrow, stopping if
+        // another header begins first.
+        let mut file = None;
+        let mut line_number = None;
+        let mut column = None;
+        for look in lines.iter().skip(index + 1).take(4) {
+            if parse_rust_header(look).is_some() {
+                break;
+            }
+            if let Some(location) = rust_compiler_location(look, source) {
+                file = Some(location.path);
+                line_number = Some(location.line);
+                column = location.column;
+                break;
+            }
+        }
+
+        // Only treat as a compile diagnostic when it carries a code or a
+        // resolved location; this excludes cargo lines like
+        // `error: could not compile ...`.
+        if code.is_none() && file.is_none() {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            kind: DiagnosticKind::RustCompileError,
+            severity,
+            code,
+            message,
+            file,
+            line: line_number,
+            column,
+            source: source.to_string(),
+            test_name: None,
+        });
+    }
+
+    diagnostics
+}
+
+/// Parse a Rust compiler header line: `error[E0063]: msg`, `warning: msg`,
+/// or `error TS2322: msg`. Returns `(severity, code, message)`.
+fn parse_rust_header(line: &str) -> Option<(Severity, Option<String>, String)> {
+    let trimmed = line.trim_start();
+    let (severity, rest) = if let Some(rest) = trimmed.strip_prefix("error") {
+        (Severity::Error, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("warning") {
+        (Severity::Warning, rest)
+    } else {
+        return None;
+    };
+
+    // Optional bracketed code: `[E0063]`.
+    let (code, after_code) = if let Some(rest) = rest.strip_prefix('[') {
+        let end = rest.find(']')?;
+        (Some(rest[..end].to_string()), &rest[end + 1..])
+    } else {
+        (None, rest)
+    };
+
+    let message = after_code.strip_prefix(':')?.trim().to_string();
+    if message.is_empty() {
+        return None;
+    }
+
+    Some((severity, code, message))
+}
+
+// ── test-failure layer ────────────────────────────────────────────────────────
+
+/// Detect `test NAME ... FAILED` summary lines and `panicked at file:line:col`
+/// locations (with the assertion/message from the following line).
+fn test_failure_diagnostics(text: &str, source: &str) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut diagnostics = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if let Some(test_name) = parse_failed_test(trimmed) {
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::TestFailure,
+                severity: Severity::Error,
+                code: None,
+                message: format!("test {test_name} failed"),
+                file: None,
+                line: None,
+                column: None,
+                source: source.to_string(),
+                test_name: Some(test_name),
+            });
+            continue;
+        }
+
+        if let Some((test_name, location)) = parse_panic(trimmed, source) {
+            let message = lines
+                .get(index + 1)
+                .map(|next| next.trim())
+                .filter(|next| !next.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "panicked".to_string());
+
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::Panic,
+                severity: Severity::Error,
+                code: None,
+                message,
+                file: location.as_ref().map(|l| l.path.clone()),
+                line: location.as_ref().map(|l| l.line),
+                column: location.as_ref().and_then(|l| l.column),
+                source: source.to_string(),
+                test_name,
+            });
+        }
+    }
+
+    diagnostics
+}
+
+/// Parse `test some::path ... FAILED`, returning the test name.
+fn parse_failed_test(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("test ")?;
+    let name = rest.strip_suffix(" ... FAILED")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Parse `thread 'NAME' panicked at file:line:col:`, returning the thread/test
+/// name and the panic location (if the `panicked at` clause carries one).
+fn parse_panic(line: &str, source: &str) -> Option<(Option<String>, Option<FileReference>)> {
+    let panic_index = line.find("panicked at")?;
+
+    // Thread name lives in the first `'...'` before the panic clause.
+    let head = &line[..panic_index];
+    let test_name = head.find('\'').and_then(|start| {
+        let inner = &head[start + 1..];
+        inner.find('\'').map(|end| inner[..end].to_string())
+    });
+
+    let after_panic = line[panic_index + "panicked at".len()..].trim();
+    let location = parse_path_line_col(after_panic, source, "panic location");
+
+    Some((test_name, location))
+}
+
+// ── generic fallback layer ────────────────────────────────────────────────────
+
+/// Emit a generic diagnostic for each obvious error/warning/panic/assertion
+/// line. Used only as a fallback when no structured diagnostics were found.
+fn generic_diagnostics(text: &str, source: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let is_error = lower.starts_with("error")
+            || lower.contains("panic")
+            || lower.contains("assertion")
+            || lower.contains("failed")
+            || lower.contains("exception")
+            || lower.contains("traceback");
+        let is_warning = lower.starts_with("warning");
+
+        if !is_error && !is_warning {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            kind: DiagnosticKind::Generic,
+            severity: if is_warning {
+                Severity::Warning
+            } else {
+                Severity::Error
+            },
+            code: None,
+            message: trimmed.to_string(),
+            file: None,
+            line: None,
+            column: None,
+            source: source.to_string(),
+            test_name: None,
+        });
+    }
+
+    diagnostics
+}
+
+/// Drop diagnostics that duplicate an earlier one on kind, message, and file.
+fn dedupe_diagnostics(diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut seen = Vec::new();
+    let mut unique = Vec::new();
+
+    for diagnostic in diagnostics {
+        let key = (
+            diagnostic.kind,
+            diagnostic.message.clone(),
+            diagnostic.file.clone(),
+            diagnostic.line,
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        unique.push(diagnostic);
+    }
+
+    unique
 }
 
 /// Extract every file reference from `text`, tagging each one with `source`
@@ -158,11 +450,8 @@ fn parse_path_line_col(text: &str, source: &str, reason: &'static str) -> Option
 
         // Optional column: `:N` immediately after the line number.
         let after_line = &after_colon[line_str.len()..];
-        let column = if after_line.starts_with(':') {
-            let col_str: String = after_line[1..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+        let column = if let Some(rest) = after_line.strip_prefix(':') {
+            let col_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             col_str.parse::<usize>().ok().filter(|&c| c > 0)
         } else {
             None
@@ -320,5 +609,72 @@ mod tests {
     fn ignores_lines_without_source_paths() {
         let result = refs("FAILED tests::my_test");
         assert!(result.is_empty());
+    }
+
+    // ── diagnostic extraction ─────────────────────────────────────────────────
+
+    #[test]
+    fn extracts_rust_compile_error_with_location() {
+        let text = "error[E0063]: missing field `model` in initializer of `config::Config`\n  --> src/config.rs:54:9";
+        let diagnostics = extract_diagnostics("", text, 101);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.kind, DiagnosticKind::RustCompileError);
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(diagnostic.code.as_deref(), Some("E0063"));
+        assert_eq!(
+            diagnostic.message,
+            "missing field `model` in initializer of `config::Config`"
+        );
+        assert_eq!(diagnostic.file.as_deref(), Some("src/config.rs"));
+        assert_eq!(diagnostic.line, Some(54));
+        assert_eq!(diagnostic.column, Some(9));
+        assert_eq!(diagnostic.source, "stderr");
+    }
+
+    #[test]
+    fn ignores_cargo_could_not_compile_line() {
+        let text = "error: could not compile `haycut` (bin \"haycut\") due to 1 previous error";
+        let diagnostics = extract_diagnostics("", text, 101);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.kind != DiagnosticKind::RustCompileError)
+        );
+    }
+
+    #[test]
+    fn extracts_failed_test_and_panic_location() {
+        let text = "test commands::packet::tests::renders_packet ... FAILED\n\
+             thread 'commands::packet::tests::renders_packet' panicked at src/commands/packet.rs:612:9:\n\
+             assertion `left == right` failed";
+        let diagnostics = extract_diagnostics("", text, 101);
+
+        let failed = diagnostics
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::TestFailure)
+            .expect("test failure diagnostic");
+        assert_eq!(
+            failed.test_name.as_deref(),
+            Some("commands::packet::tests::renders_packet")
+        );
+
+        let panic = diagnostics
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::Panic)
+            .expect("panic diagnostic");
+        assert_eq!(panic.file.as_deref(), Some("src/commands/packet.rs"));
+        assert_eq!(panic.line, Some(612));
+        assert_eq!(panic.column, Some(9));
+        assert_eq!(panic.message, "assertion `left == right` failed");
+    }
+
+    #[test]
+    fn generic_layer_runs_only_as_fallback() {
+        let text = "error: something broke\nnote: irrelevant";
+        let diagnostics = extract_diagnostics("", text, 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::Generic);
+        assert_eq!(diagnostics[0].message, "error: something broke");
     }
 }

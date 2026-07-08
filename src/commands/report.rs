@@ -10,15 +10,15 @@ use crate::{
         run_context::RunContext,
         trace::RunManifest,
     },
-    compactor::{CompactPacket, OmittedItem, OutputSource, PreservedItem, PreservedKind},
     config::{Config, TokenConfig},
+    evidence::{
+        self, ContextItem, EvidenceDiagnostic, EvidencePacket, FileRef, LikelyFailure,
+        PrimaryDiagnostic,
+    },
     store::RUN_STORE_PATH,
     util::format_count,
 };
 use serde::Serialize;
-
-const MAX_PRESERVED_ITEMS: usize = 8;
-const MAX_OMITTED_ITEMS: usize = 8;
 
 pub fn run(json: bool, markdown: bool, symbols: Vec<String>) -> i32 {
     let format = match ReportFormat::from_flags(json, markdown) {
@@ -52,11 +52,14 @@ pub fn run(json: bool, markdown: bool, symbols: Vec<String>) -> i32 {
     }
 }
 
+/// A report is a pure view over a stored run's evidence packet plus optional
+/// symbol snippets. All failure intelligence lives in [`crate::evidence`];
+/// this module only renders it.
 #[derive(Debug)]
 struct Report {
     run_directory: PathBuf,
     manifest: RunManifest,
-    packet: CompactPacket,
+    evidence: EvidencePacket,
     symbols: Vec<SymbolMatch>,
 }
 
@@ -84,7 +87,7 @@ fn load_last_report(root: &Path, symbol_targets: &[String]) -> io::Result<Report
     Ok(Report {
         run_directory: ctx.run_directory,
         manifest: ctx.manifest,
-        packet: ctx.compact,
+        evidence: ctx.evidence,
         symbols,
     })
 }
@@ -107,16 +110,45 @@ fn print_report(
     Ok(())
 }
 
+/// Token totals for the report, folding symbol snippets into the packet cost.
+struct TokenView {
+    raw: usize,
+    packet: usize,
+    saved: usize,
+    reduction: f64,
+}
+
+fn token_view(report: &Report) -> TokenView {
+    let raw = report.evidence.token_summary.raw_tokens;
+    let symbol_tokens: usize = report.symbols.iter().map(|s| s.estimated_tokens).sum();
+    let packet = report.evidence.token_summary.packet_tokens + symbol_tokens;
+    let saved = raw.saturating_sub(packet);
+
+    TokenView {
+        raw,
+        packet,
+        saved,
+        reduction: reduction_percent(raw, packet),
+    }
+}
+
+// ── JSON ──────────────────────────────────────────────────────────────────────
+
 #[derive(Serialize)]
-struct JsonReport {
+struct JsonReport<'a> {
     schema_version: u8,
     run: JsonRun,
-    token_estimates: JsonTokenEstimates,
-    reduction_percent: f64,
+    outcome: JsonOutcome<'a>,
+    token_summary: JsonTokenSummary,
     budget: JsonBudget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    likely_failure: &'a Option<LikelyFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_diagnostic: &'a Option<PrimaryDiagnostic>,
+    diagnostics: &'a [EvidenceDiagnostic],
+    file_refs: &'a [FileRef],
+    context_items: &'a [ContextItem],
     artefacts: JsonArtefacts,
-    preserved_evidence_count: usize,
-    omitted_evidence: Vec<JsonOmittedEvidence>,
     symbols: Vec<JsonSymbol>,
 }
 
@@ -124,19 +156,24 @@ struct JsonReport {
 struct JsonRun {
     id: String,
     command: String,
-    exit_code: i32,
-    result: &'static str,
     duration_ms: u128,
     created_at: String,
 }
 
 #[derive(Serialize)]
-struct JsonTokenEstimates {
-    raw_total: usize,
-    raw_stdout: usize,
-    raw_stderr: usize,
-    packet: usize,
-    saved: usize,
+struct JsonOutcome<'a> {
+    exit_code: i32,
+    status: &'a str,
+}
+
+#[derive(Serialize)]
+struct JsonTokenSummary {
+    raw_tokens: usize,
+    raw_stdout_tokens: usize,
+    raw_stderr_tokens: usize,
+    packet_tokens: usize,
+    saved_tokens: usize,
+    reduction_percent: f64,
 }
 
 #[derive(Serialize)]
@@ -148,16 +185,11 @@ struct JsonBudget {
 
 #[derive(Serialize)]
 struct JsonArtefacts {
+    run_manifest: String,
     stdout: String,
     stderr: String,
     compact: String,
-}
-
-#[derive(Serialize)]
-struct JsonOmittedEvidence {
-    source: &'static str,
-    reason: String,
-    count: usize,
+    evidence: String,
 }
 
 #[derive(Serialize)]
@@ -169,54 +201,41 @@ struct JsonSymbol {
     estimated_tokens: usize,
 }
 
-fn json_report(report: &Report, token_config: &TokenConfig) -> JsonReport {
-    let packet_tokens = evidence_packet_tokens(report);
-    let raw_tokens_avoided = report.packet.raw_tokens.saturating_sub(packet_tokens);
-    let budget = BudgetUsage::from_config(token_config, report.packet.raw_tokens, packet_tokens);
-    let stdout_path = report.run_directory.join(&report.manifest.stdout);
-    let stderr_path = report.run_directory.join(&report.manifest.stderr);
-    let compact_path = report.run_directory.join(&report.manifest.compact);
+fn json_report<'a>(report: &'a Report, token_config: &TokenConfig) -> JsonReport<'a> {
+    let tokens = token_view(report);
+    let budget = BudgetUsage::from_config(token_config, tokens.raw, tokens.packet);
 
     JsonReport {
         schema_version: 1,
         run: JsonRun {
             id: report.manifest.id.clone(),
             command: report.manifest.command.clone(),
-            exit_code: report.manifest.exit_code,
-            result: result_label(report.manifest.exit_code),
             duration_ms: report.manifest.duration_ms,
             created_at: report.manifest.created_at.to_rfc3339(),
         },
-        token_estimates: JsonTokenEstimates {
-            raw_total: report.packet.raw_tokens,
-            raw_stdout: report.packet.raw_stdout_tokens,
-            raw_stderr: report.packet.raw_stderr_tokens,
-            packet: packet_tokens,
-            saved: raw_tokens_avoided,
+        outcome: JsonOutcome {
+            exit_code: report.evidence.outcome.exit_code,
+            status: &report.evidence.outcome.status,
         },
-        reduction_percent: reduction_percent(report.packet.raw_tokens, packet_tokens),
+        token_summary: JsonTokenSummary {
+            raw_tokens: tokens.raw,
+            raw_stdout_tokens: report.manifest.raw_stdout_tokens_estimated,
+            raw_stderr_tokens: report.manifest.raw_stderr_tokens_estimated,
+            packet_tokens: tokens.packet,
+            saved_tokens: tokens.saved,
+            reduction_percent: tokens.reduction,
+        },
         budget: JsonBudget {
             soft: budget.soft_budget,
             hard: budget.hard_budget,
             status: budget_status_label(budget.status),
         },
-        artefacts: JsonArtefacts {
-            stdout: stdout_path.display().to_string(),
-            stderr: stderr_path.display().to_string(),
-            compact: compact_path.display().to_string(),
-        },
-        preserved_evidence_count: report.packet.preserved_items.len(),
-        omitted_evidence: report
-            .packet
-            .omitted_items
-            .iter()
-            .filter(|item| item.count > 0)
-            .map(|item| JsonOmittedEvidence {
-                source: source_label(item.source),
-                reason: item.reason.clone(),
-                count: item.count,
-            })
-            .collect(),
+        likely_failure: &report.evidence.likely_failure,
+        primary_diagnostic: &report.evidence.primary_diagnostic,
+        diagnostics: &report.evidence.diagnostics,
+        file_refs: &report.evidence.file_refs,
+        context_items: &report.evidence.context_items,
+        artefacts: json_artefacts(report),
         symbols: report
             .symbols
             .iter()
@@ -231,16 +250,132 @@ fn json_report(report: &Report, token_config: &TokenConfig) -> JsonReport {
     }
 }
 
+fn json_artefacts(report: &Report) -> JsonArtefacts {
+    JsonArtefacts {
+        run_manifest: artefact_path(report, "run.json"),
+        stdout: artefact_path(report, &report.manifest.stdout),
+        stderr: artefact_path(report, &report.manifest.stderr),
+        compact: artefact_path(report, &report.manifest.compact),
+        evidence: artefact_path(report, &report.manifest.evidence),
+    }
+}
+
+// ── human text ────────────────────────────────────────────────────────────────
+
+fn human_report(report: &Report, token_config: &TokenConfig) -> String {
+    let tokens = token_view(report);
+    let budget = BudgetUsage::from_config(token_config, tokens.raw, tokens.packet);
+    let mut output = String::new();
+
+    output.push_str("HayCut report\n\n");
+
+    output.push_str("Result\n");
+    output.push_str(&format!("  run: {}\n", report.manifest.id));
+    output.push_str(&format!("  command: {}\n", report.manifest.command));
+    output.push_str(&format!(
+        "  exit code: {}\n",
+        report.evidence.outcome.exit_code
+    ));
+    output.push_str(&format!("  status: {}\n", report.evidence.outcome.status));
+    output.push_str(&format!(
+        "  duration: {}\n",
+        format_duration(report.manifest.duration_ms)
+    ));
+
+    output.push_str("\nToken spend\n");
+    output.push_str(&format!("  raw: {}\n", format_count(tokens.raw)));
+    output.push_str(&format!("  packet: {}\n", format_count(tokens.packet)));
+    output.push_str(&format!("  saved: {}\n", format_count(tokens.saved)));
+    output.push_str(&format!("  reduction: {:.1}%\n", tokens.reduction));
+    output.push_str(&format!(
+        "  budget: {} (soft {}, hard {})\n",
+        budget_status_label(budget.status),
+        format_count(budget.soft_budget),
+        format_count(budget.hard_budget)
+    ));
+
+    output.push_str("\nLikely failure\n");
+    match &report.evidence.likely_failure {
+        Some(failure) => {
+            output.push_str(&format!("  {}: {}\n", failure.kind, failure.summary));
+        }
+        None => output.push_str("  none detected\n"),
+    }
+
+    output.push_str("\nPrimary diagnostic\n");
+    match &report.evidence.primary_diagnostic {
+        Some(primary) => {
+            output.push_str(&format!("  {}\n", evidence::primary_location(primary)));
+            output.push_str(&format!("  {}\n", primary_detail(primary)));
+        }
+        None => output.push_str("  none detected\n"),
+    }
+
+    output.push_str("\nContext candidates\n");
+    if report.evidence.context_items.is_empty() {
+        output.push_str("  none\n");
+    } else {
+        for item in &report.evidence.context_items {
+            output.push_str(&format!("  {}\n", item.target));
+            output.push_str(&format!("    reason: {}\n", item.reason));
+        }
+    }
+
+    if !report.symbols.is_empty() {
+        output.push_str("\nSymbols\n");
+        for symbol in &report.symbols {
+            output.push_str(&format!(
+                "  {}::{} lines {}-{} ({} tokens)\n",
+                symbol.path,
+                symbol.symbol.name,
+                symbol.symbol.start_line,
+                symbol.symbol.end_line,
+                format_count(symbol.estimated_tokens)
+            ));
+            output.push_str("  <code>\n");
+            for line in symbol.code.lines() {
+                output.push_str("  ");
+                output.push_str(line);
+                output.push('\n');
+            }
+            output.push_str("  </code>\n");
+        }
+    }
+
+    output.push_str("\nArtefacts\n");
+    output.push_str(&format!(
+        "  run metadata: {}\n",
+        artefact_path(report, "run.json")
+    ));
+    output.push_str(&format!(
+        "  compact packet: {}\n",
+        artefact_path(report, &report.manifest.compact)
+    ));
+    output.push_str(&format!(
+        "  evidence packet: {}\n",
+        artefact_path(report, &report.manifest.evidence)
+    ));
+    output.push_str(&format!(
+        "  stdout: {}\n",
+        artefact_path(report, &report.manifest.stdout)
+    ));
+    output.push_str(&format!(
+        "  stderr: {}\n",
+        artefact_path(report, &report.manifest.stderr)
+    ));
+
+    output
+}
+
+// ── markdown ──────────────────────────────────────────────────────────────────
+
 fn markdown_report(report: &Report, token_config: &TokenConfig) -> String {
-    let packet_tokens = evidence_packet_tokens(report);
-    let raw_tokens_avoided = report.packet.raw_tokens.saturating_sub(packet_tokens);
-    let budget = BudgetUsage::from_config(token_config, report.packet.raw_tokens, packet_tokens);
-    let stdout_path = report.run_directory.join(&report.manifest.stdout);
-    let stderr_path = report.run_directory.join(&report.manifest.stderr);
-    let compact_path = report.run_directory.join(&report.manifest.compact);
+    let tokens = token_view(report);
+    let budget = BudgetUsage::from_config(token_config, tokens.raw, tokens.packet);
     let mut output = String::new();
 
     output.push_str("# HayCut Report\n\n");
+
     output.push_str("## Result\n\n");
     output.push_str(&format!("- **Run:** `{}`\n", report.manifest.id));
     output.push_str(&format!(
@@ -248,135 +383,70 @@ fn markdown_report(report: &Report, token_config: &TokenConfig) -> String {
         markdown_inline_code(&report.manifest.command)
     ));
     output.push_str(&format!(
-        "- **Result:** {} (exit `{}`)\n",
-        result_label(report.manifest.exit_code),
-        report.manifest.exit_code
+        "- **Status:** {} (exit `{}`)\n",
+        report.evidence.outcome.status, report.evidence.outcome.exit_code
     ));
     output.push_str(&format!(
-        "- **Duration:** `{}` ms\n",
-        report.manifest.duration_ms
-    ));
-    output.push_str(&format!(
-        "- **Likely failure:** {}\n",
-        likely_failure(report)
-            .map(markdown_inline_code)
-            .unwrap_or_else(|| "none detected".to_string())
+        "- **Duration:** `{}`\n",
+        format_duration(report.manifest.duration_ms)
     ));
 
-    output.push_str("\n## Token Savings\n\n");
+    output.push_str("\n## Token spend\n\n");
     output.push_str("| Metric | Estimate |\n");
     output.push_str("| --- | ---: |\n");
+    output.push_str(&format!("| Raw | {} |\n", format_count(tokens.raw)));
+    output.push_str(&format!("| Packet | {} |\n", format_count(tokens.packet)));
+    output.push_str(&format!("| Saved | {} |\n", format_count(tokens.saved)));
+    output.push_str(&format!("| Reduction | {:.1}% |\n", tokens.reduction));
     output.push_str(&format!(
-        "| Raw tokens | {} |\n",
-        format_count(report.packet.raw_tokens)
-    ));
-    output.push_str(&format!(
-        "| Packet tokens | {} |\n",
-        format_count(packet_tokens)
-    ));
-    output.push_str(&format!(
-        "| Saved tokens | {} |\n",
-        format_count(raw_tokens_avoided)
-    ));
-    output.push_str(&format!(
-        "| Reduction | {:.1}% |\n",
-        reduction_percent(report.packet.raw_tokens, packet_tokens)
-    ));
-    output.push_str(&format!(
-        "| Budget status | {} |\n",
+        "| Budget | {} |\n",
         budget_status_label(budget.status)
     ));
 
-    output.push_str("\n## Evidence Summary\n\n");
-    output.push_str("**Preserved**\n\n");
-    for item in preserved_summary(report) {
-        output.push_str(&format!("- {item}\n"));
+    output.push_str("\n## Likely failure\n\n");
+    match &report.evidence.likely_failure {
+        Some(failure) => output.push_str(&format!(
+            "- **{}:** {}\n",
+            failure.kind,
+            markdown_inline_code(&failure.summary)
+        )),
+        None => output.push_str("- None detected.\n"),
     }
-    append_markdown_preserved_items(&mut output, &report.packet.preserved_items);
-    append_markdown_symbols(&mut output, report);
 
-    output.push_str("\n**Omitted**\n\n");
-    append_markdown_omitted_items(&mut output, &report.packet.omitted_items);
-
-    output.push_str("\n## Full Artefacts\n\n");
-    output.push_str(&format!(
-        "- [stdout]({})\n",
-        markdown_link_target(&stdout_path)
-    ));
-    output.push_str(&format!(
-        "- [stderr]({})\n",
-        markdown_link_target(&stderr_path)
-    ));
-    output.push_str(&format!(
-        "- [compact packet]({})\n",
-        markdown_link_target(&compact_path)
-    ));
-
-    output
-}
-
-fn human_report(report: &Report, token_config: &TokenConfig) -> String {
-    let packet_tokens = evidence_packet_tokens(report);
-    let raw_tokens_avoided = report.packet.raw_tokens.saturating_sub(packet_tokens);
-    let budget = BudgetUsage::from_config(token_config, report.packet.raw_tokens, packet_tokens);
-    let stdout_path = report.run_directory.join(&report.manifest.stdout);
-    let stderr_path = report.run_directory.join(&report.manifest.stderr);
-    let compact_path = report.run_directory.join(&report.manifest.compact);
-    let mut output = String::new();
-
-    output.push_str("HayCut report\n");
-    output.push_str("\nResultToken\n");
-    output.push_str(&format!("  run: {}\n", report.manifest.id));
-    output.push_str(&format!("  command: {}\n", report.manifest.command));
-    output.push_str(&format!(
-        "  result: {} (exit {})\n",
-        result_label(report.manifest.exit_code),
-        report.manifest.exit_code
-    ));
-    output.push_str(&format!("  duration: {}ms\n", report.manifest.duration_ms));
-    output.push_str(&format!(
-        "  likely failure: {}\n",
-        likely_failure(report).unwrap_or("none detected")
-    ));
-    output.push_str(&format!(
-        "  token: {} packet tokens\n",
-        format_count(packet_tokens)
-    ));
-
-    output.push_str("\nspendReductionPreserved\n");
-    output.push_str(&format!(
-        "  raw tokens: {}\n",
-        format_count(report.packet.raw_tokens)
-    ));
-    output.push_str(&format!(
-        "  packet tokens: {}\n",
-        format_count(packet_tokens)
-    ));
-    output.push_str(&format!(
-        "  saved tokens: {}\n",
-        format_count(raw_tokens_avoided)
-    ));
-    output.push_str(&format!(
-        "  reduction: {:.1}%\n",
-        reduction_percent(report.packet.raw_tokens, packet_tokens)
-    ));
-    output.push_str(&format!(
-        "  budget: {} (soft {}, hard {})\n",
-        budget_status_label(budget.status),
-        format_count(budget.soft_budget),
-        format_count(budget.hard_budget)
-    ));
-    output.push_str("  preserved:\n");
-    for item in preserved_summary(report) {
-        output.push_str(&format!("    - {item}\n"));
+    output.push_str("\n## Primary diagnostic\n\n");
+    match &report.evidence.primary_diagnostic {
+        Some(primary) => {
+            output.push_str(&format!(
+                "- **Location:** {}\n",
+                markdown_inline_code(&evidence::primary_location(primary))
+            ));
+            output.push_str(&format!(
+                "- **Detail:** {}\n",
+                markdown_inline_code(&primary_detail(primary))
+            ));
+        }
+        None => output.push_str("- None detected.\n"),
     }
+
+    output.push_str("\n## Context candidates\n\n");
+    if report.evidence.context_items.is_empty() {
+        output.push_str("- None.\n");
+    } else {
+        for item in &report.evidence.context_items {
+            output.push_str(&format!(
+                "- {} — {}\n",
+                markdown_inline_code(&item.target),
+                item.reason
+            ));
+        }
+    }
+
     if !report.symbols.is_empty() {
-        output.push_str("  symbols:\n");
+        output.push_str("\n## Symbols\n\n");
         for symbol in &report.symbols {
             output.push_str(&format!(
-                "    - {}::{} lines {}-{} ({} tokens)\n",
-                symbol.path,
-                symbol.symbol.name,
+                "- {} lines {}-{} ({} tokens)\n",
+                markdown_inline_code(&format!("{}::{}", symbol.path, symbol.symbol.name)),
                 symbol.symbol.start_line,
                 symbol.symbol.end_line,
                 format_count(symbol.estimated_tokens)
@@ -384,145 +454,52 @@ fn human_report(report: &Report, token_config: &TokenConfig) -> String {
         }
     }
 
-    output.push_str("\nevidenceOmitted\n");
-    append_omitted_items(&mut output, &report.packet.omitted_items);
-
-    output.push_str("\ncontextArtefacts\n");
-    output.push_str(&format!("  stdout: {}\n", stdout_path.display()));
-    output.push_str(&format!("  stderr: {}\n", stderr_path.display()));
-    output.push_str(&format!("  compact: {}\n", compact_path.display()));
-
-    output.push_str("\npreservedEvidence\n");
-    append_preserved_items(&mut output, &report.packet.preserved_items);
-    if !report.symbols.is_empty() {
-        output.push_str("  symbol snippets:\n");
-        for symbol in &report.symbols {
-            output.push_str(&format!(
-                "    {}::{} lines {}-{}\n",
-                symbol.path, symbol.symbol.name, symbol.symbol.start_line, symbol.symbol.end_line
-            ));
-            output.push_str("    <code>\n");
-            for line in symbol.code.lines() {
-                output.push_str("    ");
-                output.push_str(line);
-                output.push('\n');
-            }
-            output.push_str("    </code>\n");
-        }
-    }
+    output.push_str("\n## Artefacts\n\n");
+    output.push_str(&format!(
+        "- [run metadata]({})\n",
+        markdown_link_target(&artefact_path(report, "run.json"))
+    ));
+    output.push_str(&format!(
+        "- [compact packet]({})\n",
+        markdown_link_target(&artefact_path(report, &report.manifest.compact))
+    ));
+    output.push_str(&format!(
+        "- [evidence packet]({})\n",
+        markdown_link_target(&artefact_path(report, &report.manifest.evidence))
+    ));
+    output.push_str(&format!(
+        "- [stdout]({})\n",
+        markdown_link_target(&artefact_path(report, &report.manifest.stdout))
+    ));
+    output.push_str(&format!(
+        "- [stderr]({})\n",
+        markdown_link_target(&artefact_path(report, &report.manifest.stderr))
+    ));
 
     output
 }
 
-fn append_preserved_items(output: &mut String, items: &[PreservedItem]) {
-    if items.is_empty() {
-        output.push_str("  none detected\n");
-        return;
-    }
+// ── shared helpers ────────────────────────────────────────────────────────────
 
-    for item in items.iter().take(MAX_PRESERVED_ITEMS) {
-        output.push_str(&format!(
-            "  - {} {}: {}\n",
-            source_label(item.source),
-            preserved_kind_label(item.kind),
-            item.line
-        ));
-    }
-    append_remaining_count(output, items.len(), MAX_PRESERVED_ITEMS);
-}
-
-fn append_omitted_items(output: &mut String, items: &[OmittedItem]) {
-    let omitted: Vec<&OmittedItem> = items.iter().filter(|item| item.count > 0).collect();
-    if omitted.is_empty() {
-        output.push_str("  none\n");
-        return;
-    }
-
-    for item in omitted.iter().take(MAX_OMITTED_ITEMS) {
-        output.push_str(&format!(
-            "  - {}: {} lines ({})\n",
-            source_label(item.source),
-            format_count(item.count),
-            item.reason
-        ));
-    }
-    append_remaining_count(output, omitted.len(), MAX_OMITTED_ITEMS);
-}
-
-fn append_markdown_preserved_items(output: &mut String, items: &[PreservedItem]) {
-    if items.is_empty() {
-        output.push_str("- No compact evidence lines detected.\n");
-        return;
-    }
-
-    for item in items.iter().take(MAX_PRESERVED_ITEMS) {
-        output.push_str(&format!(
-            "- `{}` `{}`: {}\n",
-            source_label(item.source),
-            preserved_kind_label(item.kind),
-            markdown_inline_code(&item.line)
-        ));
-    }
-    if items.len() > MAX_PRESERVED_ITEMS {
-        output.push_str(&format!(
-            "- ... {} more preserved evidence lines\n",
-            format_count(items.len() - MAX_PRESERVED_ITEMS)
-        ));
+/// A one-line detail for the primary diagnostic: `error[CODE]` when a code is
+/// present, otherwise the diagnostic message.
+fn primary_detail(primary: &PrimaryDiagnostic) -> String {
+    match &primary.code {
+        Some(code) => format!("error[{code}]"),
+        None => primary.message.clone(),
     }
 }
 
-fn append_markdown_omitted_items(output: &mut String, items: &[OmittedItem]) {
-    let omitted: Vec<&OmittedItem> = items.iter().filter(|item| item.count > 0).collect();
-    if omitted.is_empty() {
-        output.push_str("- None reported.\n");
-        return;
-    }
-
-    for item in omitted.iter().take(MAX_OMITTED_ITEMS) {
-        output.push_str(&format!(
-            "- `{}`: {} lines ({})\n",
-            source_label(item.source),
-            format_count(item.count),
-            item.reason
-        ));
-    }
-    if omitted.len() > MAX_OMITTED_ITEMS {
-        output.push_str(&format!(
-            "- ... {} more omission groups\n",
-            format_count(omitted.len() - MAX_OMITTED_ITEMS)
-        ));
-    }
-}
-
-fn append_markdown_symbols(output: &mut String, report: &Report) {
-    if report.symbols.is_empty() {
-        return;
-    }
-
-    output.push_str("\n**Symbols**\n\n");
-    for symbol in &report.symbols {
-        output.push_str(&format!(
-            "- `{}` lines {}-{} ({} tokens)\n",
-            markdown_inline_code(&format!("{}::{}", symbol.path, symbol.symbol.name)),
-            symbol.symbol.start_line,
-            symbol.symbol.end_line,
-            format_count(symbol.estimated_tokens)
-        ));
-    }
+fn artefact_path(report: &Report, file: &str) -> String {
+    report.run_directory.join(file).display().to_string()
 }
 
 fn markdown_inline_code(value: &str) -> String {
     format!("`{}`", value.replace('`', "'"))
 }
 
-fn markdown_link_target(path: &Path) -> String {
-    path.display().to_string().replace(' ', "%20")
-}
-
-fn append_remaining_count(output: &mut String, total: usize, limit: usize) {
-    if total > limit {
-        output.push_str(&format!("  - ... {} more\n", format_count(total - limit)));
-    }
+fn markdown_link_target(path: &str) -> String {
+    path.replace(' ', "%20")
 }
 
 fn load_symbols(root: &Path, symbol_targets: &[String]) -> io::Result<Vec<SymbolMatch>> {
@@ -530,104 +507,6 @@ fn load_symbols(root: &Path, symbol_targets: &[String]) -> io::Result<Vec<Symbol
         .iter()
         .map(|target| read_symbol::read_symbol(root, target))
         .collect()
-}
-
-fn evidence_packet_tokens(report: &Report) -> usize {
-    report.packet.packet_tokens
-        + report
-            .symbols
-            .iter()
-            .map(|symbol| symbol.estimated_tokens)
-            .sum::<usize>()
-}
-
-fn likely_failure(report: &Report) -> Option<&str> {
-    // Deterministically promote the primary failure from the compacted evidence.
-    // Prefer, in order (HC-041):
-    //   1. compiler errors (e.g. error[E0063])
-    //   2. test assertion failures
-    //   3. panic lines
-    //   4. traceback / exception lines
-    //   5. first high-signal preserved item
-    // Classification is purely lexical; no LLM is involved. All preserved items
-    // are considered, not just native error lines, so RTK-filtered output is
-    // promoted too.
-    let candidates: Vec<&str> = report
-        .packet
-        .preserved_items
-        .iter()
-        .map(|item| item.line.as_str())
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-
-    const CLASSIFIERS: [fn(&str) -> bool; 5] = [
-        is_compiler_error,
-        is_assertion_failure,
-        is_panic_line,
-        is_traceback_exception,
-        is_high_signal,
-    ];
-
-    for classify in CLASSIFIERS {
-        if let Some(line) = candidates.iter().copied().find(|line| classify(line)) {
-            return Some(line);
-        }
-    }
-
-    None
-}
-
-/// Rust/TypeScript compiler diagnostics carrying an error code, e.g.
-/// `error[E0063]: ...` or `error TS2322: ...`.
-fn is_compiler_error(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("error[") || trimmed.starts_with("error TS")
-}
-
-/// Test-framework assertion failures across Rust, pytest, and JS runners.
-fn is_assertion_failure(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("assertion")
-        || lower.contains("assert ")
-        || lower.contains("assert(")
-        || (lower.contains("expected") && lower.contains("actual"))
-}
-
-/// Runtime panic lines, e.g. `thread 'main' panicked at ...`.
-fn is_panic_line(line: &str) -> bool {
-    line.contains("panicked at") || line.to_ascii_lowercase().contains("panic")
-}
-
-/// Python-style tracebacks and typed exception lines, e.g. `ValueError: ...`.
-fn is_traceback_exception(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("Traceback (") || trimmed.to_ascii_lowercase().contains("traceback") {
-        return true;
-    }
-
-    if let Some((head, _)) = trimmed.split_once(':') {
-        let name = head.rsplit(['.', ' ']).next().unwrap_or(head);
-        return name.ends_with("Error") || name.ends_with("Exception");
-    }
-
-    false
-}
-
-/// Catch-all for any remaining high-signal line worth surfacing.
-fn is_high_signal(line: &str) -> bool {
-    const MARKERS: [&str; 8] = [
-        "error",
-        "fail",
-        "panic",
-        "exception",
-        "assert",
-        "expected",
-        "actual",
-        "traceback",
-    ];
-
-    let lower = line.to_ascii_lowercase();
-    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 fn reduction_percent(raw_tokens: usize, packet_tokens: usize) -> f64 {
@@ -639,29 +518,8 @@ fn reduction_percent(raw_tokens: usize, packet_tokens: usize) -> f64 {
     reduced_tokens as f64 / raw_tokens as f64 * 100.0
 }
 
-fn preserved_summary(report: &Report) -> Vec<&'static str> {
-    let mut items = vec![
-        "exit code",
-        "duration",
-        "command metadata",
-        "full output handle",
-    ];
-
-    if report
-        .packet
-        .preserved_items
-        .iter()
-        .any(|item| item.kind == PreservedKind::ErrorLine)
-    {
-        items.push("failing lines");
-        items.push("stack trace frames");
-    }
-
-    items
-}
-
-fn result_label(exit_code: i32) -> &'static str {
-    if exit_code == 0 { "passed" } else { "failed" }
+fn format_duration(duration_ms: u128) -> String {
+    format!("{:.2}s", duration_ms as f64 / 1000.0)
 }
 
 fn budget_status_label(status: BudgetStatus) -> &'static str {
@@ -669,22 +527,6 @@ fn budget_status_label(status: BudgetStatus) -> &'static str {
         BudgetStatus::Within => "within budget",
         BudgetStatus::SoftExceeded => "over soft budget",
         BudgetStatus::HardExceeded => "over hard budget",
-    }
-}
-
-fn source_label(source: OutputSource) -> &'static str {
-    match source {
-        OutputSource::Stdout => "stdout",
-        OutputSource::Stderr => "stderr",
-        OutputSource::Rtk => "rtk",
-    }
-}
-
-fn preserved_kind_label(kind: PreservedKind) -> &'static str {
-    match kind {
-        PreservedKind::ErrorLine => "error",
-        PreservedKind::StackTrace => "stack trace",
-        PreservedKind::RtkFiltered => "filtered",
     }
 }
 
@@ -698,7 +540,9 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::compactor::{OmittedItem, OutputSource, PreservedItem};
+    use crate::compactor::CompactPacket;
+    use crate::evidence::{Outcome, TokenSummary};
+    use crate::extract::{DiagnosticKind, Severity};
     use crate::store::{NewArtifact, NewRun, insert_run};
     use crate::symbols::{Symbol, SymbolKind};
 
@@ -734,7 +578,7 @@ mod tests {
         assert_eq!(report.run_directory, latest);
         assert_eq!(report.manifest.id, "newer");
         assert_eq!(report.manifest.command, "newer command");
-        assert_eq!(report.packet.packet_tokens, 10);
+        assert_eq!(report.evidence.token_summary.packet_tokens, 10);
 
         fs::remove_dir_all(root).expect("test run root should be removed");
     }
@@ -744,302 +588,6 @@ mod tests {
         assert_eq!(reduction_percent(0, 10), 0.0);
         assert_eq!(reduction_percent(100, 25), 75.0);
         assert_eq!(reduction_percent(100, 125), 0.0);
-    }
-
-    #[test]
-    fn preserved_summary_includes_failure_details_when_error_lines_exist() {
-        let report = Report {
-            run_directory: PathBuf::from("run"),
-            manifest: RunManifest {
-                id: "2026-07-07T153000Z-a1b2c3".to_string(),
-                command: "cargo test".to_string(),
-                args: vec!["test".to_string()],
-                cwd: "/tmp".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                estimated_raw_tokens: 100,
-                raw_stdout_tokens_estimated: 80,
-                raw_stderr_tokens_estimated: 20,
-                created_at: Utc::now(),
-                stdout: "stdout.txt".to_string(),
-                stderr: "stderr.txt".to_string(),
-                compact: "compact.json".to_string(),
-            },
-            packet: CompactPacket {
-                compactor: "native".to_string(),
-                rtk_version: None,
-                command: "cargo test".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                failed: true,
-                stdout_artifact: "stdout.txt".to_string(),
-                stderr_artifact: "stderr.txt".to_string(),
-                compact_artifact: None,
-                raw_stdout_tokens: 80,
-                raw_stderr_tokens: 20,
-                raw_tokens: 100,
-                packet_tokens: 10,
-                preserved_items: vec![PreservedItem {
-                    source: OutputSource::Stderr,
-                    kind: PreservedKind::ErrorLine,
-                    line: "error: failed".to_string(),
-                }],
-                omitted_items: vec![OmittedItem {
-                    source: OutputSource::Stdout,
-                    reason: "noise".to_string(),
-                    count: 3,
-                }],
-                notes: Vec::new(),
-                compact_text: None,
-            },
-            symbols: Vec::new(),
-        };
-
-        let summary = preserved_summary(&report);
-
-        assert!(summary.contains(&"exit code"));
-        assert!(summary.contains(&"duration"));
-        assert!(summary.contains(&"failing lines"));
-        assert!(summary.contains(&"stack trace frames"));
-        assert!(summary.contains(&"full output handle"));
-    }
-
-    #[test]
-    fn formats_human_report_with_command_budget_omissions_and_handles() {
-        let report = Report {
-            run_directory: PathBuf::from(".haycut/runs/run-1"),
-            manifest: RunManifest {
-                id: "run-1".to_string(),
-                command: "cargo test auth".to_string(),
-                args: vec!["test".to_string(), "auth".to_string()],
-                cwd: "/tmp".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                estimated_raw_tokens: 1000,
-                raw_stdout_tokens_estimated: 800,
-                raw_stderr_tokens_estimated: 200,
-                created_at: Utc::now(),
-                stdout: "stdout.txt".to_string(),
-                stderr: "stderr.txt".to_string(),
-                compact: "compact.json".to_string(),
-            },
-            packet: CompactPacket {
-                compactor: "native".to_string(),
-                rtk_version: None,
-                command: "cargo test auth".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                failed: true,
-                stdout_artifact: "stdout.txt".to_string(),
-                stderr_artifact: "stderr.txt".to_string(),
-                compact_artifact: None,
-                raw_stdout_tokens: 800,
-                raw_stderr_tokens: 200,
-                raw_tokens: 1000,
-                packet_tokens: 60,
-                preserved_items: vec![PreservedItem {
-                    source: OutputSource::Stderr,
-                    kind: PreservedKind::ErrorLine,
-                    line: "tests/auth/session_test.rs:52 expected expired session to be rejected"
-                        .to_string(),
-                }],
-                omitted_items: vec![OmittedItem {
-                    source: OutputSource::Stdout,
-                    reason: "non-error output omitted from compact packet".to_string(),
-                    count: 37,
-                }],
-                notes: Vec::new(),
-                compact_text: None,
-            },
-            symbols: Vec::new(),
-        };
-
-        let packet = human_report(&report, &token_config());
-
-        assert!(packet.contains("HayCut report"));
-        assert!(packet.contains("ResultToken"));
-        assert!(packet.contains("command: cargo test auth"));
-        assert!(packet.contains("result: failed (exit 101)"));
-        assert!(packet.contains("likely failure: tests/auth/session_test.rs:52"));
-        assert!(packet.contains("spendReductionPreserved"));
-        assert!(packet.contains("raw tokens: 1,000"));
-        assert!(packet.contains("packet tokens: 60"));
-        assert!(packet.contains("saved tokens: 940"));
-        assert!(packet.contains("budget: within budget"));
-        assert!(packet.contains("evidenceOmitted"));
-        assert!(packet.contains("stdout: 37 lines"));
-        assert!(packet.contains("contextArtefacts"));
-        assert!(packet.contains("stdout: .haycut/runs/run-1/stdout.txt"));
-        assert!(packet.contains("stderr: .haycut/runs/run-1/stderr.txt"));
-        assert!(packet.contains("compact: .haycut/runs/run-1/compact.json"));
-        assert!(packet.contains("preservedEvidence"));
-        assert!(packet.contains("stderr error: tests/auth/session_test.rs:52"));
-    }
-
-    #[test]
-    fn formats_human_report_with_symbol_snippets() {
-        let mut report = report_fixture();
-        report.symbols.push(SymbolMatch {
-            path: "src/auth/session.rs".to_string(),
-            symbol: Symbol {
-                kind: SymbolKind::Function,
-                name: "validate_session".to_string(),
-                start_line: 88,
-                end_line: 90,
-                start_byte: 0,
-                end_byte: 0,
-            },
-            code: "fn validate_session() -> bool {\n    false\n}".to_string(),
-            estimated_tokens: 12,
-        });
-
-        let packet = human_report(&report, &token_config());
-
-        assert!(packet.contains("src/auth/session.rs::validate_session lines 88-90"));
-        assert!(packet.contains("fn validate_session() -> bool"));
-        assert!(packet.contains("token: 72 packet tokens"));
-    }
-
-    fn rtk_item(line: &str) -> PreservedItem {
-        PreservedItem {
-            source: OutputSource::Rtk,
-            kind: PreservedKind::RtkFiltered,
-            line: line.to_string(),
-        }
-    }
-
-    #[test]
-    fn promotes_compiler_error_from_rtk_filtered_evidence() {
-        let mut report = report_fixture();
-        // Mirrors a failing `cargo test` compacted through RTK, where every
-        // preserved item is RtkFiltered rather than a native ErrorLine.
-        report.packet.preserved_items = vec![
-            rtk_item("cargo test: 1 errors, 0 warnings (1 crates)"),
-            rtk_item("error[E0063]: missing field `model` in initializer of `config::Config`"),
-            rtk_item("  --> src/config.rs:54:9"),
-            rtk_item("54 |         Config {"),
-        ];
-
-        assert_eq!(
-            likely_failure(&report),
-            Some("error[E0063]: missing field `model` in initializer of `config::Config`")
-        );
-    }
-
-    #[test]
-    fn likely_failure_prefers_compiler_error_over_panic_and_assertion() {
-        let mut report = report_fixture();
-        report.packet.preserved_items = vec![
-            rtk_item("thread 'main' panicked at src/lib.rs:10:5"),
-            rtk_item("assertion `left == right` failed"),
-            rtk_item("error[E0277]: the trait bound is not satisfied"),
-        ];
-
-        assert_eq!(
-            likely_failure(&report),
-            Some("error[E0277]: the trait bound is not satisfied")
-        );
-    }
-
-    #[test]
-    fn likely_failure_falls_back_through_priority_tiers() {
-        let mut report = report_fixture();
-
-        // No compiler error: an assertion failure wins over a later panic line.
-        report.packet.preserved_items = vec![
-            rtk_item("running 3 tests"),
-            rtk_item("assertion `left == right` failed"),
-            rtk_item("thread 'main' panicked at src/lib.rs:10:5"),
-        ];
-        assert_eq!(
-            likely_failure(&report),
-            Some("assertion `left == right` failed")
-        );
-
-        // No compiler error or assertion: a Python traceback exception wins.
-        report.packet.preserved_items = vec![
-            rtk_item("Traceback (most recent call last):"),
-            rtk_item("  File \"app.py\", line 3, in <module>"),
-            rtk_item("ValueError: invalid literal for int()"),
-        ];
-        assert_eq!(
-            likely_failure(&report),
-            Some("Traceback (most recent call last):")
-        );
-    }
-
-    #[test]
-    fn formats_json_report_with_token_estimates_and_artifact_paths_without_raw_output() {
-        let mut report = report_fixture();
-        report.packet.omitted_items.push(OmittedItem {
-            source: OutputSource::Stdout,
-            reason: "non-error output omitted from compact packet".to_string(),
-            count: 37,
-        });
-        let rendered = serde_json::to_string(&json_report(&report, &token_config()))
-            .expect("JSON report should serialize");
-        let value: serde_json::Value =
-            serde_json::from_str(&rendered).expect("JSON report should parse");
-
-        assert_eq!(value["schema_version"], 1);
-        assert_eq!(value["run"]["id"], "run-1");
-        assert_eq!(value["run"]["command"], "cargo test auth");
-        assert_eq!(value["token_estimates"]["raw_total"], 1000);
-        assert_eq!(value["token_estimates"]["raw_stdout"], 800);
-        assert_eq!(value["token_estimates"]["raw_stderr"], 200);
-        assert_eq!(value["token_estimates"]["packet"], 60);
-        assert_eq!(value["token_estimates"]["saved"], 940);
-        assert_eq!(value["reduction_percent"], 94.0);
-        assert_eq!(
-            value["artefacts"]["stdout"],
-            ".haycut/runs/run-1/stdout.txt"
-        );
-        assert_eq!(
-            value["artefacts"]["stderr"],
-            ".haycut/runs/run-1/stderr.txt"
-        );
-        assert_eq!(
-            value["artefacts"]["compact"],
-            ".haycut/runs/run-1/compact.json"
-        );
-        assert_eq!(value["omitted_evidence"][0]["source"], "stdout");
-        assert_eq!(value["omitted_evidence"][0]["count"], 37);
-        assert!(!rendered.contains("expected expired session to be rejected"));
-        assert!(!rendered.contains("preserved_items"));
-    }
-
-    #[test]
-    fn formats_markdown_report_with_result_savings_evidence_and_artifact_links() {
-        let mut report = report_fixture();
-        report.packet.omitted_items.push(OmittedItem {
-            source: OutputSource::Stdout,
-            reason: "non-error output omitted from compact packet".to_string(),
-            count: 37,
-        });
-
-        let rendered = markdown_report(&report, &token_config());
-
-        assert!(rendered.starts_with("# HayCut Report"));
-        assert!(rendered.contains("## Result"));
-        assert!(rendered.contains("- **Command:** `cargo test auth`"));
-        assert!(rendered.contains("- **Result:** failed (exit `101`)"));
-        assert!(rendered.contains("## Token Savings"));
-        assert!(rendered.contains("| Raw tokens | 1,000 |"));
-        assert!(rendered.contains("| Packet tokens | 60 |"));
-        assert!(rendered.contains("| Saved tokens | 940 |"));
-        assert!(rendered.contains("| Reduction | 94.0% |"));
-        assert!(rendered.contains("## Evidence Summary"));
-        assert!(rendered.contains("- failing lines"));
-        assert!(rendered.contains("- `stderr` `error`: `tests/auth/session_test.rs:52"));
-        assert!(rendered.contains("- `stdout`: 37 lines"));
-        assert!(rendered.contains("## Full Artefacts"));
-        assert!(rendered.contains("- [stdout](.haycut/runs/run-1/stdout.txt)"));
-        assert!(rendered.contains("- [stderr](.haycut/runs/run-1/stderr.txt)"));
-        assert!(rendered.contains("- [compact packet](.haycut/runs/run-1/compact.json)"));
     }
 
     #[test]
@@ -1062,51 +610,209 @@ mod tests {
         );
     }
 
+    #[test]
+    fn human_report_renders_evidence_sections() {
+        let report = report_fixture();
+
+        let rendered = human_report(&report, &token_config());
+
+        assert!(rendered.contains("HayCut report"));
+        assert!(rendered.contains("Result\n"));
+        assert!(rendered.contains("  command: cargo test"));
+        assert!(rendered.contains("  exit code: 101"));
+        assert!(rendered.contains("  status: failure"));
+        assert!(rendered.contains("Token spend\n"));
+        assert!(rendered.contains("  raw: 93"));
+        assert!(rendered.contains("  packet: 50"));
+        assert!(rendered.contains("  saved: 43"));
+        assert!(rendered.contains("  reduction: 46.2%"));
+        assert!(rendered.contains("Likely failure\n"));
+        assert!(
+            rendered.contains(
+                "  compile_error: Missing field `model` in initializer of `config::Config`"
+            )
+        );
+        assert!(rendered.contains("Primary diagnostic\n"));
+        assert!(rendered.contains("  src/config.rs:54:9"));
+        assert!(rendered.contains("  error[E0063]"));
+        assert!(rendered.contains("Context candidates\n"));
+        assert!(rendered.contains("  src/config.rs:44-64"));
+        assert!(rendered.contains("    reason: Primary compiler diagnostic location"));
+        assert!(rendered.contains("Artefacts\n"));
+        assert!(rendered.contains("evidence packet: .haycut/runs/run-1/evidence.json"));
+    }
+
+    #[test]
+    fn human_report_reports_no_failure_for_success() {
+        let mut report = report_fixture();
+        report.evidence.outcome = Outcome {
+            exit_code: 0,
+            status: "success".to_string(),
+        };
+        report.evidence.likely_failure = None;
+        report.evidence.primary_diagnostic = None;
+        report.evidence.context_items = Vec::new();
+
+        let rendered = human_report(&report, &token_config());
+
+        assert!(rendered.contains("  status: success"));
+        assert!(rendered.contains("Likely failure\n  none detected"));
+        assert!(rendered.contains("Primary diagnostic\n  none detected"));
+        assert!(rendered.contains("Context candidates\n  none"));
+    }
+
+    #[test]
+    fn human_report_includes_symbol_snippets() {
+        let mut report = report_fixture();
+        report.symbols.push(SymbolMatch {
+            path: "src/auth/session.rs".to_string(),
+            symbol: Symbol {
+                kind: SymbolKind::Function,
+                name: "validate_session".to_string(),
+                start_line: 88,
+                end_line: 90,
+                start_byte: 0,
+                end_byte: 0,
+            },
+            code: "fn validate_session() -> bool {\n    false\n}".to_string(),
+            estimated_tokens: 12,
+        });
+
+        let rendered = human_report(&report, &token_config());
+
+        assert!(rendered.contains("src/auth/session.rs::validate_session lines 88-90"));
+        assert!(rendered.contains("fn validate_session() -> bool"));
+        // Symbol tokens fold into packet spend: 50 + 12 = 62.
+        assert!(rendered.contains("  packet: 62"));
+    }
+
+    #[test]
+    fn json_report_exposes_evidence_and_hides_raw_output() {
+        let report = report_fixture();
+        let rendered = serde_json::to_string(&json_report(&report, &token_config()))
+            .expect("JSON report should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).expect("JSON report should parse");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["run"]["id"], "run-1");
+        assert_eq!(value["outcome"]["exit_code"], 101);
+        assert_eq!(value["outcome"]["status"], "failure");
+        assert_eq!(value["token_summary"]["raw_tokens"], 93);
+        assert_eq!(value["token_summary"]["packet_tokens"], 50);
+        assert_eq!(value["token_summary"]["saved_tokens"], 43);
+        assert_eq!(value["likely_failure"]["kind"], "compile_error");
+        assert_eq!(value["primary_diagnostic"]["code"], "E0063");
+        assert_eq!(value["primary_diagnostic"]["file"], "src/config.rs");
+        assert_eq!(value["context_items"][0]["target"], "src/config.rs:44-64");
+        assert_eq!(
+            value["artefacts"]["evidence"],
+            ".haycut/runs/run-1/evidence.json"
+        );
+        assert!(!rendered.contains("preserved_items"));
+    }
+
+    #[test]
+    fn markdown_report_renders_evidence_sections() {
+        let report = report_fixture();
+
+        let rendered = markdown_report(&report, &token_config());
+
+        assert!(rendered.starts_with("# HayCut Report"));
+        assert!(rendered.contains("## Result"));
+        assert!(rendered.contains("- **Command:** `cargo test`"));
+        assert!(rendered.contains("- **Status:** failure (exit `101`)"));
+        assert!(rendered.contains("## Token spend"));
+        assert!(rendered.contains("| Raw | 93 |"));
+        assert!(rendered.contains("| Packet | 50 |"));
+        assert!(rendered.contains("## Likely failure"));
+        assert!(rendered.contains("- **compile_error:**"));
+        assert!(rendered.contains("## Primary diagnostic"));
+        assert!(rendered.contains("`src/config.rs:54:9`"));
+        assert!(rendered.contains("`error[E0063]`"));
+        assert!(rendered.contains("## Context candidates"));
+        assert!(rendered.contains("`src/config.rs:44-64` — Primary compiler diagnostic location"));
+        assert!(rendered.contains("## Artefacts"));
+        assert!(rendered.contains("- [evidence packet](.haycut/runs/run-1/evidence.json)"));
+    }
+
     fn report_fixture() -> Report {
         Report {
             run_directory: PathBuf::from(".haycut/runs/run-1"),
-            manifest: RunManifest {
-                id: "run-1".to_string(),
-                command: "cargo test auth".to_string(),
-                args: vec!["test".to_string(), "auth".to_string()],
-                cwd: "/tmp".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                estimated_raw_tokens: 1000,
-                raw_stdout_tokens_estimated: 800,
-                raw_stderr_tokens_estimated: 200,
-                created_at: Utc::now(),
-                stdout: "stdout.txt".to_string(),
-                stderr: "stderr.txt".to_string(),
-                compact: "compact.json".to_string(),
-            },
-            packet: CompactPacket {
-                compactor: "native".to_string(),
-                rtk_version: None,
-                command: "cargo test auth".to_string(),
-                exit_code: 101,
-                duration_ms: 42,
-                failed: true,
-                stdout_artifact: "stdout.txt".to_string(),
-                stderr_artifact: "stderr.txt".to_string(),
-                compact_artifact: None,
-                raw_stdout_tokens: 800,
-                raw_stderr_tokens: 200,
-                raw_tokens: 1000,
-                packet_tokens: 60,
-                preserved_items: vec![PreservedItem {
-                    source: OutputSource::Stderr,
-                    kind: PreservedKind::ErrorLine,
-                    line: "tests/auth/session_test.rs:52 expected expired session to be rejected"
-                        .to_string(),
-                }],
-                omitted_items: Vec::new(),
-                notes: Vec::new(),
-                compact_text: None,
-            },
+            manifest: manifest_fixture(),
+            evidence: evidence_fixture(),
             symbols: Vec::new(),
+        }
+    }
+
+    fn manifest_fixture() -> RunManifest {
+        RunManifest {
+            id: "run-1".to_string(),
+            command: "cargo test".to_string(),
+            args: vec!["test".to_string()],
+            cwd: "/tmp".to_string(),
+            exit_code: 101,
+            duration_ms: 2_260,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            estimated_raw_tokens: 93,
+            raw_stdout_tokens_estimated: 0,
+            raw_stderr_tokens_estimated: 93,
+            created_at: Utc::now(),
+            stdout: "stdout.txt".to_string(),
+            stderr: "stderr.txt".to_string(),
+            compact: "compact.json".to_string(),
+            evidence: "evidence.json".to_string(),
+        }
+    }
+
+    fn evidence_fixture() -> EvidencePacket {
+        EvidencePacket {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            outcome: Outcome {
+                exit_code: 101,
+                status: "failure".to_string(),
+            },
+            likely_failure: Some(LikelyFailure {
+                kind: "compile_error".to_string(),
+                summary: "Missing field `model` in initializer of `config::Config`".to_string(),
+                confidence: "high".to_string(),
+            }),
+            primary_diagnostic: Some(PrimaryDiagnostic {
+                source: "stderr".to_string(),
+                message: "missing field `model` in initializer of `config::Config`".to_string(),
+                code: Some("E0063".to_string()),
+                file: Some("src/config.rs".to_string()),
+                line: Some(54),
+                column: Some(9),
+            }),
+            diagnostics: vec![EvidenceDiagnostic {
+                kind: DiagnosticKind::RustCompileError,
+                severity: Severity::Error,
+                code: Some("E0063".to_string()),
+                message: "missing field `model` in initializer of `config::Config`".to_string(),
+                file: Some("src/config.rs".to_string()),
+                line: Some(54),
+                column: Some(9),
+            }],
+            file_refs: vec![FileRef {
+                file: "src/config.rs".to_string(),
+                line: 54,
+                column: Some(9),
+                reason: "compiler diagnostic location".to_string(),
+            }],
+            context_items: vec![ContextItem {
+                kind: "file_window".to_string(),
+                target: "src/config.rs:44-64".to_string(),
+                reason: "Primary compiler diagnostic location".to_string(),
+            }],
+            token_summary: TokenSummary {
+                raw_tokens: 93,
+                packet_tokens: 50,
+                saved_tokens: 43,
+                reduction_percent: 46.2,
+            },
         }
     }
 
@@ -1151,16 +857,53 @@ mod tests {
             stdout: "stdout.txt".to_string(),
             stderr: "stderr.txt".to_string(),
             compact: "compact.json".to_string(),
+            evidence: "evidence.json".to_string(),
         };
-        let packet = CompactPacket {
+        let evidence = EvidencePacket {
+            schema_version: 1,
+            run_id: id.to_string(),
+            outcome: Outcome {
+                exit_code: 0,
+                status: "success".to_string(),
+            },
+            likely_failure: None,
+            primary_diagnostic: None,
+            diagnostics: Vec::new(),
+            file_refs: Vec::new(),
+            context_items: Vec::new(),
+            token_summary: TokenSummary {
+                raw_tokens: 100,
+                packet_tokens,
+                saved_tokens: 100_usize.saturating_sub(packet_tokens),
+                reduction_percent: 0.0,
+            },
+        };
+
+        fs::write(
+            run_directory.join("run.json"),
+            serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
+        )?;
+        fs::write(
+            run_directory.join("compact.json"),
+            serde_json::to_string_pretty(&compact_fixture(command, packet_tokens))
+                .map_err(io::Error::other)?,
+        )?;
+        fs::write(
+            run_directory.join("evidence.json"),
+            serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?,
+        )
+    }
+
+    fn compact_fixture(command: &str, packet_tokens: usize) -> CompactPacket {
+        CompactPacket {
             compactor: "native".to_string(),
             rtk_version: None,
             command: command.to_string(),
             exit_code: 0,
             duration_ms: 42,
             failed: false,
-            stdout_artifact: run_directory.join("stdout.txt").display().to_string(),
-            stderr_artifact: run_directory.join("stderr.txt").display().to_string(),
+            stdout_artifact: "stdout.txt".to_string(),
+            stderr_artifact: "stderr.txt".to_string(),
             compact_artifact: None,
             raw_stdout_tokens: 80,
             raw_stderr_tokens: 20,
@@ -1170,16 +913,7 @@ mod tests {
             omitted_items: Vec::new(),
             notes: Vec::new(),
             compact_text: None,
-        };
-
-        fs::write(
-            run_directory.join("run.json"),
-            serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
-        )?;
-        fs::write(
-            run_directory.join("compact.json"),
-            serde_json::to_string_pretty(&packet).map_err(io::Error::other)?,
-        )
+        }
     }
 
     fn insert_report_run(
@@ -1211,6 +945,12 @@ mod tests {
                         id: format!("{id}:compact_json"),
                         kind: "compact_json",
                         path: run_directory.join("compact.json").display().to_string(),
+                        estimated_tokens: Some(10),
+                    },
+                    NewArtifact {
+                        id: format!("{id}:evidence_json"),
+                        kind: "evidence_json",
+                        path: run_directory.join("evidence.json").display().to_string(),
                         estimated_tokens: Some(10),
                     },
                 ],
