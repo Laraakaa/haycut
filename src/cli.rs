@@ -35,6 +35,10 @@ pub enum Commands {
 
     /// Run a command and capture trace information
     Trace {
+        /// Attach the trace to a task (`current` is supported)
+        #[arg(long, value_enum)]
+        task: Option<TaskTarget>,
+
         /// Compactor to use for prompt-facing output
         #[arg(long, value_enum)]
         compactor: Option<CompactorMode>,
@@ -108,6 +112,18 @@ pub enum Commands {
     /// Suggest the next token-efficient debugging action without executing it
     Suggest,
 
+    /// Manage HayCut task state
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+
+    /// Run the constrained HayCut agent loop
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+
     /// Search repository files for an exact string
     Search {
         /// Maximum number of matches to show
@@ -126,6 +142,69 @@ pub enum CompactorMode {
     Rtk,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum TaskTarget {
+    Current,
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommand {
+    /// Start a new current task
+    Start {
+        /// Task title and goal
+        title: String,
+
+        /// Verification command, e.g. `cargo test`
+        #[arg(long)]
+        verify: Option<String>,
+    },
+
+    /// Show current task status
+    Status,
+
+    /// List known tasks
+    List,
+
+    /// Close the current task
+    Close,
+}
+
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Loop until done, blocked, budget exhausted, or max steps hit
+    Run {
+        /// Use the current task
+        #[arg(long, value_enum)]
+        task: Option<TaskTarget>,
+
+        /// Verification command, e.g. `cargo test`
+        #[arg(long)]
+        verify: Option<String>,
+
+        /// Maximum planner steps to execute
+        #[arg(long, default_value_t = commands::agent::DEFAULT_MAX_STEPS)]
+        max_steps: usize,
+
+        /// Task goal when not using --task current
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        goal: Vec<String>,
+    },
+
+    /// Ask the model for exactly one next action and execute it if deterministic
+    Step {
+        /// Use the current task
+        #[arg(long, value_enum)]
+        task: Option<TaskTarget>,
+    },
+
+    /// Show stored agent planner prompts, responses, actions, and cost
+    Trace {
+        /// Use the current task
+        #[arg(long, value_enum)]
+        task: Option<TaskTarget>,
+    },
+}
+
 pub fn run() -> i32 {
     let cli = Cli::parse();
     cli.execute()
@@ -140,9 +219,11 @@ impl Cli {
             }
             Some(Commands::Files { limit }) => commands::files::run(limit),
             Some(Commands::Index { max_file_size }) => commands::index::run(max_file_size),
-            Some(Commands::Trace { compactor, command }) => {
-                commands::trace::run(command, compactor)
-            }
+            Some(Commands::Trace {
+                task,
+                compactor,
+                command,
+            }) => commands::trace::run(command, compactor, task),
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
             Some(Commands::Report {
                 last,
@@ -162,6 +243,8 @@ impl Cli {
                 force,
             }) => commands::read_window::run(path, line, radius, force),
             Some(Commands::Suggest) => commands::suggest::run(),
+            Some(Commands::Task { command }) => commands::task::run(command),
+            Some(Commands::Agent { command }) => commands::agent::run(command),
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             None => 0,
         }

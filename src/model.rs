@@ -10,11 +10,23 @@ use serde::{Deserialize, Serialize};
 
 pub trait ModelProvider {
     fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse>;
+
+    /// Call the model with a menu of tools. The model picks one and returns its
+    /// arguments as a validated JSON object. Also returns the raw response for
+    /// logging. `(tool_name, arguments, response)`.
+    fn complete_with_tools(
+        &self,
+        request: ModelRequest,
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<(String, serde_json::Value, ModelResponse)>;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelRequest {
     pub purpose: ModelPurpose,
+    /// Optional system/policy message prepended before the user prompt.
+    #[serde(default)]
+    pub system: Option<String>,
     pub prompt: String,
     pub estimated_tokens: EstimatedTokenUsage,
     pub max_output_tokens: Option<usize>,
@@ -51,6 +63,8 @@ pub struct ReportedTokenUsage {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelPurpose {
+    AgentPlanner,
+    TaskTriage,
     LogSummary,
     ContextRanking,
     PatchGeneration,
@@ -72,6 +86,8 @@ impl fmt::Display for ModelPurpose {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::LogSummary => "log_summary",
+            Self::AgentPlanner => "agent_planner",
+            Self::TaskTriage => "task_triage",
             Self::ContextRanking => "context_ranking",
             Self::PatchGeneration => "patch_generation",
             Self::PatchReview => "patch_review",
@@ -86,6 +102,8 @@ impl FromStr for ModelPurpose {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "log_summary" => Ok(Self::LogSummary),
+            "agent_planner" => Ok(Self::AgentPlanner),
+            "task_triage" => Ok(Self::TaskTriage),
             "context_ranking" => Ok(Self::ContextRanking),
             "patch_generation" => Ok(Self::PatchGeneration),
             "patch_review" => Ok(Self::PatchReview),
@@ -177,71 +195,133 @@ impl OpenAiProvider {
 
 impl ModelProvider for OpenAiProvider {
     fn complete(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
-        let api_key = self.api_key()?;
-        let url = format!("{}/chat/completions", self.config.base_url);
-
         let body = OpenAiChatRequest {
             model: &self.config.model,
-            messages: vec![OpenAiMessage {
-                role: "user",
-                content: &request.prompt,
-            }],
+            messages: chat_messages(&request),
             max_tokens: request.max_output_tokens,
+            tools: None,
+            tool_choice: None,
         };
+        let raw = self.send(&request, body)?;
+        let reported = ReportedTokenUsage {
+            input: raw.usage.as_ref().map(|u| u.prompt_tokens),
+            output: raw.usage.as_ref().map(|u| u.completion_tokens),
+        };
+        let finish_reason = raw.choices.first().and_then(|c| c.finish_reason.clone());
+        let text = raw
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message)
+            .and_then(|m| m.content)
+            .ok_or_else(|| anyhow::anyhow!("model API returned no text content"))?;
+        self.ledger.record(ModelCallRecord {
+            purpose: request.purpose,
+            estimated_tokens: request.estimated_tokens,
+            reported_tokens: reported,
+        });
+        Ok(ModelResponse {
+            text,
+            reported_tokens: reported,
+            finish_reason,
+            metadata: BTreeMap::new(),
+        })
+    }
 
+    fn complete_with_tools(
+        &self,
+        request: ModelRequest,
+        tools: &[ToolDefinition],
+    ) -> anyhow::Result<(String, serde_json::Value, ModelResponse)> {
+        let body = OpenAiChatRequest {
+            model: &self.config.model,
+            messages: chat_messages(&request),
+            max_tokens: request.max_output_tokens,
+            tools: Some(
+                tools
+                    .iter()
+                    .map(|t| OpenAiTool {
+                        r#type: "function",
+                        function: OpenAiFunction {
+                            name: t.name.to_string(),
+                            description: t.description.to_string(),
+                            parameters: t.parameters.clone(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_choice: Some(serde_json::json!("required")),
+        };
+        let raw = self.send(&request, body)?;
+        let reported = ReportedTokenUsage {
+            input: raw.usage.as_ref().map(|u| u.prompt_tokens),
+            output: raw.usage.as_ref().map(|u| u.completion_tokens),
+        };
+        let finish_reason = raw.choices.first().and_then(|c| c.finish_reason.clone());
+        let tool_call = raw
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message)
+            .and_then(|m| m.tool_calls.into_iter().next())
+            .ok_or_else(|| anyhow::anyhow!("model API returned no tool call"))?;
+        let tool_name = tool_call.function.name;
+        let arguments: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+            .map_err(|e| anyhow::anyhow!("tool call arguments were not valid JSON: {e}"))?;
+        let response = ModelResponse {
+            text: tool_call.function.arguments,
+            reported_tokens: reported,
+            finish_reason,
+            metadata: BTreeMap::new(),
+        };
+        self.ledger.record(ModelCallRecord {
+            purpose: request.purpose,
+            estimated_tokens: request.estimated_tokens,
+            reported_tokens: reported,
+        });
+        Ok((tool_name, arguments, response))
+    }
+}
+
+impl OpenAiProvider {
+    fn send<'a>(
+        &self,
+        request: &ModelRequest,
+        body: OpenAiChatRequest<'a>,
+    ) -> anyhow::Result<OpenAiChatResponse> {
+        let api_key = self.api_key()?;
+        let url = format!("{}/chat/completions", self.config.base_url);
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(self.config.timeout_secs))
             .build();
-
         let http_result = agent
             .post(&url)
             .set("Authorization", &format!("Bearer {api_key}"))
             .set("Content-Type", "application/json")
             .send_json(serde_json::to_value(&body)?);
-
-        let (response, reported) = match http_result {
-            Ok(http_response) => {
-                let raw: OpenAiChatResponse = http_response
-                    .into_json()
-                    .map_err(|e| anyhow::anyhow!("invalid JSON from model API: {e}"))?;
-
-                let reported = ReportedTokenUsage {
-                    input: raw.usage.as_ref().map(|u| u.prompt_tokens),
-                    output: raw.usage.as_ref().map(|u| u.completion_tokens),
-                };
-                let finish_reason = raw.choices.first().and_then(|c| c.finish_reason.clone());
-
-                let text = raw
-                    .choices
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.message)
-                    .map(|m| m.content)
-                    .ok_or_else(|| anyhow::anyhow!("model API returned no choices"))?;
-
-                let response = ModelResponse {
-                    text,
-                    reported_tokens: reported,
-                    finish_reason,
-                    metadata: BTreeMap::new(),
-                };
-                (response, reported)
-            }
+        match http_result {
+            Ok(http_response) => http_response
+                .into_json()
+                .map_err(|e| anyhow::anyhow!("invalid JSON from model API: {e}")),
             Err(ureq::Error::Status(status, http_response)) => {
-                let body_snippet = http_response.into_string().unwrap_or_default();
-                let trimmed = body_snippet.chars().take(256).collect::<String>();
+                let snippet = http_response
+                    .into_string()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(256)
+                    .collect::<String>();
                 let reported = ReportedTokenUsage::default();
                 self.ledger.record(ModelCallRecord {
                     purpose: request.purpose,
                     estimated_tokens: request.estimated_tokens,
                     reported_tokens: reported,
                 });
-                return Err(anyhow::anyhow!(
-                    "model API returned HTTP {status} for {} ({}/{}): {trimmed}",
+                Err(anyhow::anyhow!(
+                    "model API returned HTTP {status} for {} ({}/{}): {snippet}",
                     request.purpose,
                     self.config.base_url,
                     self.config.model
-                ));
+                ))
             }
             Err(ureq::Error::Transport(transport)) => {
                 let reported = ReportedTokenUsage::default();
@@ -250,22 +330,39 @@ impl ModelProvider for OpenAiProvider {
                     estimated_tokens: request.estimated_tokens,
                     reported_tokens: reported,
                 });
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "transport error calling model API ({}/{}): {transport}",
                     self.config.base_url,
                     self.config.model
-                ));
+                ))
             }
-        };
-
-        self.ledger.record(ModelCallRecord {
-            purpose: request.purpose,
-            estimated_tokens: request.estimated_tokens,
-            reported_tokens: reported,
-        });
-
-        Ok(response)
+        }
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolDefinition {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: serde_json::Value,
+}
+
+/// Build the chat message list for a request, prepending the system/policy
+/// message when one is set. Kept as a free function so both entry points share
+/// identical message construction.
+fn chat_messages(request: &ModelRequest) -> Vec<OpenAiMessage<'_>> {
+    let mut messages = Vec::with_capacity(2);
+    if let Some(system) = request.system.as_deref() {
+        messages.push(OpenAiMessage {
+            role: "system",
+            content: system,
+        });
+    }
+    messages.push(OpenAiMessage {
+        role: "user",
+        content: &request.prompt,
+    });
+    messages
 }
 
 // ── OpenAI wire types (private) ──────────────────────────────────────────────
@@ -276,6 +373,23 @@ struct OpenAiChatRequest<'a> {
     messages: Vec<OpenAiMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct OpenAiTool {
+    r#type: &'static str,
+    function: OpenAiFunction,
+}
+
+#[derive(Serialize)]
+struct OpenAiFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -298,7 +412,21 @@ struct OpenAiChoice {
 
 #[derive(Deserialize)]
 struct OpenAiChoiceMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolCall {
+    function: OpenAiToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -349,11 +477,34 @@ impl ModelProvider for MockModelProvider {
             .expect("mock provider mutex poisoned")
             .pop()
             .ok_or_else(|| anyhow::anyhow!("MockModelProvider: no more staged responses"))?;
-
         self.ledger
             .record(ModelCallRecord::from_request_response(&request, &response));
-
         Ok(response)
+    }
+
+    /// The mock `text` must be a JSON object with a `_tool` key naming the
+    /// tool. The remaining fields are treated as the tool arguments.
+    fn complete_with_tools(
+        &self,
+        request: ModelRequest,
+        _tools: &[ToolDefinition],
+    ) -> anyhow::Result<(String, serde_json::Value, ModelResponse)> {
+        let response = self
+            .responses
+            .lock()
+            .expect("mock provider mutex poisoned")
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("MockModelProvider: no more staged responses"))?;
+        self.ledger
+            .record(ModelCallRecord::from_request_response(&request, &response));
+        let mut value: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&response.text)
+                .map_err(|e| anyhow::anyhow!("mock tool-call text not valid JSON: {e}"))?;
+        let tool_name = value
+            .remove("_tool")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("mock tool-call text missing `_tool` key"))?;
+        Ok((tool_name, serde_json::Value::Object(value), response))
     }
 }
 
@@ -364,6 +515,7 @@ mod tests {
     fn sample_request(purpose: ModelPurpose) -> ModelRequest {
         ModelRequest {
             purpose,
+            system: None,
             prompt: "test prompt".to_string(),
             estimated_tokens: EstimatedTokenUsage {
                 input: 42,
@@ -405,6 +557,7 @@ mod tests {
     fn records_estimated_and_reported_tokens_for_model_calls() {
         let request = ModelRequest {
             purpose: ModelPurpose::FinalReport,
+            system: None,
             prompt: "summarize this run".to_string(),
             estimated_tokens: EstimatedTokenUsage {
                 input: 42,

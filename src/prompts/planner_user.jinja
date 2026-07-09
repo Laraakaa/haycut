@@ -1,0 +1,41 @@
+TASK
+Goal: {{ goal }}
+{% if acceptance %}
+Acceptance: {{ acceptance | join("; ") }}
+{% endif %}
+{% if constraints %}
+Constraints: {{ constraints | join("; ") }}
+{% endif %}
+ENVIRONMENT
+{% if environment %}
+Language: {{ environment.language }}
+Test: {{ environment.test_command }}
+{% if environment.build_command %}
+Build: {{ environment.build_command }}
+{% endif %}
+{% else %}
+Unknown project type; inspect the repo before running commands.
+{% endif %}
+{% if failure %}
+CURRENT FAILURE
+Kind: {{ failure.kind }}
+Summary: {{ failure.summary }}
+{% if failure.locations %}
+Locations: {{ failure.locations | join("; ") }}
+{% endif %}
+{% endif %}
+{% if observations %}
+KNOWN CONTEXT
+Already inspected:
+{% for observation in observations %}
+- {{ observation.id }}: {{ observation.summary }} ({{ observation.source }})
+{% endfor %}
+{% endif %}
+{% if hypotheses %}
+OPEN HYPOTHESES
+{% for hypothesis in hypotheses %}
+{{ hypothesis.id }} {{ hypothesis.confidence }}: {{ hypothesis.summary }}
+{% endfor %}
+{% endif %}
+BUDGET
+Used packet tokens: {{ budget.used }} / {{ budget.soft }} soft, {{ budget.hard }} hard.

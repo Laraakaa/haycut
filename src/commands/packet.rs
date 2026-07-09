@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -7,13 +6,12 @@ use std::{
 use crate::{
     budget::BudgetUsage,
     commands::{run_context::RunContext, trace::RunManifest},
-    compactor::{CompactPacket, OutputSource, PreservedItem, PreservedKind},
+    compactor::{CompactPacket, OutputSource},
     config::{Config, TokenConfig},
+    extract::{DiagnosticKind, Severity},
     store::RUN_STORE_PATH,
     util::{estimate_tokens, format_count},
 };
-
-const EXCERPT_RADIUS: usize = 2;
 
 pub fn run(budget: Option<usize>, force: bool) -> i32 {
     let config = match Config::load_from_current_dir() {
@@ -70,7 +68,7 @@ pub struct ContextItem {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextKind {
     CommandSummary,
     FailureLine,
@@ -105,6 +103,7 @@ pub struct OmittedItem {
     pub token_estimate: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SourceRef {
     Run {
@@ -124,24 +123,12 @@ pub enum SourceRef {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     High,
     Medium,
     Low,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct FileMention {
-    path: String,
-    line: usize,
-    excerpt: Option<LineExcerpt>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct LineExcerpt {
-    start_line: usize,
-    lines: Vec<String>,
 }
 
 impl EvidencePacket {
@@ -154,59 +141,53 @@ impl EvidencePacket {
             output.push_str(line);
             output.push('\n');
         }
-        output.push_str("Included context:\n");
-        for item in &self.items {
-            output.push_str(&format!(
-                "  - source: {}  tokens: {}  reason: {}\n",
-                item.source.label(),
-                format_count(item.token_estimate),
-                item.reason
-            ));
-        }
-        output.push_str("Compact evidence:\n");
-        let evidence_items = self.compact_evidence_items();
-        if evidence_items.is_empty() {
+
+        output.push_str("Diagnostics:\n");
+        let diagnostics = self.items_of(ContextKind::FailureLine);
+        if diagnostics.is_empty() {
             output.push_str("  none detected\n");
         } else {
-            for item in evidence_items {
-                output.push_str(&format!("  - {}: {}\n", item.source.label(), item.content));
+            for item in diagnostics {
+                output.push_str(&format!("  - {}\n", item.content));
             }
         }
+
         output.push_str("Files mentioned:\n");
-        let file_references = self.file_references();
+        let file_references = self.items_of(ContextKind::FileReference);
         if file_references.is_empty() {
             output.push_str("  none detected\n");
         } else {
             for item in file_references {
-                let SourceRef::File { path, line } = &item.source else {
-                    continue;
-                };
-                output.push_str(&format!("  {path}:{line}\n"));
-                match self.code_window_for(path, *line) {
-                    Some(window) => {
-                        let SourceRef::CodeWindow {
-                            start_line,
-                            end_line,
-                            ..
-                        } = window.source
-                        else {
-                            continue;
-                        };
-                        output
-                            .push_str(&format!("  <excerpt lines {}-{}>\n", start_line, end_line));
-                        for (offset, line) in window.content.lines().enumerate() {
-                            output.push_str(&format!(
-                                "    {:>4} | {}\n",
-                                start_line + offset,
-                                line
-                            ));
-                        }
-                        output.push_str("  </excerpt>\n");
-                    }
-                    None => output.push_str("    excerpt unavailable\n"),
-                }
+                output.push_str(&format!("  {}\n", item.content));
             }
         }
+
+        output.push_str("Suggested context:\n");
+        let windows = self.items_of(ContextKind::CodeWindow);
+        if windows.is_empty() {
+            output.push_str("  none\n");
+        } else {
+            for item in windows {
+                let SourceRef::CodeWindow {
+                    path,
+                    start_line,
+                    end_line,
+                } = &item.source
+                else {
+                    continue;
+                };
+                output.push_str(&format!(
+                    "  {path}:{start_line}-{end_line}  reason: {}\n",
+                    item.reason
+                ));
+                output.push_str(&format!("  <excerpt lines {start_line}-{end_line}>\n"));
+                for (offset, line) in item.content.lines().enumerate() {
+                    output.push_str(&format!("    {:>4} | {}\n", start_line + offset, line));
+                }
+                output.push_str("  </excerpt>\n");
+            }
+        }
+
         output.push_str("Context budget:\n");
         output.push_str(&format!(
             "  packet tokens: {}\n",
@@ -274,38 +255,8 @@ impl EvidencePacket {
         self.token_estimate = token_estimate;
     }
 
-    fn file_references(&self) -> Vec<&ContextItem> {
-        self.items
-            .iter()
-            .filter(|item| item.kind == ContextKind::FileReference)
-            .collect()
-    }
-
-    fn code_window_for(&self, path: &str, line: usize) -> Option<&ContextItem> {
-        self.items.iter().find(|item| match &item.source {
-            SourceRef::CodeWindow {
-                path: window_path,
-                start_line,
-                end_line,
-            } => {
-                item.kind == ContextKind::CodeWindow
-                    && window_path == path
-                    && (*start_line..=*end_line).contains(&line)
-            }
-            _ => false,
-        })
-    }
-
-    fn compact_evidence_items(&self) -> Vec<&ContextItem> {
-        self.items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.kind,
-                    ContextKind::FailureLine | ContextKind::StackFrame | ContextKind::Note
-                ) && !item.content.trim().is_empty()
-            })
-            .collect()
+    fn items_of(&self, kind: ContextKind) -> Vec<&ContextItem> {
+        self.items.iter().filter(|item| item.kind == kind).collect()
     }
 }
 
@@ -359,43 +310,47 @@ impl SourceRef {
 
 fn load_last_failed_packet(db_path: &Path) -> io::Result<EvidencePacket> {
     let ctx = RunContext::load_last_failed(db_path)?;
-    let stdout = ctx.read_stdout_lossy()?;
-    let stderr = ctx.read_stderr_lossy()?;
-    let mentions = file_mentions(
-        Path::new(&ctx.manifest.cwd),
-        &[stdout, stderr, compact_lines(&ctx.compact)],
-    );
     Ok(build_evidence_packet(
-        ctx.run_directory,
-        ctx.manifest,
-        ctx.compact,
-        mentions,
+        &ctx.manifest,
+        &ctx.evidence,
+        &ctx.compact,
     ))
 }
 
-fn build_evidence_packet(
-    run_directory: PathBuf,
-    manifest: RunManifest,
-    compact: CompactPacket,
-    mentions: Vec<FileMention>,
-) -> EvidencePacket {
-    let mut items = vec![command_summary_item(&manifest)];
-    items.extend(
-        compact
-            .preserved_items
-            .iter()
-            .map(context_item_from_preserved),
-    );
-    items.extend(mentions.iter().flat_map(context_items_from_mention));
+/// Render the shared evidence layer's likely failure as a single line,
+/// matching `haycut report` so both commands agree on the same run.
+fn format_likely_failure(evidence: &crate::evidence::EvidencePacket) -> String {
+    match &evidence.likely_failure {
+        Some(failure) => format!("{}: {}", failure.kind, failure.summary),
+        None => "none detected".to_string(),
+    }
+}
 
-    let likely_failure = likely_failure_from_items(&items).unwrap_or("none detected");
+/// Assemble a budget-aware packet purely from `evidence.json`: structured
+/// diagnostics, referenced files, and the suggested context windows (whose
+/// source lines are read from disk). This keeps `packet` a renderer of the
+/// shared evidence layer, consistent with `report`.
+fn build_evidence_packet(
+    manifest: &RunManifest,
+    evidence: &crate::evidence::EvidencePacket,
+    compact: &CompactPacket,
+) -> EvidencePacket {
+    let root = PathBuf::from(&manifest.cwd);
+    let mut items: Vec<ContextItem> = evidence.diagnostics.iter().map(diagnostic_item).collect();
+    items.extend(evidence.file_refs.iter().map(file_ref_item));
+    for context in &evidence.context_items {
+        if let Some(item) = context_window_item(&root, context) {
+            items.push(item);
+        }
+    }
+
     let summary = vec![
         format!("Run:      {}", manifest.id),
         format!(
             "Command:  {}  exit code: {}",
             manifest.command, manifest.exit_code
         ),
-        format!("Likely failure:  {likely_failure}"),
+        format!("Likely failure:  {}", format_likely_failure(evidence)),
     ];
     let mention_tokens = items
         .iter()
@@ -407,9 +362,9 @@ fn build_evidence_packet(
         })
         .map(|item| item.token_estimate)
         .sum::<usize>();
-    let token_estimate = compact.packet_tokens + mention_tokens;
-    let base_token_estimate = compact.packet_tokens;
-    let full_handles = artifact_handles(&run_directory, &manifest, &compact);
+    let base_token_estimate = evidence.token_summary.packet_tokens;
+    let token_estimate = base_token_estimate + mention_tokens;
+    let full_handles = artifact_handles(manifest, compact);
     let omitted = compact
         .omitted_items
         .iter()
@@ -417,7 +372,7 @@ fn build_evidence_packet(
             source: source_ref_for_output(item.source),
             reason: item.reason.clone(),
             count: item.count,
-            token_estimate: omitted_token_estimate(&compact, item.source),
+            token_estimate: omitted_token_estimate(compact, item.source),
         })
         .collect();
 
@@ -426,10 +381,148 @@ fn build_evidence_packet(
         summary,
         items,
         omitted,
-        raw_token_estimate: compact.raw_tokens,
+        raw_token_estimate: evidence.token_summary.raw_tokens,
         base_token_estimate,
         token_estimate,
         full_handles,
+    }
+}
+
+fn diagnostic_item(diagnostic: &crate::evidence::EvidenceDiagnostic) -> ContextItem {
+    let content = format_diagnostic(diagnostic);
+    let source = match (&diagnostic.file, diagnostic.line) {
+        (Some(path), Some(line)) => SourceRef::File {
+            path: path.clone(),
+            line,
+        },
+        _ => SourceRef::Output {
+            kind: ArtifactKind::Compact,
+        },
+    };
+
+    ContextItem {
+        kind: ContextKind::FailureLine,
+        token_estimate: estimate_tokens(content.as_bytes()),
+        content,
+        source,
+        reason: "diagnostic extracted from run output".to_string(),
+        priority: Priority::High,
+    }
+}
+
+fn file_ref_item(reference: &crate::evidence::FileRef) -> ContextItem {
+    let content = match reference.column {
+        Some(column) => format!("{}:{}:{}", reference.file, reference.line, column),
+        None => format!("{}:{}", reference.file, reference.line),
+    };
+
+    ContextItem {
+        kind: ContextKind::FileReference,
+        token_estimate: estimate_tokens(content.as_bytes()),
+        content,
+        source: SourceRef::File {
+            path: reference.file.clone(),
+            line: reference.line,
+        },
+        reason: reference.reason.clone(),
+        priority: Priority::Medium,
+    }
+}
+
+fn context_window_item(root: &Path, context: &crate::evidence::ContextItem) -> Option<ContextItem> {
+    let (path, start_line, end_line) = parse_window_target(&context.target)?;
+    let lines = read_line_range(root, &path, start_line, end_line)?;
+    let content = lines.join("\n");
+
+    Some(ContextItem {
+        kind: ContextKind::CodeWindow,
+        token_estimate: estimate_tokens(content.as_bytes()),
+        content,
+        source: SourceRef::CodeWindow {
+            path,
+            start_line,
+            end_line,
+        },
+        reason: context.reason.clone(),
+        priority: Priority::Medium,
+    })
+}
+
+/// Parse an evidence context target like `src/config.rs:203-223`.
+fn parse_window_target(target: &str) -> Option<(String, usize, usize)> {
+    let (path, range) = target.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    if start == 0 || end < start {
+        return None;
+    }
+
+    Some((path.to_string(), start, end))
+}
+
+/// Read the inclusive `start..=end` line range from a source file, clamped to
+/// the file's bounds. Returns `None` if the file is missing or the range is
+/// out of bounds.
+fn read_line_range(root: &Path, path: &str, start: usize, end: usize) -> Option<Vec<String>> {
+    let candidate = Path::new(path);
+    let source_path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let source = fs::read_to_string(source_path).ok()?;
+    let lines: Vec<&str> = source.lines().collect();
+    if start == 0 || start > lines.len() {
+        return None;
+    }
+
+    let end = end.min(lines.len());
+    Some(
+        lines[start - 1..end]
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect(),
+    )
+}
+
+/// Render a structured diagnostic as a single readable line, e.g.
+/// `error[E0063]: missing field ... (src/config.rs:54:9)`.
+fn format_diagnostic(diagnostic: &crate::evidence::EvidenceDiagnostic) -> String {
+    let head = match diagnostic.kind {
+        DiagnosticKind::RustCompileError => match &diagnostic.code {
+            Some(code) => format!("error[{code}]"),
+            None => "error".to_string(),
+        },
+        DiagnosticKind::TestFailure => "test failure".to_string(),
+        DiagnosticKind::Panic => "panic".to_string(),
+        DiagnosticKind::Generic => match diagnostic.severity {
+            Severity::Error => "error".to_string(),
+            Severity::Warning => "warning".to_string(),
+        },
+    };
+
+    let mut rendered = format!("{head}: {}", diagnostic.message);
+    if let Some(location) = format_location(
+        diagnostic.file.as_deref(),
+        diagnostic.line,
+        diagnostic.column,
+    ) {
+        rendered.push_str(&format!(" ({location})"));
+    }
+    rendered
+}
+
+fn format_location(
+    file: Option<&str>,
+    line: Option<usize>,
+    column: Option<usize>,
+) -> Option<String> {
+    let file = file?;
+    match (line, column) {
+        (Some(line), Some(column)) => Some(format!("{file}:{line}:{column}")),
+        (Some(line), None) => Some(format!("{file}:{line}")),
+        _ => Some(file.to_string()),
     }
 }
 
@@ -441,99 +534,25 @@ fn omitted_token_estimate(compact: &CompactPacket, source: OutputSource) -> usiz
     }
 }
 
-fn command_summary_item(manifest: &RunManifest) -> ContextItem {
-    let content = format!(
-        "{} exited with {} after {}ms",
-        manifest.command, manifest.exit_code, manifest.duration_ms
-    );
-
-    ContextItem {
-        kind: ContextKind::CommandSummary,
-        token_estimate: estimate_tokens(content.as_bytes()),
-        content,
-        source: SourceRef::Run {
-            id: manifest.id.clone(),
-        },
-        reason: "summarizes the captured command run".to_string(),
-        priority: Priority::High,
-    }
-}
-
-fn context_item_from_preserved(item: &PreservedItem) -> ContextItem {
-    let kind = match item.kind {
-        PreservedKind::ErrorLine => ContextKind::FailureLine,
-        PreservedKind::StackTrace => ContextKind::StackFrame,
-        PreservedKind::RtkFiltered => ContextKind::Note,
-    };
-    let priority = match kind {
-        ContextKind::FailureLine | ContextKind::StackFrame => Priority::High,
-        ContextKind::Note => Priority::Low,
-        _ => Priority::Medium,
-    };
-
-    ContextItem {
-        kind,
-        content: item.line.clone(),
-        source: source_ref_for_output(item.source),
-        reason: preserved_reason(item.kind).to_string(),
-        priority,
-        token_estimate: estimate_tokens(item.line.as_bytes()),
-    }
-}
-
-fn context_items_from_mention(mention: &FileMention) -> Vec<ContextItem> {
-    let reference_content = format!("{}:{}", mention.path, mention.line);
-    let mut items = vec![ContextItem {
-        kind: ContextKind::FileReference,
-        token_estimate: estimate_tokens(reference_content.as_bytes()),
-        content: reference_content,
-        source: SourceRef::File {
-            path: mention.path.clone(),
-            line: mention.line,
-        },
-        reason: "file location mentioned in captured output".to_string(),
-        priority: Priority::Medium,
-    }];
-
-    if let Some(excerpt) = &mention.excerpt {
-        let content = excerpt.lines.join("\n");
-        let end_line = excerpt.start_line + excerpt.lines.len().saturating_sub(1);
-        items.push(ContextItem {
-            kind: ContextKind::CodeWindow,
-            token_estimate: estimate_tokens(content.as_bytes()),
-            content,
-            source: SourceRef::CodeWindow {
-                path: mention.path.clone(),
-                start_line: excerpt.start_line,
-                end_line,
-            },
-            reason: "nearby source context for a referenced location".to_string(),
-            priority: Priority::Medium,
-        });
-    }
-
-    items
-}
-
-fn artifact_handles(
-    run_directory: &Path,
-    manifest: &RunManifest,
-    compact: &CompactPacket,
-) -> Vec<ArtifactHandle> {
+fn artifact_handles(manifest: &RunManifest, compact: &CompactPacket) -> Vec<ArtifactHandle> {
     vec![
         ArtifactHandle {
             kind: ArtifactKind::Stdout,
-            path: run_directory.join(&manifest.stdout),
+            path: PathBuf::from(&manifest.stdout),
             token_estimate: compact.raw_stdout_tokens,
         },
         ArtifactHandle {
             kind: ArtifactKind::Stderr,
-            path: run_directory.join(&manifest.stderr),
+            path: PathBuf::from(&manifest.stderr),
             token_estimate: compact.raw_stderr_tokens,
         },
         ArtifactHandle {
             kind: ArtifactKind::Compact,
-            path: run_directory.join(&manifest.compact),
+            path: compact
+                .compact_artifact
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&manifest.compact)),
             token_estimate: compact.packet_tokens,
         },
     ]
@@ -549,238 +568,6 @@ fn source_ref_for_output(source: OutputSource) -> SourceRef {
     SourceRef::Output { kind }
 }
 
-fn preserved_reason(kind: PreservedKind) -> &'static str {
-    match kind {
-        PreservedKind::ErrorLine => "failure line preserved from command output",
-        PreservedKind::StackTrace => "stack frame summary preserved from command output",
-        PreservedKind::RtkFiltered => "line preserved by RTK compaction",
-    }
-}
-
-fn likely_failure_from_items(items: &[ContextItem]) -> Option<&str> {
-    items
-        .iter()
-        .filter(|item| item.kind == ContextKind::FailureLine && !item.content.trim().is_empty())
-        .max_by_key(|item| likely_failure_rank(&item.content))
-        .map(|item| item.content.as_str())
-}
-
-fn likely_failure_rank(line: &str) -> u8 {
-    let trimmed = line.trim_start();
-    let lower = trimmed.to_ascii_lowercase();
-
-    if lower.contains("assertion") || lower.contains(" panicked at ") {
-        5
-    } else if trimmed.starts_with("left:") || trimmed.starts_with("right:") {
-        4
-    } else if lower.contains("error") || lower.contains("failed") || lower.contains("failure") {
-        3
-    } else if lower.contains("expected") || lower.contains("actual") {
-        2
-    } else {
-        1
-    }
-}
-
-fn file_mentions(root: &Path, texts: &[String]) -> Vec<FileMention> {
-    let mut locations = BTreeSet::new();
-    for text in texts {
-        for (path, line) in extract_locations(text) {
-            locations.insert((path, line));
-        }
-    }
-
-    locations
-        .into_iter()
-        .map(|(path, line)| {
-            let excerpt = source_excerpt(root, &path, line).ok().flatten();
-            FileMention {
-                path,
-                line,
-                excerpt,
-            }
-        })
-        .collect()
-}
-
-fn extract_locations(text: &str) -> Vec<(String, usize)> {
-    let mut locations = Vec::new();
-
-    for line in text.lines() {
-        if let Some(location) = parse_python_traceback_location(line) {
-            locations.push(location);
-        }
-
-        locations.extend(parse_colon_locations(line));
-    }
-
-    locations
-}
-
-#[cfg(test)]
-fn parse_location(token: &str) -> Option<(String, usize)> {
-    let token = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '\'' | '"'
-        )
-    });
-
-    parse_location_prefix(token)
-}
-
-fn parse_colon_locations(line: &str) -> Vec<(String, usize)> {
-    let mut locations = Vec::new();
-
-    for (start, ch) in line.char_indices() {
-        if !is_path_start(ch) || !is_location_start_boundary(line, start) {
-            continue;
-        }
-
-        if let Some(location) = parse_location_prefix(&line[start..]) {
-            locations.push(location);
-        }
-    }
-
-    locations
-}
-
-fn parse_location_prefix(text: &str) -> Option<(String, usize)> {
-    for (index, ch) in text.char_indices() {
-        if ch != ':' {
-            continue;
-        }
-
-        let path = &text[..index];
-        let line_number = text[index + ch.len_utf8()..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        let Ok(line) = line_number.parse::<usize>() else {
-            continue;
-        };
-        if line == 0 || !looks_like_source_path(path) {
-            continue;
-        }
-
-        return Some((path.trim_start_matches("./").to_string(), line));
-    }
-
-    None
-}
-
-fn is_path_start(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '.' || ch == '/'
-}
-
-fn is_location_start_boundary(line: &str, start: usize) -> bool {
-    if start == 0 {
-        return true;
-    }
-
-    let before = &line[..start];
-    let Some(previous) = before.chars().next_back() else {
-        return true;
-    };
-    if !is_path_char(previous) {
-        return true;
-    }
-
-    previous.is_ascii_digit() && before_number_is_colon(before)
-}
-
-fn before_number_is_colon(text: &str) -> bool {
-    text.trim_end_matches(|ch: char| ch.is_ascii_digit())
-        .ends_with(':')
-}
-
-fn is_path_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':' | '\\')
-}
-
-fn parse_python_traceback_location(line: &str) -> Option<(String, usize)> {
-    let file_start = line.find("File ")?;
-    let after_file = &line[file_start + "File ".len()..];
-    let quote = after_file.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-
-    let after_open_quote = &after_file[quote.len_utf8()..];
-    let path_end = after_open_quote.find(quote)?;
-    let path = &after_open_quote[..path_end];
-    let after_path = &after_open_quote[path_end + quote.len_utf8()..];
-    let line_marker = ", line ";
-    let line_start = after_path.find(line_marker)? + line_marker.len();
-    let line_number = after_path[line_start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    let line = line_number.parse::<usize>().ok()?;
-    if line == 0 || !looks_like_source_path(path) {
-        return None;
-    }
-
-    Some((path.trim_start_matches("./").to_string(), line))
-}
-
-fn looks_like_source_path(path: &str) -> bool {
-    if path.is_empty() || !path.chars().all(is_path_char) {
-        return false;
-    }
-
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return false;
-    }
-
-    path.contains('/')
-        || path.ends_with(".rs")
-        || path.ends_with(".py")
-        || path.ends_with(".ts")
-        || path.ends_with(".tsx")
-        || path.ends_with(".js")
-        || path.ends_with(".jsx")
-}
-
-fn source_excerpt(root: &Path, path: &str, line: usize) -> io::Result<Option<LineExcerpt>> {
-    let path = Path::new(path);
-    let source_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let source = match fs::read_to_string(source_path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let lines: Vec<&str> = source.lines().collect();
-    if line == 0 || line > lines.len() {
-        return Ok(None);
-    }
-
-    let start_line = line.saturating_sub(EXCERPT_RADIUS).max(1);
-    let end_line = (line + EXCERPT_RADIUS).min(lines.len());
-    let excerpt = lines[start_line - 1..end_line]
-        .iter()
-        .map(|line| (*line).to_string())
-        .collect();
-
-    Ok(Some(LineExcerpt {
-        start_line,
-        lines: excerpt,
-    }))
-}
-
-fn compact_lines(compact: &CompactPacket) -> String {
-    compact
-        .preserved_items
-        .iter()
-        .map(|item| item.line.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -791,107 +578,9 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::{
-        compactor::{NativeHeuristicCompactor, OutputCompactor, OutputSource, PreservedItem},
-        store::{NewArtifact, NewRun, insert_run},
-    };
-
-    #[test]
-    fn parses_file_locations_from_output_tokens() {
-        assert_eq!(
-            parse_location("src/lib.rs:12:5"),
-            Some(("src/lib.rs".to_string(), 12))
-        );
-        assert_eq!(
-            parse_location("tests/auth/session_test.rs:52:9"),
-            Some(("tests/auth/session_test.rs".to_string(), 52))
-        );
-        assert_eq!(
-            parse_location("tests/test_auth.py:52"),
-            Some(("tests/test_auth.py".to_string(), 52))
-        );
-        assert_eq!(
-            parse_location("/path/to/file.ts:117:13"),
-            Some(("/path/to/file.ts".to_string(), 117))
-        );
-        assert_eq!(
-            parse_location("(./src/auth/session.rs:88)"),
-            Some(("src/auth/session.rs".to_string(), 88))
-        );
-        assert_eq!(parse_location("exit code: 101"), None);
-    }
-
-    #[test]
-    fn extracts_python_traceback_file_locations() {
-        assert_eq!(
-            parse_python_traceback_location(
-                "  File \"tests/test_auth.py\", line 123, in test_auth"
-            ),
-            Some(("tests/test_auth.py".to_string(), 123))
-        );
-        assert_eq!(
-            parse_python_traceback_location("File '/path/to/file.ts', line 117"),
-            Some(("/path/to/file.ts".to_string(), 117))
-        );
-        assert_eq!(
-            parse_python_traceback_location("File missing quotes, line 123"),
-            None
-        );
-    }
-
-    #[test]
-    fn extracts_locations_from_multiline_logs() {
-        let locations = extract_locations(
-            "error[E0425]: cannot find value\n  --> src/lib.rs:12:5\n  File \"tests/test_auth.py\", line 52, in test_auth\n",
-        );
-
-        assert!(locations.contains(&("src/lib.rs".to_string(), 12)));
-        assert!(locations.contains(&("tests/test_auth.py".to_string(), 52)));
-    }
-
-    #[test]
-    fn extracts_adjacent_path_locations_from_logs() {
-        let locations = extract_locations(
-            "src/lib.rs:12:5tests/test_auth.py:52/path/to/file.ts:117:13File \"src/main.rs\", line 9",
-        );
-
-        assert!(locations.contains(&("src/lib.rs".to_string(), 12)));
-        assert!(locations.contains(&("tests/test_auth.py".to_string(), 52)));
-        assert!(locations.contains(&("/path/to/file.ts".to_string(), 117)));
-        assert!(locations.contains(&("src/main.rs".to_string(), 9)));
-    }
-
-    #[test]
-    fn includes_nearby_excerpt_for_mentioned_file() {
-        let root = temp_root("packet-excerpt");
-        fs::create_dir_all(root.join("src/auth")).expect("source directory should be created");
-        fs::write(
-            root.join("src/auth/session.rs"),
-            "line 1\nline 2\nline 3\nline 4\nline 5\n",
-        )
-        .expect("source should be written");
-
-        let mentions = file_mentions(&root, &["error at src/auth/session.rs:3:5".to_string()]);
-
-        assert_eq!(mentions.len(), 1);
-        assert_eq!(mentions[0].path, "src/auth/session.rs");
-        assert_eq!(mentions[0].line, 3);
-        assert_eq!(
-            mentions[0].excerpt,
-            Some(LineExcerpt {
-                start_line: 1,
-                lines: vec![
-                    "line 1".to_string(),
-                    "line 2".to_string(),
-                    "line 3".to_string(),
-                    "line 4".to_string(),
-                    "line 5".to_string(),
-                ],
-            })
-        );
-
-        fs::remove_dir_all(root).expect("test root should be removed");
-    }
+    use crate::compactor::{NativeHeuristicCompactor, OutputCompactor};
+    use crate::extract::{DiagnosticKind, Severity};
+    use crate::store::{NewArtifact, NewRun, insert_run};
 
     #[test]
     fn loads_most_recent_failed_run_not_latest_success() {
@@ -936,76 +625,86 @@ mod tests {
     }
 
     #[test]
-    fn renders_packet_with_command_files_excerpts_and_token_estimate() {
-        let compact = CompactPacket {
-            compactor: "native".to_string(),
-            rtk_version: None,
-            command: "cargo test auth".to_string(),
-            exit_code: 101,
-            duration_ms: 42,
-            failed: true,
-            stdout_artifact: "stdout.txt".to_string(),
-            stderr_artifact: "stderr.txt".to_string(),
-            compact_artifact: None,
-            raw_stdout_tokens: 20,
-            raw_stderr_tokens: 80,
-            raw_tokens: 100,
-            packet_tokens: 25,
-            preserved_items: vec![PreservedItem {
-                source: OutputSource::Stderr,
-                kind: PreservedKind::ErrorLine,
-                line: "tests/auth/session_test.rs:52 expected expired session".to_string(),
-            }],
-            omitted_items: Vec::new(),
-            notes: Vec::new(),
-            compact_text: None,
-        };
-        let packet = build_evidence_packet(
-            PathBuf::from(".haycut/runs/run-1"),
-            manifest_fixture("run-1", "cargo test auth", 101, "/tmp"),
-            compact,
-            vec![FileMention {
-                path: "tests/auth/session_test.rs".to_string(),
-                line: 52,
-                excerpt: Some(LineExcerpt {
-                    start_line: 50,
-                    lines: vec![
-                        "setup();".to_string(),
-                        "let session = expired_session();".to_string(),
-                        "assert!(validate_session(session).is_err());".to_string(),
-                    ],
-                }),
-            }],
-        );
+    fn renders_packet_from_evidence_diagnostics_files_and_context() {
+        let root = temp_root("packet-render");
+        fs::create_dir_all(root.join("tests/auth")).expect("source directory should be created");
+        fs::write(
+            root.join("tests/auth/session_test.rs"),
+            "fn setup() {}\nfn helper() {}\nsetup();\nlet session = expired_session();\nassert!(validate_session(session).is_err());\nfn teardown() {}\n",
+        )
+        .expect("source should be written");
 
+        let evidence = crate::evidence::EvidencePacket {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            outcome: crate::evidence::Outcome {
+                exit_code: 101,
+                status: "failure".to_string(),
+            },
+            likely_failure: Some(crate::evidence::LikelyFailure {
+                kind: "test_failure".to_string(),
+                summary: "Test auth session failed".to_string(),
+                confidence: "high".to_string(),
+            }),
+            primary_diagnostic: Some(crate::evidence::PrimaryDiagnostic {
+                source: "stderr".to_string(),
+                message: "assertion failed: session rejected".to_string(),
+                code: None,
+                file: Some("tests/auth/session_test.rs".to_string()),
+                line: Some(5),
+                column: Some(5),
+            }),
+            diagnostics: vec![crate::evidence::EvidenceDiagnostic {
+                kind: DiagnosticKind::Panic,
+                severity: Severity::Error,
+                code: None,
+                message: "assertion failed: session rejected".to_string(),
+                file: Some("tests/auth/session_test.rs".to_string()),
+                line: Some(5),
+                column: Some(5),
+            }],
+            file_refs: vec![crate::evidence::FileRef {
+                file: "tests/auth/session_test.rs".to_string(),
+                line: 5,
+                column: Some(5),
+                reason: "panic location".to_string(),
+            }],
+            context_items: vec![crate::evidence::ContextItem {
+                kind: "file_window".to_string(),
+                target: "tests/auth/session_test.rs:3-5".to_string(),
+                reason: "Primary test failure location".to_string(),
+            }],
+            token_summary: crate::evidence::TokenSummary {
+                raw_tokens: 100,
+                packet_tokens: 25,
+                saved_tokens: 75,
+                reduction_percent: 75.0,
+            },
+        };
+        let compact = compact_fixture("cargo test auth", 101, 25);
+        let manifest =
+            manifest_fixture("run-1", "cargo test auth", 101, &root.display().to_string());
+
+        let packet = build_evidence_packet(&manifest, &evidence, &compact);
         let rendered = packet.render(&token_config());
 
+        fs::remove_dir_all(root).expect("test root should be removed");
+
         assert!(rendered.contains("Command:  cargo test auth  exit code: 101"));
-        assert!(rendered.contains("Included context:"));
+        assert!(rendered.contains("Likely failure:  test_failure: Test auth session failed"));
+        assert!(rendered.contains("Diagnostics:"));
+        assert!(rendered.contains(
+            "  - panic: assertion failed: session rejected (tests/auth/session_test.rs:5:5)"
+        ));
+        assert!(rendered.contains("Files mentioned:"));
+        assert!(rendered.contains("  tests/auth/session_test.rs:5:5"));
+        assert!(rendered.contains("Suggested context:"));
         assert!(
             rendered.contains(
-                "Likely failure:  tests/auth/session_test.rs:52 expected expired session"
+                "  tests/auth/session_test.rs:3-5  reason: Primary test failure location"
             )
         );
-        assert!(rendered.contains("Compact evidence:"));
-        assert!(
-            rendered.contains("  - stderr: tests/auth/session_test.rs:52 expected expired session")
-        );
-        for item in &packet.items {
-            assert!(!item.reason.trim().is_empty());
-            let expected = format!(
-                "  - source: {}  tokens: {}  reason: {}",
-                item.source.label(),
-                format_count(item.token_estimate),
-                item.reason
-            );
-            assert!(
-                rendered.contains(&expected),
-                "missing included context row: {expected}"
-            );
-        }
-        assert!(rendered.contains("tests/auth/session_test.rs:52"));
-        assert!(rendered.contains("<excerpt lines 50-52>"));
+        assert!(rendered.contains("<excerpt lines 3-5>"));
         assert!(rendered.contains("assert!(validate_session(session).is_err());"));
         assert!(rendered.contains("packet tokens:"));
         assert!(rendered.contains("Budget:  soft: 40,000  hard: 80,000"));
@@ -1014,31 +713,29 @@ mod tests {
 
     #[test]
     fn detects_hard_budget_exceeded_for_packet() {
-        let compact = CompactPacket {
-            compactor: "native".to_string(),
-            rtk_version: None,
-            command: "cargo test auth".to_string(),
-            exit_code: 101,
-            duration_ms: 42,
-            failed: true,
-            stdout_artifact: "stdout.txt".to_string(),
-            stderr_artifact: "stderr.txt".to_string(),
-            compact_artifact: None,
-            raw_stdout_tokens: 50,
-            raw_stderr_tokens: 50,
-            raw_tokens: 100,
-            packet_tokens: 90_000,
-            preserved_items: Vec::new(),
-            omitted_items: Vec::new(),
-            notes: Vec::new(),
-            compact_text: None,
+        let evidence = crate::evidence::EvidencePacket {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            outcome: crate::evidence::Outcome {
+                exit_code: 101,
+                status: "failure".to_string(),
+            },
+            likely_failure: None,
+            primary_diagnostic: None,
+            diagnostics: Vec::new(),
+            file_refs: Vec::new(),
+            context_items: Vec::new(),
+            token_summary: crate::evidence::TokenSummary {
+                raw_tokens: 100,
+                packet_tokens: 90_000,
+                saved_tokens: 0,
+                reduction_percent: 0.0,
+            },
         };
-        let packet = build_evidence_packet(
-            PathBuf::from(".haycut/runs/run-1"),
-            manifest_fixture("run-1", "cargo test auth", 101, "/tmp"),
-            compact,
-            Vec::new(),
-        );
+        let compact = compact_fixture("cargo test auth", 101, 90_000);
+        let manifest = manifest_fixture("run-1", "cargo test auth", 101, "/tmp");
+
+        let packet = build_evidence_packet(&manifest, &evidence, &compact);
 
         assert!(packet.budget_usage(&token_config()).hard_error().is_some());
     }
@@ -1059,9 +756,9 @@ mod tests {
                     priority: Priority::High,
                     token_estimate: 6,
                 },
-                context_window_item("src/high.rs", 1, 20, Priority::High),
-                context_window_item("src/medium.rs", 1, 15, Priority::Medium),
-                context_window_item("src/low.rs", 1, 10, Priority::Low),
+                window_item_fixture("src/high.rs", 1, 20, Priority::High),
+                window_item_fixture("src/medium.rs", 1, 15, Priority::Medium),
+                window_item_fixture("src/low.rs", 1, 10, Priority::Low),
             ],
             omitted: Vec::new(),
             raw_token_estimate: 200,
@@ -1074,13 +771,9 @@ mod tests {
         let rendered = packet.render(&token_config());
 
         assert_eq!(packet.token_estimate, 45);
-        assert!(rendered.contains("source: src/high.rs lines 1-1"));
-        assert!(rendered.contains("source: src/medium.rs lines 1-1"));
-        assert!(
-            !rendered.contains(
-                "source: src/low.rs lines 1-1  tokens: 10  reason: nearby source context"
-            )
-        );
+        assert!(rendered.contains("src/high.rs:1-1"));
+        assert!(rendered.contains("src/medium.rs:1-1"));
+        assert!(!rendered.contains("src/low.rs:1-1"));
         assert!(rendered.contains("Omitted:"));
         assert!(rendered.contains(
             "source: src/low.rs lines 1-1  tokens: 10  reason: over budget; nearby source context"
@@ -1112,8 +805,8 @@ mod tests {
             "test".to_string(),
             "commands::packet::tests::renders_packet".to_string(),
         ];
-        let stdout_artifact = PathBuf::from("stdout.txt");
-        let stderr_artifact = PathBuf::from("stderr.txt");
+        let stdout_artifact = PathBuf::from(".haycut/runs/golden-rust/stdout.txt");
+        let stderr_artifact = PathBuf::from(".haycut/runs/golden-rust/stderr.txt");
         let input = crate::compactor::CompactionInput {
             command: "cargo",
             args: &args,
@@ -1128,25 +821,24 @@ mod tests {
             .compact(&input)
             .expect("fixture should compact");
         let stderr_text = String::from_utf8_lossy(stderr).into_owned();
-        let mentions = file_mentions(&root, &[stderr_text, compact_lines(&compact)]);
-        let packet = build_evidence_packet(
-            PathBuf::from(".haycut/runs/golden-rust"),
-            manifest_fixture(
-                "golden-rust",
-                "cargo test commands::packet::tests::renders_packet",
-                101,
-                &root.display().to_string(),
-            ),
-            compact,
-            mentions,
+        let evidence = crate::evidence::build("golden-rust", 101, &compact, "", &stderr_text);
+        let mut manifest = manifest_fixture(
+            "golden-rust",
+            "cargo test commands::packet::tests::renders_packet",
+            101,
+            &root.display().to_string(),
         );
+        manifest.stdout = ".haycut/runs/golden-rust/stdout.txt".to_string();
+        manifest.stderr = ".haycut/runs/golden-rust/stderr.txt".to_string();
+        manifest.compact = "sqlite:compact_json".to_string();
+        let packet = build_evidence_packet(&manifest, &evidence, &compact);
         let rendered = packet.render(&token_config());
 
         fs::remove_dir_all(root).expect("test root should be removed");
         insta::assert_snapshot!("rust_failure_packet", rendered);
     }
 
-    fn context_window_item(
+    fn window_item_fixture(
         path: &str,
         start_line: usize,
         token_estimate: usize,
@@ -1163,6 +855,28 @@ mod tests {
             reason: "nearby source context".to_string(),
             priority,
             token_estimate,
+        }
+    }
+
+    fn compact_fixture(command: &str, exit_code: i32, packet_tokens: usize) -> CompactPacket {
+        CompactPacket {
+            compactor: "native".to_string(),
+            rtk_version: None,
+            command: command.to_string(),
+            exit_code,
+            duration_ms: 42,
+            failed: exit_code != 0,
+            stdout_artifact: "stdout.txt".to_string(),
+            stderr_artifact: "stderr.txt".to_string(),
+            compact_artifact: None,
+            raw_stdout_tokens: 0,
+            raw_stderr_tokens: 0,
+            raw_tokens: 100,
+            packet_tokens,
+            preserved_items: Vec::new(),
+            omitted_items: Vec::new(),
+            notes: Vec::new(),
+            compact_text: None,
         }
     }
 
@@ -1208,7 +922,7 @@ mod tests {
             run_directory.join("stderr.txt"),
             "error at tests/auth/session_test.rs:52:9\n",
         )?;
-        let manifest = manifest_fixture(id, command, exit_code, "/tmp");
+        let _manifest = manifest_fixture(id, command, exit_code, "/tmp");
         let compact = CompactPacket {
             compactor: "native".to_string(),
             rtk_version: None,
@@ -1229,14 +943,6 @@ mod tests {
             compact_text: None,
         };
 
-        fs::write(
-            run_directory.join("run.json"),
-            serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
-        )?;
-        fs::write(
-            run_directory.join("compact.json"),
-            serde_json::to_string_pretty(&compact).map_err(io::Error::other)?,
-        )?;
         let evidence = crate::evidence::build(
             id,
             exit_code,
@@ -1244,10 +950,8 @@ mod tests {
             "",
             "error at tests/auth/session_test.rs:52:9\n",
         );
-        fs::write(
-            run_directory.join("evidence.json"),
-            serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?,
-        )
+        let _ = evidence;
+        Ok(())
     }
 
     fn insert_packet_run(
@@ -1258,35 +962,70 @@ mod tests {
         created_at: &str,
         run_directory: &Path,
     ) -> io::Result<()> {
+        let compact = CompactPacket {
+            compactor: "native".to_string(),
+            rtk_version: None,
+            command: command.to_string(),
+            exit_code,
+            duration_ms: 42,
+            failed: exit_code != 0,
+            stdout_artifact: run_directory.join("stdout.txt").display().to_string(),
+            stderr_artifact: run_directory.join("stderr.txt").display().to_string(),
+            compact_artifact: None,
+            raw_stdout_tokens: 0,
+            raw_stderr_tokens: 10,
+            raw_tokens: 10,
+            packet_tokens: 5,
+            preserved_items: Vec::new(),
+            omitted_items: Vec::new(),
+            notes: Vec::new(),
+            compact_text: None,
+        };
+        let evidence = crate::evidence::build(
+            id,
+            exit_code,
+            &compact,
+            "",
+            "error at tests/auth/session_test.rs:52:9\n",
+        );
+        let compact_json = serde_json::to_string(&compact).map_err(io::Error::other)?;
+        let evidence_json = serde_json::to_string(&evidence).map_err(io::Error::other)?;
+        let stdout_path = run_directory.join("stdout.txt").display().to_string();
+        let stderr_path = run_directory.join("stderr.txt").display().to_string();
+
         insert_run(
             db_path,
             &NewRun {
                 id,
                 command,
+                args_json: "[]",
                 cwd: "/tmp",
                 exit_code: Some(exit_code),
                 duration_ms: 42,
+                stdout_bytes: 0,
+                stderr_bytes: 45,
                 raw_tokens: 10,
+                raw_stdout_tokens: 0,
+                raw_stderr_tokens: 10,
                 packet_tokens: 5,
                 created_at,
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+                compact_text_path: None,
+                compact_json: &compact_json,
+                evidence_json: &evidence_json,
                 artifacts: vec![
                     NewArtifact {
-                        id: format!("{id}:run_manifest"),
-                        kind: "run_manifest",
-                        path: run_directory.join("run.json").display().to_string(),
-                        estimated_tokens: None,
+                        id: format!("{id}:stdout"),
+                        kind: "stdout",
+                        path: stdout_path.clone(),
+                        estimated_tokens: Some(0),
                     },
                     NewArtifact {
-                        id: format!("{id}:compact_json"),
-                        kind: "compact_json",
-                        path: run_directory.join("compact.json").display().to_string(),
-                        estimated_tokens: Some(5),
-                    },
-                    NewArtifact {
-                        id: format!("{id}:evidence_json"),
-                        kind: "evidence_json",
-                        path: run_directory.join("evidence.json").display().to_string(),
-                        estimated_tokens: Some(5),
+                        id: format!("{id}:stderr"),
+                        kind: "stderr",
+                        path: stderr_path.clone(),
+                        estimated_tokens: Some(10),
                     },
                 ],
             },

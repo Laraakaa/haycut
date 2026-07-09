@@ -23,22 +23,22 @@ pub fn run(path: PathBuf, line: usize, radius: usize, force: bool) -> i32 {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct FileWindow {
-    path: PathBuf,
-    start_line: usize,
-    end_line: usize,
-    token_estimate: usize,
-    lines: Vec<NumberedLine>,
+pub struct FileWindow {
+    pub path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub token_estimate: usize,
+    pub lines: Vec<NumberedLine>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct NumberedLine {
-    number: usize,
-    text: String,
+pub struct NumberedLine {
+    pub number: usize,
+    pub text: String,
 }
 
 impl FileWindow {
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         let mut output = String::new();
 
         output.push_str(&format!("File: {}\n", self.path.display()));
@@ -54,7 +54,12 @@ impl FileWindow {
     }
 }
 
-fn read_window(path: PathBuf, line: usize, radius: usize, force: bool) -> io::Result<FileWindow> {
+pub fn read_window(
+    path: PathBuf,
+    line: usize,
+    radius: usize,
+    force: bool,
+) -> io::Result<FileWindow> {
     if line == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -1,70 +1,37 @@
 ---
 source: src/commands/packet.rs
-assertion_line: 1149
+assertion_line: 844
 expression: rendered
 ---
 EVIDENCE PACKET
 Run:      golden-rust
 Command:  cargo test commands::packet::tests::renders_packet  exit code: 101
-Likely failure:  assertion `left == right` failed
-Included context:
-  - source: run golden-rust  tokens: 19  reason: summarizes the captured command run
-  - source: stderr  tokens: 12  reason: failure line preserved from command output
-  - source: stderr  tokens: 12  reason: failure line preserved from command output
-  - source: stderr  tokens: 13  reason: failure line preserved from command output
-  - source: stderr  tokens: 0  reason: failure line preserved from command output
-  - source: stderr  tokens: 2  reason: failure line preserved from command output
-  - source: stderr  tokens: 0  reason: failure line preserved from command output
-  - source: stderr  tokens: 14  reason: failure line preserved from command output
-  - source: stderr  tokens: 22  reason: failure line preserved from command output
-  - source: stderr  tokens: 8  reason: failure line preserved from command output
-  - source: stderr  tokens: 5  reason: failure line preserved from command output
-  - source: stderr  tokens: 7  reason: failure line preserved from command output
-  - source: stderr  tokens: 19  reason: failure line preserved from command output
-  - source: stderr  tokens: 0  reason: failure line preserved from command output
-  - source: stderr  tokens: 12  reason: failure line preserved from command output
-  - source: stderr  tokens: 10  reason: failure line preserved from command output
-  - source: stderr  tokens: 10  reason: failure line preserved from command output
-  - source: stderr  tokens: 12  reason: failure line preserved from command output
-  - source: stderr  tokens: 0  reason: failure line preserved from command output
-  - source: stderr  tokens: 2  reason: failure line preserved from command output
-  - source: stderr  tokens: 10  reason: failure line preserved from command output
-  - source: stderr  tokens: 0  reason: failure line preserved from command output
-  - source: stderr  tokens: 24  reason: failure line preserved from command output
-  - source: stderr  tokens: 12  reason: failure line preserved from command output
-  - source: src/commands/packet.rs:612  tokens: 6  reason: file location mentioned in captured output
-  - source: src/commands/packet.rs lines 610-614  tokens: 22  reason: nearby source context for a referenced location
-Compact evidence:
-  - stderr: setup noise 004: preparing temporary project root
-  - stderr: setup noise 005: recording environment variables
-  - stderr: test commands::packet::tests::renders_packet ... FAILED
-  - stderr: failures:
-  - stderr: ---- commands::packet::tests::renders_packet stdout ----
-  - stderr: thread 'commands::packet::tests::renders_packet' panicked at src/commands/packet.rs:612:9:
-  - stderr: assertion `left == right` failed
-  - stderr:   left: "packet source"
-  - stderr:  right: "useful source excerpt"
-  - stderr: note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-  - stderr: tail noise 001: cargo wrote standard test epilogue
-  - stderr: tail noise 002: target directory unchanged
-  - stderr: tail noise 003: no doctests were executed
-  - stderr: tail noise 010: background output should be omitted
-  - stderr: failures:
-  - stderr:     commands::packet::tests::renders_packet
-  - stderr: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.00s
-  - stderr: error: test failed, to rerun pass `--bin haycut`
+Likely failure:  test_failure: Test commands::packet::tests::renders_packet failed
+Diagnostics:
+  - test failure: test commands::packet::tests::renders_packet failed
+  - panic: assertion `left == right` failed (src/commands/packet.rs:612:9)
 Files mentioned:
-  src/commands/packet.rs:612
-  <excerpt lines 610-614>
+  src/commands/packet.rs:612:9
+Suggested context:
+  src/commands/packet.rs:602-622  reason: Primary test failure location
+  <excerpt lines 602-622>
+     602 | // filler line 602
+     603 | // filler line 603
+     604 | // filler line 604
+     605 | // filler line 605
+     606 | // filler line 606
+     607 | // filler line 607
+     608 | // filler line 608
+     609 | // filler line 609
      610 | #[test]
      611 | fn renders_packet() {
      612 |     assert_eq!(actual.source(), "useful source excerpt");
      613 | }
   </excerpt>
 Context budget:
-  packet tokens: 280
+  packet tokens: 319
 Budget:  soft: 40,000  hard: 80,000
-This run: raw output: 381 (1.0% of soft, 0.5% of hard)  packet: 280 (0.7% of soft, 0.4% of hard)
+This run: raw output: 381 (1.0% of soft, 0.5% of hard)  packet: 319 (0.8% of soft, 0.4% of hard)
 Status: packet is within budget; raw output would have used 1.0% of soft budget
 Omitted:
   - source: stdout  tokens: 0  reason: non-error output omitted from compact packet
@@ -72,4 +39,4 @@ Omitted:
 Full handles:
   stdout: .haycut/runs/golden-rust/stdout.txt
   stderr: .haycut/runs/golden-rust/stderr.txt
-  compact: .haycut/runs/golden-rust/compact.json
+  compact: sqlite:compact_json

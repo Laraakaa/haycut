@@ -185,6 +185,17 @@ impl OutputCompactor for RtkCompactor {
         let compact_output = [output.stdout, output.stderr].concat();
         let mut preserved_items = Vec::new();
         for line in String::from_utf8_lossy(&compact_output).lines().take(120) {
+            // RTK filters can echo a line twice (e.g. cargo-test repeats the
+            // final `test result:` summary). Collapse consecutive duplicates so
+            // the preserved evidence stays clean without touching the raw
+            // `compact.txt` artifact.
+            if preserved_items
+                .last()
+                .is_some_and(|last: &PreservedItem| last.line == line)
+            {
+                continue;
+            }
+
             preserved_items.push(PreservedItem {
                 source: OutputSource::Rtk,
                 kind: PreservedKind::RtkFiltered,

@@ -1,7 +1,7 @@
 //! The semantic layer: turns a compacted run plus raw output into a structured
 //! [`EvidencePacket`].
 //!
-//! `evidence.json` is HayCut's stable internal contract. `trace` writes it,
+//! The evidence packet is HayCut's stable internal contract. `trace` stores it,
 //! `report` renders it, and future commands consume it. Extraction lives in
 //! [`crate::extract`]; this module owns derivation (likely failure, primary
 //! diagnostic, and suggested context).
@@ -99,7 +99,7 @@ pub struct TokenSummary {
 }
 
 impl EvidencePacket {
-    /// Render a compact, human-readable view of the evidence for `evidence.txt`.
+    /// Render a compact, human-readable view of the evidence packet.
     pub fn render_text(&self) -> String {
         let mut output = String::new();
 
@@ -168,7 +168,7 @@ pub fn build(
 
     let likely_failure = derive_likely_failure(&diagnostics, exit_code);
     let primary_diagnostic = derive_primary_diagnostic(&diagnostics, &file_references);
-    let context_items = derive_context_items(primary_diagnostic.as_ref());
+    let context_items = derive_context_items(primary_diagnostic.as_ref(), likely_failure.as_ref());
 
     EvidencePacket {
         schema_version: 1,
@@ -275,7 +275,10 @@ fn derive_primary_diagnostic(
     })
 }
 
-fn derive_context_items(primary: Option<&PrimaryDiagnostic>) -> Vec<ContextItem> {
+fn derive_context_items(
+    primary: Option<&PrimaryDiagnostic>,
+    likely_failure: Option<&LikelyFailure>,
+) -> Vec<ContextItem> {
     let Some(primary) = primary else {
         return Vec::new();
     };
@@ -289,8 +292,19 @@ fn derive_context_items(primary: Option<&PrimaryDiagnostic>) -> Vec<ContextItem>
     vec![ContextItem {
         kind: "file_window".to_string(),
         target: format!("{file}:{start}-{end}"),
-        reason: "Primary compiler diagnostic location".to_string(),
+        reason: context_reason(likely_failure).to_string(),
     }]
+}
+
+/// Describe why the primary location is worth inspecting, tailored to the kind
+/// of failure so the reason stays accurate (not every primary is a compiler
+/// diagnostic).
+fn context_reason(likely_failure: Option<&LikelyFailure>) -> &'static str {
+    match likely_failure.map(|failure| failure.kind.as_str()) {
+        Some("compile_error") => "Primary compiler diagnostic location",
+        Some("test_failure") => "Primary test failure location",
+        _ => "Primary failure location",
+    }
 }
 
 fn primary_from_diagnostic(diagnostic: &Diagnostic) -> PrimaryDiagnostic {

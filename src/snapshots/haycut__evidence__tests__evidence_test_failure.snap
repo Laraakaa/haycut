@@ -1,6 +1,6 @@
 ---
 source: src/evidence.rs
-assertion_line: 474
+assertion_line: 490
 expression: evidence
 ---
 {
@@ -49,7 +49,7 @@ expression: evidence
     {
       "kind": "file_window",
       "target": "src/commands/packet.rs:602-622",
-      "reason": "Primary compiler diagnostic location"
+      "reason": "Primary test failure location"
     }
   ],
   "token_summary": {

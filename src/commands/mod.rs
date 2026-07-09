@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod files;
 pub mod index;
 pub mod init;
@@ -9,4 +10,5 @@ pub mod run_context;
 pub mod runs;
 pub mod search;
 pub mod suggest;
+pub mod task;
 pub mod trace;

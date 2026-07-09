@@ -11,6 +11,10 @@ pub struct Config {
     pub trace: TraceConfig,
     #[serde(default)]
     pub model: Option<ModelConfig>,
+    /// Optional cheaper/faster model used for triage-class work (task
+    /// classification, ranking, summarisation). Falls back to `model`.
+    #[serde(default)]
+    pub triage_model: Option<ModelConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,7 +65,102 @@ impl Default for Config {
                 store_full_output: true,
             },
             model: None,
+            triage_model: None,
         }
+    }
+}
+
+/// Thin user-level config containing only the keys a user would set once
+/// for their whole machine (primarily model configuration). Stored at the
+/// platform config dir, e.g. `~/.config/haycut/config.toml` on Linux/macOS.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub model: Option<ModelConfig>,
+    #[serde(default)]
+    pub triage_model: Option<ModelConfig>,
+}
+
+impl UserConfig {
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        match user_config_path() {
+            Some(path) => Self::load_from_path(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = fs::read_to_string(path)?;
+        Ok(toml::from_str(&contents)?)
+    }
+
+    pub fn default_toml() -> String {
+        "# HayCut user config — applies to every project on this machine.\n\
+         # https://github.com/Laraakaa/haycut\n\
+         #\n\
+         # Configure the model used by `haycut agent`.\n\
+         # Remove the leading `#` characters and fill in your values.\n\
+         #\n\
+         # [model]\n\
+         # base_url = \"https://api.openai.com/v1\"\n\
+         # model = \"gpt-4o-mini\"\n\
+         # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # timeout_secs = 60\n\
+         #\n\
+         # Optional cheaper model for triage (task classification, ranking).\n\
+         # Falls back to [model] when omitted.\n\
+         #\n\
+         # [triage_model]\n\
+         # base_url = \"https://api.openai.com/v1\"\n\
+         # model = \"gpt-4o-mini\"\n\
+         # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # timeout_secs = 60\n"
+            .to_string()
+    }
+
+    /// Create the user config file if it does not already exist.
+    /// The parent directory is created automatically.
+    /// Returns the path that was created, or `None` if the path could not be
+    /// determined or the file already existed.
+    pub fn create_if_missing() -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
+        let Some(path) = user_config_path() else {
+            return Ok(None);
+        };
+        if path.exists() {
+            return Ok(None);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, Self::default_toml())?;
+        Ok(Some(path))
+    }
+
+    /// Resolved path for the user config file, if the platform dirs can be
+    /// determined.
+    pub fn path() -> Option<std::path::PathBuf> {
+        user_config_path()
+    }
+}
+
+fn user_config_path() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        let home = std::env::var_os("HOME")?;
+        return Some(
+            std::path::PathBuf::from(home)
+                .join(".config")
+                .join("haycut")
+                .join("config.toml"),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        directories::ProjectDirs::from("", "", "haycut")
+            .map(|dirs| dirs.config_dir().join("config.toml"))
     }
 }
 
@@ -83,8 +182,40 @@ impl Config {
         Ok(config)
     }
 
+    /// Load model configuration: project config `[model]` wins if present,
+    /// otherwise falls back to the user-level config.
+    /// Returns `None` when neither source provides `[model]`.
+    pub fn load_model() -> Result<Option<ModelConfig>, Box<dyn std::error::Error>> {
+        let project_model = Self::load_from_current_dir()?.model;
+        if project_model.is_some() {
+            return Ok(project_model);
+        }
+        Ok(UserConfig::load()?.model)
+    }
+
+    /// Load the triage model: `[triage_model]` from project then user config,
+    /// falling back to the main model so triage always has somewhere to run.
+    pub fn load_triage_model() -> Result<Option<ModelConfig>, Box<dyn std::error::Error>> {
+        let project = Self::load_from_current_dir()?.triage_model;
+        if project.is_some() {
+            return Ok(project);
+        }
+        if let Some(user_triage) = UserConfig::load()?.triage_model {
+            return Ok(Some(user_triage));
+        }
+        Self::load_model()
+    }
+
     pub fn default_toml() -> Result<String, toml::ser::Error> {
-        toml::to_string_pretty(&Self::default())
+        // Prepend a short comment header to the serialised TOML.
+        let body = toml::to_string_pretty(&Self::default())?;
+        Ok(format!(
+            "# HayCut project config\n\
+             # https://github.com/Laraakaa/haycut\n\
+             #\n\
+             # Model configuration lives in the user config file, not here.\n\
+             # Run `haycut init` to see where that file is located.\n\n{body}"
+        ))
     }
 }
 

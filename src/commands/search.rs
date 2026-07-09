@@ -7,11 +7,11 @@ use crate::util::{estimate_tokens, format_count};
 pub const DEFAULT_LIMIT: usize = 20;
 
 #[derive(Debug, PartialEq, Eq)]
-struct SearchMatch {
-    path: String,
-    line_number: u64,
-    line: String,
-    estimated_tokens: usize,
+pub struct SearchMatch {
+    pub path: String,
+    pub line_number: u64,
+    pub line: String,
+    pub estimated_tokens: usize,
 }
 
 pub fn run(query: Vec<String>, limit: usize) -> i32 {
@@ -28,7 +28,7 @@ pub fn run(query: Vec<String>, limit: usize) -> i32 {
     }
 }
 
-fn search_exact(query: &str, limit: usize) -> io::Result<Vec<SearchMatch>> {
+pub fn search_exact(query: &str, limit: usize) -> io::Result<Vec<SearchMatch>> {
     let output = Command::new("rg")
         .args([
             "--json",
@@ -129,7 +129,7 @@ fn text_field<'a>(value: &'a Value, path: &[&str]) -> io::Result<&'a str> {
     })
 }
 
-fn print_matches(matches: &[SearchMatch]) {
+pub fn print_matches(matches: &[SearchMatch]) {
     println!("{:<36}  {:>6}  {:>11}  Text", "Path", "Line", "Est. tokens");
 
     for item in matches {

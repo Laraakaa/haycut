@@ -11,5 +11,6 @@ mod symbols;
 mod util;
 
 fn main() {
+    let _ = config::UserConfig::create_if_missing();
     std::process::exit(cli::run());
 }

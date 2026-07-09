@@ -1,7 +1,4 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::{io, path::Path};
 
 use crate::{
     budget::{BudgetStatus, BudgetUsage},
@@ -57,7 +54,6 @@ pub fn run(json: bool, markdown: bool, symbols: Vec<String>) -> i32 {
 /// this module only renders it.
 #[derive(Debug)]
 struct Report {
-    run_directory: PathBuf,
     manifest: RunManifest,
     evidence: EvidencePacket,
     symbols: Vec<SymbolMatch>,
@@ -85,7 +81,6 @@ fn load_last_report(root: &Path, symbol_targets: &[String]) -> io::Result<Report
     let ctx = RunContext::load_last(root)?;
     let symbols = load_symbols(Path::new(&ctx.manifest.cwd), symbol_targets)?;
     Ok(Report {
-        run_directory: ctx.run_directory,
         manifest: ctx.manifest,
         evidence: ctx.evidence,
         symbols,
@@ -490,8 +485,16 @@ fn primary_detail(primary: &PrimaryDiagnostic) -> String {
     }
 }
 
-fn artefact_path(report: &Report, file: &str) -> String {
-    report.run_directory.join(file).display().to_string()
+fn artefact_path(_report: &Report, file: &str) -> String {
+    match file {
+        "run.json" => "sqlite:runs".to_string(),
+        "sqlite:compact_json" | "sqlite:evidence_json" => file.to_string(),
+        _ => report_path(file),
+    }
+}
+
+fn report_path(path: &str) -> String {
+    path.to_string()
 }
 
 fn markdown_inline_code(value: &str) -> String {
@@ -534,6 +537,7 @@ fn budget_status_label(status: BudgetStatus) -> &'static str {
 mod tests {
     use std::{
         env, fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -560,6 +564,7 @@ mod tests {
             &db_path,
             "older",
             "older command",
+            20,
             "2026-07-07T15:29:00+00:00",
             &older,
         )
@@ -568,6 +573,7 @@ mod tests {
             &db_path,
             "newer",
             "newer command",
+            10,
             "2026-07-07T15:30:00+00:00",
             &latest,
         )
@@ -575,7 +581,6 @@ mod tests {
 
         let report = load_last_report(&db_path, &[]).expect("last report should load from SQLite");
 
-        assert_eq!(report.run_directory, latest);
         assert_eq!(report.manifest.id, "newer");
         assert_eq!(report.manifest.command, "newer command");
         assert_eq!(report.evidence.token_summary.packet_tokens, 10);
@@ -639,7 +644,7 @@ mod tests {
         assert!(rendered.contains("  src/config.rs:44-64"));
         assert!(rendered.contains("    reason: Primary compiler diagnostic location"));
         assert!(rendered.contains("Artefacts\n"));
-        assert!(rendered.contains("evidence packet: .haycut/runs/run-1/evidence.json"));
+        assert!(rendered.contains("evidence packet: sqlite:evidence_json"));
     }
 
     #[test]
@@ -705,10 +710,7 @@ mod tests {
         assert_eq!(value["primary_diagnostic"]["code"], "E0063");
         assert_eq!(value["primary_diagnostic"]["file"], "src/config.rs");
         assert_eq!(value["context_items"][0]["target"], "src/config.rs:44-64");
-        assert_eq!(
-            value["artefacts"]["evidence"],
-            ".haycut/runs/run-1/evidence.json"
-        );
+        assert_eq!(value["artefacts"]["evidence"], "sqlite:evidence_json");
         assert!(!rendered.contains("preserved_items"));
     }
 
@@ -733,12 +735,11 @@ mod tests {
         assert!(rendered.contains("## Context candidates"));
         assert!(rendered.contains("`src/config.rs:44-64` — Primary compiler diagnostic location"));
         assert!(rendered.contains("## Artefacts"));
-        assert!(rendered.contains("- [evidence packet](.haycut/runs/run-1/evidence.json)"));
+        assert!(rendered.contains("- [evidence packet](sqlite:evidence_json)"));
     }
 
     fn report_fixture() -> Report {
         Report {
-            run_directory: PathBuf::from(".haycut/runs/run-1"),
             manifest: manifest_fixture(),
             evidence: evidence_fixture(),
             symbols: Vec::new(),
@@ -759,10 +760,10 @@ mod tests {
             raw_stdout_tokens_estimated: 0,
             raw_stderr_tokens_estimated: 93,
             created_at: Utc::now(),
-            stdout: "stdout.txt".to_string(),
-            stderr: "stderr.txt".to_string(),
-            compact: "compact.json".to_string(),
-            evidence: "evidence.json".to_string(),
+            stdout: ".haycut/runs/run-1/stdout.txt".to_string(),
+            stderr: ".haycut/runs/run-1/stderr.txt".to_string(),
+            compact: "sqlite:compact_json".to_string(),
+            evidence: "sqlite:evidence_json".to_string(),
         }
     }
 
@@ -841,57 +842,9 @@ mod tests {
         packet_tokens: usize,
     ) -> io::Result<()> {
         fs::create_dir_all(run_directory)?;
-        let manifest = RunManifest {
-            id: id.to_string(),
-            command: command.to_string(),
-            args: Vec::new(),
-            cwd: "/tmp".to_string(),
-            exit_code: 0,
-            duration_ms: 42,
-            stdout_bytes: 0,
-            stderr_bytes: 0,
-            estimated_raw_tokens: 100,
-            raw_stdout_tokens_estimated: 80,
-            raw_stderr_tokens_estimated: 20,
-            created_at: Utc::now(),
-            stdout: "stdout.txt".to_string(),
-            stderr: "stderr.txt".to_string(),
-            compact: "compact.json".to_string(),
-            evidence: "evidence.json".to_string(),
-        };
-        let evidence = EvidencePacket {
-            schema_version: 1,
-            run_id: id.to_string(),
-            outcome: Outcome {
-                exit_code: 0,
-                status: "success".to_string(),
-            },
-            likely_failure: None,
-            primary_diagnostic: None,
-            diagnostics: Vec::new(),
-            file_refs: Vec::new(),
-            context_items: Vec::new(),
-            token_summary: TokenSummary {
-                raw_tokens: 100,
-                packet_tokens,
-                saved_tokens: 100_usize.saturating_sub(packet_tokens),
-                reduction_percent: 0.0,
-            },
-        };
-
-        fs::write(
-            run_directory.join("run.json"),
-            serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
-        )?;
-        fs::write(
-            run_directory.join("compact.json"),
-            serde_json::to_string_pretty(&compact_fixture(command, packet_tokens))
-                .map_err(io::Error::other)?,
-        )?;
-        fs::write(
-            run_directory.join("evidence.json"),
-            serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?,
-        )
+        let _ = (id, command, packet_tokens);
+        fs::write(run_directory.join("stdout.txt"), "")?;
+        fs::write(run_directory.join("stderr.txt"), "")
     }
 
     fn compact_fixture(command: &str, packet_tokens: usize) -> CompactPacket {
@@ -920,38 +873,68 @@ mod tests {
         db_path: &Path,
         id: &str,
         command: &str,
+        packet_tokens: usize,
         created_at: &str,
         run_directory: &Path,
     ) -> io::Result<()> {
+        let compact = compact_fixture(command, packet_tokens);
+        let evidence = EvidencePacket {
+            schema_version: 1,
+            run_id: id.to_string(),
+            outcome: Outcome {
+                exit_code: 0,
+                status: "success".to_string(),
+            },
+            likely_failure: None,
+            primary_diagnostic: None,
+            diagnostics: Vec::new(),
+            file_refs: Vec::new(),
+            context_items: Vec::new(),
+            token_summary: TokenSummary {
+                raw_tokens: 100,
+                packet_tokens,
+                saved_tokens: 100_usize.saturating_sub(packet_tokens),
+                reduction_percent: 0.0,
+            },
+        };
+        let compact_json = serde_json::to_string(&compact).map_err(io::Error::other)?;
+        let evidence_json = serde_json::to_string(&evidence).map_err(io::Error::other)?;
+        let stdout_path = run_directory.join("stdout.txt").display().to_string();
+        let stderr_path = run_directory.join("stderr.txt").display().to_string();
+
         insert_run(
             db_path,
             &NewRun {
                 id,
                 command,
+                args_json: "[]",
                 cwd: "/tmp",
                 exit_code: Some(0),
                 duration_ms: 42,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
                 raw_tokens: 100,
-                packet_tokens: 10,
+                raw_stdout_tokens: 80,
+                raw_stderr_tokens: 20,
+                packet_tokens: packet_tokens as i64,
                 created_at,
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+                compact_text_path: None,
+                compact_json: &compact_json,
+                evidence_json: &evidence_json,
                 artifacts: vec![
                     NewArtifact {
-                        id: format!("{id}:run_manifest"),
-                        kind: "run_manifest",
-                        path: run_directory.join("run.json").display().to_string(),
-                        estimated_tokens: None,
+                        id: format!("{id}:stdout"),
+                        kind: "stdout",
+                        path: stdout_path.clone(),
+                        estimated_tokens: Some(80),
                     },
                     NewArtifact {
-                        id: format!("{id}:compact_json"),
-                        kind: "compact_json",
-                        path: run_directory.join("compact.json").display().to_string(),
-                        estimated_tokens: Some(10),
-                    },
-                    NewArtifact {
-                        id: format!("{id}:evidence_json"),
-                        kind: "evidence_json",
-                        path: run_directory.join("evidence.json").display().to_string(),
-                        estimated_tokens: Some(10),
+                        id: format!("{id}:stderr"),
+                        kind: "stderr",
+                        path: stderr_path.clone(),
+                        estimated_tokens: Some(20),
                     },
                 ],
             },

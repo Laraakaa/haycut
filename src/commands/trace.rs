@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    cli::CompactorMode,
+    cli::{CompactorMode, TaskTarget},
+    commands::task,
     compactor::{
         CompactPacket, CompactionInput, NativeHeuristicCompactor, OutputCompactor, RtkCompactor,
     },
@@ -36,14 +37,11 @@ pub struct CommandTrace {
 
 #[derive(Debug)]
 pub struct ArtifactPaths {
+    pub id: String,
     pub run_directory: PathBuf,
-    pub run_json: PathBuf,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
-    pub compact_json: PathBuf,
     pub compact_text: Option<PathBuf>,
-    pub evidence_json: PathBuf,
-    pub evidence_text: PathBuf,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -66,20 +64,11 @@ pub struct RunManifest {
     pub evidence: String,
 }
 
-impl RunManifest {
-    pub fn load(path: &PathBuf) -> io::Result<Self> {
-        let contents = fs::read_to_string(path)?;
-
-        serde_json::from_str(&contents).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid run manifest {}: {error}", path.display()),
-            )
-        })
-    }
-}
-
-pub fn run(command: Vec<String>, compactor: Option<CompactorMode>) -> i32 {
+pub fn run(
+    command: Vec<String>,
+    compactor: Option<CompactorMode>,
+    task_target: Option<TaskTarget>,
+) -> i32 {
     if let Err(error) = Config::load_from_current_dir() {
         eprintln!("Error loading config: {error}");
         return 1;
@@ -100,6 +89,13 @@ pub fn run(command: Vec<String>, compactor: Option<CompactorMode>) -> i32 {
 
                         if let Err(error) = store_run(&trace, &artifacts, &packet, &evidence) {
                             eprintln!("Error storing trace run: {error}");
+                            return 1;
+                        }
+
+                        if task_target.is_some()
+                            && let Err(error) = task::attach_current_run(&trace, &packet, &evidence)
+                        {
+                            eprintln!("Error updating task: {error}");
                             return 1;
                         }
 
@@ -154,49 +150,19 @@ fn store_artifacts(trace: &CommandTrace) -> io::Result<ArtifactPaths> {
 fn store_artifacts_in(trace: &CommandTrace, artifact_root: &Path) -> io::Result<ArtifactPaths> {
     let id = run_id(trace.start_time);
     let run_directory = artifact_root.join(&id);
-    let run_json = run_directory.join("run.json");
     let stdout = run_directory.join("stdout.txt");
     let stderr = run_directory.join("stderr.txt");
-    let compact_json = run_directory.join("compact.json");
-    let evidence_json = run_directory.join("evidence.json");
-    let evidence_text = run_directory.join("evidence.txt");
 
     fs::create_dir_all(&run_directory)?;
     fs::write(&stdout, &trace.stdout)?;
     fs::write(&stderr, &trace.stderr)?;
-    let token_estimate = estimate_raw_tokens(trace);
-
-    let manifest = RunManifest {
-        id,
-        command: command_line(trace),
-        args: trace.args.clone(),
-        cwd: trace.working_directory.display().to_string(),
-        exit_code: trace.exit_code,
-        duration_ms: trace.duration.as_millis(),
-        stdout_bytes: trace.stdout.len(),
-        stderr_bytes: trace.stderr.len(),
-        estimated_raw_tokens: token_estimate.total,
-        raw_stdout_tokens_estimated: token_estimate.stdout,
-        raw_stderr_tokens_estimated: token_estimate.stderr,
-        created_at: trace.start_time,
-        stdout: "stdout.txt".to_string(),
-        stderr: "stderr.txt".to_string(),
-        compact: "compact.json".to_string(),
-        evidence: "evidence.json".to_string(),
-    };
-    let metadata = serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?;
-    fs::write(&run_json, metadata)?;
-    RunManifest::load(&run_json)?;
 
     Ok(ArtifactPaths {
+        id,
         run_directory,
-        run_json,
         stdout,
         stderr,
-        compact_json,
         compact_text: None,
-        evidence_json,
-        evidence_text,
     })
 }
 
@@ -263,9 +229,6 @@ fn store_compact_packet(
         artifacts.compact_text = Some(compact_text_path);
     }
 
-    let json = serde_json::to_string_pretty(packet).map_err(io::Error::other)?;
-    fs::write(&artifacts.compact_json, json)?;
-
     Ok(())
 }
 
@@ -274,15 +237,10 @@ fn store_evidence(
     artifacts: &ArtifactPaths,
     packet: &CompactPacket,
 ) -> io::Result<EvidencePacket> {
-    let manifest = RunManifest::load(&artifacts.run_json)?;
     let stdout = String::from_utf8_lossy(&trace.stdout);
     let stderr = String::from_utf8_lossy(&trace.stderr);
 
-    let evidence = evidence::build(&manifest.id, trace.exit_code, packet, &stdout, &stderr);
-
-    let json = serde_json::to_string_pretty(&evidence).map_err(io::Error::other)?;
-    fs::write(&artifacts.evidence_json, json)?;
-    fs::write(&artifacts.evidence_text, evidence.render_text())?;
+    let evidence = evidence::build(&artifacts.id, trace.exit_code, packet, &stdout, &stderr);
 
     Ok(evidence)
 }
@@ -309,58 +267,64 @@ fn store_run_in(
     evidence: &EvidencePacket,
     db_path: &Path,
 ) -> io::Result<()> {
-    let manifest = RunManifest::load(&artifacts.run_json)?;
     let token_estimate = estimate_raw_tokens(trace);
-    let evidence_tokens =
-        estimate_tokens(serde_json::to_vec(evidence).unwrap_or_default().as_slice());
     let mut artifact_rows = vec![
-        new_artifact(&manifest.id, "run_manifest", &artifacts.run_json, None),
         new_artifact(
-            &manifest.id,
+            &artifacts.id,
             "stdout",
             &artifacts.stdout,
             Some(to_i64(token_estimate.stdout, "stdout token estimate")?),
         ),
         new_artifact(
-            &manifest.id,
+            &artifacts.id,
             "stderr",
             &artifacts.stderr,
             Some(to_i64(token_estimate.stderr, "stderr token estimate")?),
-        ),
-        new_artifact(
-            &manifest.id,
-            "compact_json",
-            &artifacts.compact_json,
-            Some(to_i64(packet.packet_tokens, "packet token estimate")?),
-        ),
-        new_artifact(
-            &manifest.id,
-            "evidence_json",
-            &artifacts.evidence_json,
-            Some(to_i64(evidence_tokens, "evidence token estimate")?),
         ),
     ];
 
     if let Some(compact_text) = artifacts.compact_text.as_deref() {
         artifact_rows.push(new_artifact(
-            &manifest.id,
+            &artifacts.id,
             "compact_text",
             compact_text,
             Some(to_i64(packet.packet_tokens, "packet token estimate")?),
         ));
     }
 
+    let args_json = serde_json::to_string(&trace.args).map_err(io::Error::other)?;
+    let compact_json = serde_json::to_string(packet).map_err(io::Error::other)?;
+    let evidence_json = serde_json::to_string(evidence).map_err(io::Error::other)?;
+    let command = command_line(trace);
+    let cwd = trace.working_directory.display().to_string();
+    let stdout_path = artifacts.stdout.display().to_string();
+    let stderr_path = artifacts.stderr.display().to_string();
+    let compact_text_path = artifacts
+        .compact_text
+        .as_deref()
+        .map(|path| path.display().to_string());
+
     store::insert_run(
         db_path,
         &NewRun {
-            id: &manifest.id,
-            command: &manifest.command,
-            cwd: &manifest.cwd,
-            exit_code: Some(manifest.exit_code),
-            duration_ms: to_i64(manifest.duration_ms, "duration")?,
-            raw_tokens: to_i64(manifest.estimated_raw_tokens, "raw token estimate")?,
+            id: &artifacts.id,
+            command: &command,
+            args_json: &args_json,
+            cwd: &cwd,
+            exit_code: Some(trace.exit_code),
+            duration_ms: to_i64(trace.duration.as_millis(), "duration")?,
+            stdout_bytes: to_i64(trace.stdout.len(), "stdout size")?,
+            stderr_bytes: to_i64(trace.stderr.len(), "stderr size")?,
+            raw_tokens: to_i64(token_estimate.total, "raw token estimate")?,
+            raw_stdout_tokens: to_i64(token_estimate.stdout, "stdout token estimate")?,
+            raw_stderr_tokens: to_i64(token_estimate.stderr, "stderr token estimate")?,
             packet_tokens: to_i64(packet.packet_tokens, "packet token estimate")?,
-            created_at: &manifest.created_at.to_rfc3339(),
+            created_at: &trace.start_time.to_rfc3339(),
+            stdout_path: &stdout_path,
+            stderr_path: &stderr_path,
+            compact_text_path: compact_text_path.as_deref(),
+            compact_json: &compact_json,
+            evidence_json: &evidence_json,
             artifacts: artifact_rows,
         },
     )
@@ -460,9 +424,9 @@ fn print_trace(trace: &CommandTrace, artifacts: &ArtifactPaths, packet: &Compact
     println!("Preserved items: {}", packet.preserved_items.len());
     println!("Omitted item groups: {}", packet.omitted_items.len());
     println!("artifact directory: {}", artifacts.run_directory.display());
-    println!("run metadata: {}", artifacts.run_json.display());
-    println!("compact packet: {}", artifacts.compact_json.display());
-    println!("evidence packet: {}", artifacts.evidence_json.display());
+    println!("run metadata: {}", RUN_STORE_PATH);
+    println!("compact packet: {}", RUN_STORE_PATH);
+    println!("evidence packet: {}", RUN_STORE_PATH);
     println!("stdout artifact: {}", artifacts.stdout.display());
     println!("stderr artifact: {}", artifacts.stderr.display());
     if let Some(compact_text) = artifacts.compact_text.as_deref() {
@@ -535,7 +499,6 @@ mod tests {
 
         let artifacts = store_artifacts_in(&trace, &artifact_root).expect("artifacts should store");
 
-        assert!(artifacts.run_json.exists());
         assert_eq!(
             fs::read(&artifacts.stdout).expect("stdout should be readable"),
             trace.stdout
@@ -544,31 +507,14 @@ mod tests {
             fs::read(&artifacts.stderr).expect("stderr should be readable"),
             trace.stderr
         );
-
-        let metadata =
-            fs::read_to_string(&artifacts.run_json).expect("run metadata should be readable");
-        assert!(metadata.contains("test-command"));
-        assert!(metadata.contains("stdout.txt"));
-        assert!(metadata.contains("stderr.txt"));
-        assert!(metadata.contains("raw_stdout_tokens_estimated"));
-        assert!(metadata.contains("raw_stderr_tokens_estimated"));
-        assert!(metadata.contains("estimated_raw_tokens"));
-
-        let manifest = RunManifest::load(&artifacts.run_json).expect("manifest should load");
         assert_eq!(
-            manifest.id,
+            artifacts.id,
             artifacts
                 .run_directory
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
         );
-        assert_eq!(manifest.command, "test-command --flag");
-        assert_eq!(manifest.args, vec!["--flag"]);
-        assert_eq!(manifest.exit_code, 3);
-        assert_eq!(manifest.stdout_bytes, trace.stdout.len());
-        assert_eq!(manifest.stderr_bytes, trace.stderr.len());
-        assert_eq!(manifest.estimated_raw_tokens, 2);
 
         fs::remove_dir_all(artifact_root).expect("test artifacts should be removed");
     }
@@ -621,24 +567,22 @@ mod tests {
             .expect("run should store in SQLite");
 
         let stored_run = crate::store::latest_run(&db_path).expect("latest run should load");
-        let manifest = RunManifest::load(&artifacts.run_json).expect("manifest should load");
 
-        assert_eq!(stored_run.id, manifest.id);
+        assert_eq!(stored_run.id, artifacts.id);
         assert_eq!(stored_run.command, "test-command --flag");
+        assert_eq!(stored_run.args_json, "[\"--flag\"]");
         assert_eq!(stored_run.exit_code, Some(3));
         assert_eq!(stored_run.raw_tokens, Some(3));
+        assert_eq!(stored_run.raw_stdout_tokens, Some(2));
+        assert_eq!(stored_run.raw_stderr_tokens, Some(1));
         assert_eq!(stored_run.packet_tokens, Some(2));
+        assert!(stored_run.compact_json.contains("test-command"));
+        assert!(stored_run.evidence_json.contains(&artifacts.id));
         assert_eq!(
             stored_run
-                .artifact_path("run_manifest")
-                .expect("run manifest artifact should exist"),
-            artifacts.run_json.display().to_string()
-        );
-        assert_eq!(
-            stored_run
-                .artifact_path("evidence_json")
-                .expect("evidence artifact should exist"),
-            artifacts.evidence_json.display().to_string()
+                .artifact_path("stdout")
+                .expect("stdout artifact should exist"),
+            artifacts.stdout.display().to_string()
         );
 
         fs::remove_dir_all(artifact_root).expect("test artifacts should be removed");
@@ -652,27 +596,6 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.starts_with(&start_time.format("%Y-%m-%dT%H%M%SZ").to_string()));
-    }
-
-    #[test]
-    fn corrupt_manifest_produces_clear_error() {
-        let path = env::temp_dir().join(format!(
-            "haycut-corrupt-manifest-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after Unix epoch")
-                .as_nanos()
-        ));
-        fs::write(&path, "not json").expect("corrupt manifest should be written");
-
-        let error = RunManifest::load(&path).expect_err("corrupt manifest should fail");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("invalid run manifest"));
-        assert!(error.to_string().contains(&path.display().to_string()));
-
-        fs::remove_file(path).expect("corrupt manifest should be removed");
     }
 
     #[test]

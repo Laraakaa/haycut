@@ -6,6 +6,7 @@ use std::{
 use crate::{
     commands::read_window::DEFAULT_RADIUS,
     commands::run_context::RunContext,
+    commands::task,
     commands::trace::RunManifest,
     compactor::{CompactPacket, PreservedKind},
     extract::extract_file_references,
@@ -14,6 +15,18 @@ use crate::{
 };
 
 pub fn run() -> i32 {
+    match task::load_current_next_actions() {
+        Ok(Some(actions)) if !actions.is_empty() => {
+            print_task_suggestions(&actions);
+            return 0;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("Error loading task suggestions: {error}");
+            return 1;
+        }
+    }
+
     match load_suggestions(Path::new(RUN_STORE_PATH)) {
         Ok(suggestions) => {
             print_suggestions(&suggestions);
@@ -23,6 +36,21 @@ pub fn run() -> i32 {
             eprintln!("Error loading run: {error}");
             1
         }
+    }
+}
+
+fn print_task_suggestions(actions: &[task::NextAction]) {
+    for (i, action) in actions.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("Suggested next action:  {}", action.command);
+        println!("Reason:                 {}", action.reason);
+        println!("Expected answer:        {}", action.expected_answer);
+        if let Some(hypothesis) = &action.hypothesis {
+            println!("Hypothesis:             {hypothesis}");
+        }
+        println!("Estimated cost:         {} tokens", action.estimated_tokens);
     }
 }
 

@@ -1,7 +1,6 @@
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::{fs, io, path::Path};
+
+use chrono::{DateTime, Utc};
 
 use crate::{
     commands::trace::RunManifest, compactor::CompactPacket, evidence::EvidencePacket, store,
@@ -11,7 +10,6 @@ use crate::{
 /// packet, and run directory.  Centralises the repeated "find last run → load
 /// manifest → load compact" pattern used by `packet`, `report`, and `suggest`.
 pub struct RunContext {
-    pub run_directory: PathBuf,
     pub manifest: RunManifest,
     pub compact: CompactPacket,
     pub evidence: EvidencePacket,
@@ -35,43 +33,24 @@ impl RunContext {
             store::latest_run(db_path)?
         };
 
-        let run_json_path = PathBuf::from(stored_run.artifact_path("run_manifest")?);
-        let compact_path = PathBuf::from(stored_run.artifact_path("compact_json")?);
-        let evidence_path = PathBuf::from(stored_run.artifact_path("evidence_json")?);
-        let run_directory = run_json_path
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| {
+        let compact: CompactPacket =
+            serde_json::from_str(&stored_run.compact_json).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "run manifest has no parent directory",
+                    format!("invalid compact packet for run {}: {error}", stored_run.id),
                 )
             })?;
 
-        let manifest = RunManifest::load(&run_json_path)?;
-        let compact_contents = fs::read_to_string(&compact_path)?;
-        let compact: CompactPacket = serde_json::from_str(&compact_contents).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid compact packet {}: {error}", compact_path.display()),
-            )
-        })?;
-
-        let evidence_contents = fs::read_to_string(&evidence_path)?;
         let evidence: EvidencePacket =
-            serde_json::from_str(&evidence_contents).map_err(|error| {
+            serde_json::from_str(&stored_run.evidence_json).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid evidence packet {}: {error}",
-                        evidence_path.display()
-                    ),
+                    format!("invalid evidence packet for run {}: {error}", stored_run.id),
                 )
             })?;
 
         Ok(Self {
-            run_directory,
-            manifest,
+            manifest: manifest_from_stored(&stored_run)?,
             compact,
             evidence,
         })
@@ -79,13 +58,49 @@ impl RunContext {
 
     /// Read stdout as lossy UTF-8, propagating I/O errors.
     pub fn read_stdout_lossy(&self) -> io::Result<String> {
-        let bytes = fs::read(self.run_directory.join(&self.manifest.stdout))?;
+        let bytes = fs::read(&self.manifest.stdout)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Read stderr as lossy UTF-8, propagating I/O errors.
     pub fn read_stderr_lossy(&self) -> io::Result<String> {
-        let bytes = fs::read(self.run_directory.join(&self.manifest.stderr))?;
+        let bytes = fs::read(&self.manifest.stderr)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+fn manifest_from_stored(stored: &store::StoredRun) -> io::Result<RunManifest> {
+    let args: Vec<String> = serde_json::from_str(&stored.args_json).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid args JSON for run {}: {error}", stored.id),
+        )
+    })?;
+    let created_at = DateTime::parse_from_rfc3339(&stored.created_at)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid created_at for run {}: {error}", stored.id),
+            )
+        })?
+        .with_timezone(&Utc);
+
+    Ok(RunManifest {
+        id: stored.id.clone(),
+        command: stored.command.clone(),
+        args,
+        cwd: stored.cwd.clone(),
+        exit_code: stored.exit_code.unwrap_or_default(),
+        duration_ms: stored.duration_ms.unwrap_or_default() as u128,
+        stdout_bytes: stored.stdout_bytes.unwrap_or_default() as usize,
+        stderr_bytes: stored.stderr_bytes.unwrap_or_default() as usize,
+        estimated_raw_tokens: stored.raw_tokens.unwrap_or_default() as usize,
+        raw_stdout_tokens_estimated: stored.raw_stdout_tokens.unwrap_or_default() as usize,
+        raw_stderr_tokens_estimated: stored.raw_stderr_tokens.unwrap_or_default() as usize,
+        created_at,
+        stdout: stored.stdout_path.clone(),
+        stderr: stored.stderr_path.clone(),
+        compact: "sqlite:compact_json".to_string(),
+        evidence: "sqlite:evidence_json".to_string(),
+    })
 }
