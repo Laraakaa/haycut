@@ -42,13 +42,65 @@ pub struct TaskState {
     /// reproduce-first for debug tasks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<TaskIntent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_failure: Option<CurrentFailure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<DateTime<Utc>>,
+
+    // Agent state-machine additions.
+    /// Detected project environment (language, build/test commands).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectCard>,
+    /// Resolved verification plan derived from the project card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationPlan>,
+    /// Flight-recorder route of steps executed so far.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route: Vec<RouteEntry>,
+    /// Planned patch text produced by the strong-model planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_text: Option<String>,
+    /// Whether the planned patch has been (stub) applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub patch_applied: bool,
+    /// Number of retry-fix loops performed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retry_count: usize,
+    /// Signature of the failure that triggered the last retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_signature: Option<String>,
 }
 
-/// Coarse task classification produced by the triage model.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Detected project environment used by the agent state machine.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProjectCard {
+    pub language: String,
+    pub test_command: String,
+    pub build_command: Option<String>,
+}
+
+/// Verification command plan with expected exit codes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerificationPlan {
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_baseline_exit: Option<i32>,
+    pub expected_final_exit: i32,
+}
+
+/// One entry in the agent route flight recorder.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouteEntry {
+    pub step: String,
+    pub executor: crate::commands::agent::ExecutorKind,
+    pub outcome: String,
+}
+
+/// Coarse task classification produced by the weak classification model.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskIntent {
@@ -60,14 +112,6 @@ pub enum TaskIntent {
     Refactor,
     /// Look something up or explain; no code change implied.
     AnswerQuestion,
-}
-
-impl TaskIntent {
-    /// Whether HayCut should deterministically run the verification command
-    /// before the first planner call for a task with this intent.
-    pub fn reproduce_first(self) -> bool {
-        matches!(self, TaskIntent::DebugFailure)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -237,6 +281,13 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         intent: None,
         current_failure: None,
         closed_at: None,
+        project: None,
+        verification: None,
+        route: Vec::new(),
+        patch_text: None,
+        patch_applied: false,
+        retry_count: 0,
+        last_failure_signature: None,
     };
 
     save_current(&task)?;

@@ -64,12 +64,34 @@ pub struct ReportedTokenUsage {
 #[serde(rename_all = "snake_case")]
 pub enum ModelPurpose {
     AgentPlanner,
-    TaskTriage,
+    IntentClassification,
     LogSummary,
     ContextRanking,
     PatchGeneration,
     PatchReview,
     FinalReport,
+}
+
+/// Model capability tier used to resolve which configured model should run a
+/// given purpose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelTier {
+    /// Cheap, fast model for classification, ranking, and summarisation.
+    Weak,
+    /// Capable model for planning, patch generation, and reports.
+    Strong,
+}
+
+impl ModelPurpose {
+    /// Map a purpose to the model tier that should run it.
+    pub fn tier(self) -> ModelTier {
+        match self {
+            Self::IntentClassification | Self::LogSummary | Self::ContextRanking => ModelTier::Weak,
+            Self::AgentPlanner | Self::PatchGeneration | Self::PatchReview | Self::FinalReport => {
+                ModelTier::Strong
+            }
+        }
+    }
 }
 
 impl ModelCallRecord {
@@ -87,7 +109,7 @@ impl fmt::Display for ModelPurpose {
         formatter.write_str(match self {
             Self::LogSummary => "log_summary",
             Self::AgentPlanner => "agent_planner",
-            Self::TaskTriage => "task_triage",
+            Self::IntentClassification => "intent_classification",
             Self::ContextRanking => "context_ranking",
             Self::PatchGeneration => "patch_generation",
             Self::PatchReview => "patch_review",
@@ -103,7 +125,7 @@ impl FromStr for ModelPurpose {
         match value {
             "log_summary" => Ok(Self::LogSummary),
             "agent_planner" => Ok(Self::AgentPlanner),
-            "task_triage" => Ok(Self::TaskTriage),
+            "intent_classification" => Ok(Self::IntentClassification),
             "context_ranking" => Ok(Self::ContextRanking),
             "patch_generation" => Ok(Self::PatchGeneration),
             "patch_review" => Ok(Self::PatchReview),
@@ -551,6 +573,17 @@ mod tests {
             "unknown".parse::<ModelPurpose>(),
             Err(ParseModelPurposeError)
         );
+    }
+
+    #[test]
+    fn maps_purposes_to_model_tiers() {
+        assert_eq!(ModelPurpose::IntentClassification.tier(), ModelTier::Weak);
+        assert_eq!(ModelPurpose::LogSummary.tier(), ModelTier::Weak);
+        assert_eq!(ModelPurpose::ContextRanking.tier(), ModelTier::Weak);
+        assert_eq!(ModelPurpose::AgentPlanner.tier(), ModelTier::Strong);
+        assert_eq!(ModelPurpose::PatchGeneration.tier(), ModelTier::Strong);
+        assert_eq!(ModelPurpose::PatchReview.tier(), ModelTier::Strong);
+        assert_eq!(ModelPurpose::FinalReport.tier(), ModelTier::Strong);
     }
 
     #[test]

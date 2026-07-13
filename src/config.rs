@@ -11,10 +11,14 @@ pub struct Config {
     pub trace: TraceConfig,
     #[serde(default)]
     pub model: Option<ModelConfig>,
-    /// Optional cheaper/faster model used for triage-class work (task
-    /// classification, ranking, summarisation). Falls back to `model`.
+    /// Optional explicit cheap model for deterministic weak-model steps.
+    /// Falls back to `model`.
     #[serde(default)]
-    pub triage_model: Option<ModelConfig>,
+    pub weak_model: Option<ModelConfig>,
+    /// Optional explicit capable model for planning and patch generation.
+    /// Falls back to `model`.
+    #[serde(default)]
+    pub strong_model: Option<ModelConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,7 +69,8 @@ impl Default for Config {
                 store_full_output: true,
             },
             model: None,
-            triage_model: None,
+            weak_model: None,
+            strong_model: None,
         }
     }
 }
@@ -78,7 +83,9 @@ pub struct UserConfig {
     #[serde(default)]
     pub model: Option<ModelConfig>,
     #[serde(default)]
-    pub triage_model: Option<ModelConfig>,
+    pub weak_model: Option<ModelConfig>,
+    #[serde(default)]
+    pub strong_model: Option<ModelConfig>,
 }
 
 impl UserConfig {
@@ -110,14 +117,23 @@ impl UserConfig {
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
          # timeout_secs = 60\n\
          #\n\
-         # Optional cheaper model for triage (task classification, ranking).\n\
-         # Falls back to [model] when omitted.\n\
+         # Optional explicit cheap model for weak-model steps.\n\
+         # Falls back to [model].\n\
          #\n\
-         # [triage_model]\n\
+         # [weak_model]\n\
          # base_url = \"https://api.openai.com/v1\"\n\
          # model = \"gpt-4o-mini\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
-         # timeout_secs = 60\n"
+         # timeout_secs = 60\n\
+         #\n\
+         # Optional explicit capable model for planning/patch generation.\n\
+         # Falls back to [model].\n\
+         #\n\
+         # [strong_model]\n\
+         # base_url = \"https://api.openai.com/v1\"\n\
+         # model = \"gpt-4o\"\n\
+         # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # timeout_secs = 120\n"
             .to_string()
     }
 
@@ -150,12 +166,12 @@ fn user_config_path() -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
         let home = std::env::var_os("HOME")?;
-        return Some(
+        Some(
             std::path::PathBuf::from(home)
                 .join(".config")
                 .join("haycut")
                 .join("config.toml"),
-        );
+        )
     }
     #[cfg(not(unix))]
     {
@@ -193,15 +209,28 @@ impl Config {
         Ok(UserConfig::load()?.model)
     }
 
-    /// Load the triage model: `[triage_model]` from project then user config,
-    /// falling back to the main model so triage always has somewhere to run.
-    pub fn load_triage_model() -> Result<Option<ModelConfig>, Box<dyn std::error::Error>> {
-        let project = Self::load_from_current_dir()?.triage_model;
+    /// Load the weak model: `[weak_model]` from project then user config,
+    /// falling back to the main model.
+    pub fn load_weak_model() -> Result<Option<ModelConfig>, Box<dyn std::error::Error>> {
+        let project = Self::load_from_current_dir()?.weak_model;
         if project.is_some() {
             return Ok(project);
         }
-        if let Some(user_triage) = UserConfig::load()?.triage_model {
-            return Ok(Some(user_triage));
+        if let Some(user_weak) = UserConfig::load()?.weak_model {
+            return Ok(Some(user_weak));
+        }
+        Self::load_model()
+    }
+
+    /// Load the strong model: `[strong_model]` from project then user config,
+    /// falling back to the main model.
+    pub fn load_strong_model() -> Result<Option<ModelConfig>, Box<dyn std::error::Error>> {
+        let project = Self::load_from_current_dir()?.strong_model;
+        if project.is_some() {
+            return Ok(project);
+        }
+        if let Some(user_strong) = UserConfig::load()?.strong_model {
+            return Ok(Some(user_strong));
         }
         Self::load_model()
     }

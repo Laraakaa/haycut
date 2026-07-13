@@ -9,12 +9,19 @@ use crate::{
     cli::{AgentCommand, TaskTarget},
     commands::{read_symbol, read_window, search, task, trace},
     config::Config,
-    model::{EstimatedTokenUsage, ModelProvider, ModelPurpose, ModelRequest, OpenAiProvider, ToolDefinition},
+    model::{
+        EstimatedTokenUsage, ModelProvider, ModelPurpose, ModelRequest, OpenAiProvider,
+        ToolDefinition,
+    },
     store::{self, NewAgentTrace, RUN_STORE_PATH},
     util::{estimate_tokens, format_count},
 };
 
+mod policy;
+pub use policy::{ExecutorKind, NextStep, StopReason, select_next_step};
+
 pub const DEFAULT_MAX_STEPS: usize = 8;
+const MAX_RETRIES: usize = 2;
 const SEARCH_LIMIT: usize = 20;
 const MAX_OUTPUT_TOKENS: usize = 512;
 
@@ -26,7 +33,6 @@ const PLANNER_SYSTEM_PROMPT: &str = include_str!("../prompts/planner_system.txt"
 /// The user prompt is assembled from a Jinja template so it is easy to see
 /// what lands where. Compiled once and reused across steps.
 const PLANNER_USER_TEMPLATE: &str = include_str!("../prompts/planner_user.jinja");
-
 
 pub fn run(command: AgentCommand) -> i32 {
     match command {
@@ -48,6 +54,20 @@ pub struct PlannerAction {
     #[serde(default)]
     pub args: ActionArgs,
     pub reason: String,
+}
+
+impl PlannerAction {
+    fn action_name(&self) -> String {
+        match self.action {
+            ActionKind::Search => "search".to_string(),
+            ActionKind::ReadSymbol => "read_symbol".to_string(),
+            ActionKind::ReadWindow => "read_window".to_string(),
+            ActionKind::Trace => "trace".to_string(),
+            ActionKind::ProposePatchPlan => "plan".to_string(),
+            ActionKind::Finish => "finish".to_string(),
+            ActionKind::AskUser => "ask".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,11 +103,9 @@ pub struct ActionArgs {
 }
 
 #[derive(Debug)]
-struct StepOutcome {
-    action: PlannerAction,
-    observation: String,
-    done: bool,
-    blocked: bool,
+struct StepResult {
+    summary: String,
+    terminal: bool,
 }
 
 fn run_loop(
@@ -111,16 +129,37 @@ fn run_loop(
         }
     }
 
+    let mut task = match task::load_current() {
+        Ok(task) => task,
+        Err(error) => {
+            eprintln!("Error loading current task: {error}");
+            return 1;
+        }
+    };
+
     for step in 0..max_steps {
-        match step_once() {
+        let next = select_next_step(&task, MAX_RETRIES);
+        if matches!(next, NextStep::Stop(_)) {
+            print_stop(&next);
+            return 0;
+        }
+
+        let step_index = task.route.len() + 1;
+        match execute_step(&next, &mut task, step_index) {
             Ok(outcome) => {
+                record_route(&mut task, &next, &outcome);
                 println!(
-                    "step {}: {:?} — {}",
+                    "step {}: {} ({:?}) — {}",
                     step + 1,
-                    outcome.action.action,
-                    first_line(&outcome.observation)
+                    next.name(),
+                    next.executor(),
+                    first_line(&outcome.summary)
                 );
-                if outcome.done || outcome.blocked {
+                if let Err(error) = task::save_current(&task) {
+                    eprintln!("Error saving task: {error}");
+                    return 1;
+                }
+                if outcome.terminal {
                     return 0;
                 }
             }
@@ -141,11 +180,31 @@ fn run_step(task_target: Option<TaskTarget>) -> i32 {
         return 2;
     }
 
-    match step_once() {
+    let mut task = match task::load_current() {
+        Ok(task) => task,
+        Err(error) => {
+            eprintln!("Error loading current task: {error}");
+            return 1;
+        }
+    };
+
+    let next = select_next_step(&task, MAX_RETRIES);
+    if let NextStep::Stop(reason) = &next {
+        println!("stop: {:?}", reason);
+        return 0;
+    }
+
+    let step_index = task.route.len() + 1;
+    match execute_step(&next, &mut task, step_index) {
         Ok(outcome) => {
-            println!("Selected action: {:?}", outcome.action.action);
-            println!("Reason: {}", outcome.action.reason);
-            println!("Observation: {}", outcome.observation);
+            record_route(&mut task, &next, &outcome);
+            println!("Selected step: {}", next.name());
+            println!("Executor: {:?}", next.executor());
+            println!("Observation: {}", outcome.summary);
+            if let Err(error) = task::save_current(&task) {
+                eprintln!("Error saving task: {error}");
+                return 1;
+            }
             0
         }
         Err(error) => {
@@ -161,9 +220,30 @@ fn run_trace(task_target: Option<TaskTarget>) -> i32 {
         return 2;
     }
 
-    match task::load_current()
-        .and_then(|task| store::agent_traces_for_task(Path::new(RUN_STORE_PATH), &task.id))
-    {
+    let task = match task::load_current() {
+        Ok(task) => task,
+        Err(error) => {
+            eprintln!("Error loading current task: {error}");
+            return 1;
+        }
+    };
+
+    println!("Route:");
+    if task.route.is_empty() {
+        println!("  (no steps recorded)");
+    } else {
+        for entry in &task.route {
+            println!(
+                "  {}({}) -> {}",
+                entry.step,
+                entry.executor.name(),
+                entry.outcome
+            );
+        }
+    }
+    println!();
+
+    match store::agent_traces_for_task(Path::new(RUN_STORE_PATH), &task.id) {
         Ok(traces) => {
             if traces.is_empty() {
                 println!("No agent traces recorded for current task.");
@@ -201,10 +281,60 @@ fn run_trace(task_target: Option<TaskTarget>) -> i32 {
     }
 }
 
-fn step_once() -> io::Result<StepOutcome> {
-    let mut task = task::load_current()?;
-    let Some(model_config) = Config::load_model()
-        .map_err(|error| io::Error::other(error.to_string()))?
+fn execute_step(
+    step: &NextStep,
+    task: &mut task::TaskState,
+    step_index: usize,
+) -> io::Result<StepResult> {
+    match step {
+        NextStep::ClassifyIntent => execute_classify_intent(task, step_index),
+        NextStep::DetectProject => execute_detect_project(task),
+        NextStep::ResolveVerification => execute_resolve_verification(task),
+        NextStep::RunBaseline => execute_run_baseline(task),
+        NextStep::ExtractEvidence => execute_extract_evidence(task),
+        NextStep::PlanContext => execute_plan_context(task, step_index),
+        NextStep::ReadContext => execute_read_context(task),
+        NextStep::PlanPatch => execute_plan_patch(task, step_index),
+        NextStep::ApplyPatch => execute_apply_patch(task),
+        NextStep::RunFinalVerification => execute_run_final_verification(task),
+        NextStep::RetryFix => execute_retry_fix(task),
+        NextStep::AskUser => execute_ask_user(task),
+        NextStep::DirectAnswer => execute_direct_answer(task, step_index),
+        NextStep::Report => execute_report(task),
+        NextStep::Stop(reason) => Ok(StepResult {
+            summary: format!("stopped: {:?}", reason),
+            terminal: true,
+        }),
+    }
+}
+
+fn print_stop(step: &NextStep) {
+    if let NextStep::Stop(reason) = step {
+        match reason {
+            StopReason::Verified => println!("Task verified."),
+            StopReason::LoopDetected => println!("Stopped: same failure signature detected twice."),
+            StopReason::BudgetExhausted => println!("Stopped: token budget exhausted."),
+            StopReason::Blocked => println!("Stopped: blocked; needs user input."),
+            StopReason::Failed => println!("Stopped: step failed."),
+            StopReason::MaxSteps => println!("Stopped: max steps reached."),
+        }
+    }
+}
+
+fn record_route(task: &mut task::TaskState, step: &NextStep, outcome: &StepResult) {
+    task.route.push(task::RouteEntry {
+        step: step.name().to_string(),
+        executor: step.executor(),
+        outcome: outcome.summary.clone(),
+    });
+}
+
+fn execute_classify_intent(
+    task: &mut task::TaskState,
+    step_index: usize,
+) -> io::Result<StepResult> {
+    let Some(weak_config) =
+        Config::load_weak_model().map_err(|error| io::Error::other(error.to_string()))?
     else {
         let path_hint = crate::config::UserConfig::path()
             .map(|path| path.display().to_string())
@@ -214,48 +344,154 @@ fn step_once() -> io::Result<StepOutcome> {
             format!("agent step requires [model] configuration in {path_hint}"),
         ));
     };
-    let provider = OpenAiProvider::new(model_config);
+    let weak = OpenAiProvider::new(weak_config);
 
-    let step_index = next_step_index(&task);
-
-    // Deterministic step-0 shortcut: on the first step of a fresh task, use the
-    // cheap triage model to classify intent. For debug tasks with a known test
-    // command, reproduce the failure directly instead of spending a full
-    // planner turn deciding to. Any uncertainty defers to the planner.
-    if step_index == 1 && task.intent.is_none() && task.current_failure.is_none() {
-        if let Some(outcome) = try_reproduce_first(&mut task, step_index)? {
-            return Ok(outcome);
-        }
-    }
-
-    let prompt = planner_prompt(&task);
-    let request = model_request(&task, &prompt);
-    let estimated = request.estimated_tokens;
-    let (tool_name, args_value, response) = provider
-        .complete_with_tools(request, &planner_tools())
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let action = action_from_tool_call(&tool_name, args_value)?;
-    validate_action(&action, &task)?;
-    let observation = execute_action(&action)?;
-
-    task.observations.push(task::Observation {
-        id: format!("obs{}", task.observations.len() + 1),
-        source: format!("agent:step:{step_index}"),
-        kind: format!("agent_{:?}", action.action).to_lowercase(),
-        summary: observation.clone(),
-        locations: action_locations(&action),
-        tokens: task::ObservationTokens {
-            raw: estimate_tokens(observation.as_bytes()),
-            packet: estimate_tokens(observation.as_bytes()),
-        },
-    });
+    let (intent, input_tokens, output_tokens) = classify_task(&weak, &task.goal)?;
+    task.intent = Some(intent);
     task.budget.packet_tokens_used = task
         .budget
         .packet_tokens_used
-        .saturating_add(estimated.input)
-        .saturating_add(response.reported_tokens.output.unwrap_or(estimated.output));
-    task.next_actions.clear();
-    task::save_current(&task)?;
+        .saturating_add(input_tokens)
+        .saturating_add(output_tokens);
+
+    let summary = format!("classified intent: {:?}", intent);
+    record_agent_trace(
+        task,
+        step_index,
+        &summary,
+        ExecutorKind::WeakModel,
+        input_tokens,
+        output_tokens,
+        &summary,
+    )?;
+
+    Ok(StepResult {
+        summary,
+        terminal: false,
+    })
+}
+
+fn execute_detect_project(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let env = detect_project_env(Path::new("."));
+    let summary = if let Some(env) = &env {
+        task.project = Some(task::ProjectCard {
+            language: env.language.clone(),
+            test_command: env.test_command.clone(),
+            build_command: env.build_command.clone(),
+        });
+        format!(
+            "detected project: {} (test: `{}`)",
+            env.language, env.test_command
+        )
+    } else {
+        "unknown project type".to_string()
+    };
+
+    Ok(StepResult {
+        summary,
+        terminal: false,
+    })
+}
+
+fn execute_resolve_verification(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let Some(project) = task.project.clone() else {
+        return Ok(StepResult {
+            summary: "no project detected; cannot resolve verification".to_string(),
+            terminal: false,
+        });
+    };
+
+    let command: Vec<String> = project
+        .test_command
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let expected_baseline_exit = match task.intent {
+        Some(task::TaskIntent::DebugFailure) => Some(101),
+        _ => None,
+    };
+
+    task.verification = Some(task::VerificationPlan {
+        command: command.clone(),
+        expected_baseline_exit,
+        expected_final_exit: 0,
+    });
+
+    Ok(StepResult {
+        summary: format!("verification plan: `{}`", project.test_command),
+        terminal: false,
+    })
+}
+
+fn execute_run_baseline(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let Some(plan) = task.verification.clone() else {
+        return Ok(StepResult {
+            summary: "no verification plan".to_string(),
+            terminal: false,
+        });
+    };
+
+    let exit_code = trace::run(plan.command.clone(), None, Some(TaskTarget::Current));
+    // trace::run persists evidence via attach_current_run; reload to see it.
+    *task = task::load_current()?;
+
+    let summary = format!("baseline `{}` exited {exit_code}", plan.command.join(" "));
+    Ok(StepResult {
+        summary,
+        terminal: false,
+    })
+}
+
+fn execute_extract_evidence(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let summary = if let Some(failure) = &task.current_failure {
+        format!(
+            "extracted {}: {} at {}",
+            failure.kind,
+            failure.summary,
+            failure.locations.join(", ")
+        )
+    } else {
+        "no current failure extracted".to_string()
+    };
+
+    Ok(StepResult {
+        summary,
+        terminal: false,
+    })
+}
+
+fn execute_plan_context(task: &mut task::TaskState, step_index: usize) -> io::Result<StepResult> {
+    let Some(strong_config) =
+        Config::load_strong_model().map_err(|error| io::Error::other(error.to_string()))?
+    else {
+        let path_hint = crate::config::UserConfig::path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.config/haycut/config.toml".to_string());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("agent step requires [model] configuration in {path_hint}"),
+        ));
+    };
+    let strong = OpenAiProvider::new(strong_config);
+
+    let prompt = planner_prompt(task);
+    let request = model_request(task, ModelPurpose::AgentPlanner, &prompt);
+    let estimated = request.estimated_tokens;
+    let (tool_name, args_value, response) = strong
+        .complete_with_tools(request, &planner_tools())
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let action = action_from_tool_call(&tool_name, args_value)?;
+    validate_action(&action, task)?;
+
+    // Convert the planner action into queued next_actions so ReadContext can
+    // execute them deterministically.
+    if action.action != ActionKind::Finish && action.action != ActionKind::AskUser {
+        task.next_actions
+            .push(planner_action_to_next_action(&action));
+    }
+
+    let cost = estimated.input + response.reported_tokens.output.unwrap_or(estimated.output);
+    task.budget.packet_tokens_used = task.budget.packet_tokens_used.saturating_add(cost);
 
     let action_json = serde_json::to_string(&action).map_err(io::Error::other)?;
     store::insert_agent_trace(
@@ -267,7 +503,7 @@ fn step_once() -> io::Result<StepOutcome> {
             prompt: &prompt,
             response: &response.text,
             action_json: &action_json,
-            observation: &observation,
+            observation: &action.reason,
             estimated_input_tokens: estimated.input as i64,
             estimated_output_tokens: estimated.output as i64,
             reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
@@ -276,79 +512,65 @@ fn step_once() -> io::Result<StepOutcome> {
         },
     )?;
 
-    Ok(StepOutcome {
-        done: action.action == ActionKind::Finish,
-        blocked: action.action == ActionKind::AskUser,
-        action,
-        observation,
+    Ok(StepResult {
+        summary: format!("planner: {} — {}", action.action_name(), action.reason),
+        terminal: action.action == ActionKind::Finish || action.action == ActionKind::AskUser,
     })
 }
 
-/// Attempt the deterministic step-0 reproduce. Returns `Ok(Some(_))` when it
-/// classified the task as a failure to debug and reproduced it directly (so the
-/// caller should return without a planner call), or `Ok(None)` to fall through
-/// to the normal planner. Never hard-fails the step: any triage error or
-/// missing signal defers to the planner.
-fn try_reproduce_first(
-    task: &mut task::TaskState,
-    step_index: usize,
-) -> io::Result<Option<StepOutcome>> {
-    // Without a known test command there is nothing deterministic to run.
-    let Some(env) = detect_project_env(Path::new(".")) else {
-        return Ok(None);
+fn execute_read_context(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let Some(action) = task.next_actions.first().cloned() else {
+        return Ok(StepResult {
+            summary: "no queued context action".to_string(),
+            terminal: false,
+        });
     };
 
-    let Some(triage_config) =
-        Config::load_triage_model().map_err(|error| io::Error::other(error.to_string()))?
+    let observation = execute_next_action(&action)?;
+    task.observations.push(task::Observation {
+        id: format!("obs{}", task.observations.len() + 1),
+        source: "agent:read_context".to_string(),
+        kind: "agent_read_context".to_string(),
+        summary: observation.clone(),
+        locations: Vec::new(),
+        tokens: task::ObservationTokens {
+            raw: estimate_tokens(observation.as_bytes()),
+            packet: estimate_tokens(observation.as_bytes()),
+        },
+    });
+    task.next_actions.remove(0);
+
+    Ok(StepResult {
+        summary: observation,
+        terminal: false,
+    })
+}
+
+fn execute_plan_patch(task: &mut task::TaskState, step_index: usize) -> io::Result<StepResult> {
+    let Some(strong_config) =
+        Config::load_strong_model().map_err(|error| io::Error::other(error.to_string()))?
     else {
-        return Ok(None);
+        let path_hint = crate::config::UserConfig::path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.config/haycut/config.toml".to_string());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("agent step requires [model] configuration in {path_hint}"),
+        ));
     };
-    let triage = OpenAiProvider::new(triage_config);
+    let strong = OpenAiProvider::new(strong_config);
 
-    let (intent, input_tokens, output_tokens) = match classify_task(&triage, &task.goal) {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("triage classification failed; deferring to planner: {error}");
-            return Ok(None);
-        }
-    };
+    let prompt = patch_plan_prompt(task);
+    let request = model_request(task, ModelPurpose::PatchGeneration, &prompt);
+    let estimated = request.estimated_tokens;
+    let response = strong
+        .complete(request)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let patch_text = response.text.trim().to_string();
+    task.patch_text = Some(patch_text.clone());
 
-    if !intent.reproduce_first() {
-        // Persist the verdict so we never reclassify, then let the planner run.
-        task.intent = Some(intent);
-        task.budget.packet_tokens_used = task
-            .budget
-            .packet_tokens_used
-            .saturating_add(input_tokens)
-            .saturating_add(output_tokens);
-        task::save_current(task)?;
-        return Ok(None);
-    }
-
-    // Reproduce through the normal trace pipeline; it captures gated evidence
-    // and sets `current_failure` on the persisted task.
-    let command: Vec<String> = env
-        .test_command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
-    let exit_code = trace::run(command, None, Some(TaskTarget::Current));
-
-    // `trace::run` rewrote the on-disk task; reload before layering on the
-    // triage verdict and its token cost.
-    let mut task = task::load_current()?;
-    task.intent = Some(intent);
-    task.budget.packet_tokens_used = task
-        .budget
-        .packet_tokens_used
-        .saturating_add(input_tokens)
-        .saturating_add(output_tokens);
-    task::save_current(&task)?;
-
-    let observation = format!(
-        "triage=debug_failure; reproduced `{}` (exit {exit_code})",
-        env.test_command
-    );
+    let cost = estimated.input + response.reported_tokens.output.unwrap_or(estimated.output);
+    task.budget.packet_tokens_used = task.budget.packet_tokens_used.saturating_add(cost);
 
     store::insert_agent_trace(
         Path::new(RUN_STORE_PATH),
@@ -356,36 +578,181 @@ fn try_reproduce_first(
             id: &trace_id(),
             task_id: &task.id,
             step_index: step_index as i64,
-            prompt: "<deterministic triage + reproduce>",
-            response: "debug_failure",
-            action_json: "{\"action\":\"trace\",\"deterministic\":true}",
-            observation: &observation,
+            prompt: &prompt,
+            response: &patch_text,
+            action_json: "{\"action\":\"plan_patch\"}",
+            observation: &patch_text,
+            estimated_input_tokens: estimated.input as i64,
+            estimated_output_tokens: estimated.output as i64,
+            reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
+            reported_output_tokens: response.reported_tokens.output.map(|value| value as i64),
+            created_at: &Utc::now().to_rfc3339(),
+        },
+    )?;
+
+    Ok(StepResult {
+        summary: format!("patch plan: {}", first_line(&patch_text)),
+        terminal: false,
+    })
+}
+
+fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
+    task.patch_applied = true;
+    Ok(StepResult {
+        summary: "planned, not applied".to_string(),
+        terminal: false,
+    })
+}
+
+fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let Some(plan) = task.verification.clone() else {
+        return Ok(StepResult {
+            summary: "no verification plan".to_string(),
+            terminal: false,
+        });
+    };
+
+    let exit_code = trace::run(plan.command.clone(), None, Some(TaskTarget::Current));
+    *task = task::load_current()?;
+
+    let passed = exit_code == plan.expected_final_exit;
+    let summary = format!(
+        "final verification `{}` exited {exit_code} ({})",
+        plan.command.join(" "),
+        if passed { "pass" } else { "fail" }
+    );
+
+    Ok(StepResult {
+        summary,
+        terminal: false,
+    })
+}
+
+fn execute_retry_fix(task: &mut task::TaskState) -> io::Result<StepResult> {
+    task.last_failure_signature = task.current_failure.as_ref().map(policy::failure_signature);
+    task.retry_count += 1;
+    task.patch_text = None;
+    task.patch_applied = false;
+    task.next_actions.clear();
+
+    Ok(StepResult {
+        summary: format!("retry fix attempt {}", task.retry_count),
+        terminal: false,
+    })
+}
+
+fn execute_ask_user(_task: &mut task::TaskState) -> io::Result<StepResult> {
+    Ok(StepResult {
+        summary: "ask user".to_string(),
+        terminal: true,
+    })
+}
+
+fn execute_direct_answer(task: &mut task::TaskState, step_index: usize) -> io::Result<StepResult> {
+    let Some(strong_config) =
+        Config::load_strong_model().map_err(|error| io::Error::other(error.to_string()))?
+    else {
+        let path_hint = crate::config::UserConfig::path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/.config/haycut/config.toml".to_string());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("agent step requires [model] configuration in {path_hint}"),
+        ));
+    };
+    let strong = OpenAiProvider::new(strong_config);
+
+    let prompt = format!(
+        "Answer the following software task concisely.\n\nTask: {}\n\nKnown context:\n{}\n",
+        task.goal,
+        task.observations
+            .iter()
+            .map(|observation| format!("- {}", observation.summary))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let request = model_request(task, ModelPurpose::FinalReport, &prompt);
+    let estimated = request.estimated_tokens;
+    let response = strong
+        .complete(request)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let cost = estimated.input + response.reported_tokens.output.unwrap_or(estimated.output);
+    task.budget.packet_tokens_used = task.budget.packet_tokens_used.saturating_add(cost);
+
+    let answer = response.text.trim().to_string();
+    store::insert_agent_trace(
+        Path::new(RUN_STORE_PATH),
+        &NewAgentTrace {
+            id: &trace_id(),
+            task_id: &task.id,
+            step_index: step_index as i64,
+            prompt: &prompt,
+            response: &answer,
+            action_json: "{\"action\":\"direct_answer\"}",
+            observation: &answer,
+            estimated_input_tokens: estimated.input as i64,
+            estimated_output_tokens: estimated.output as i64,
+            reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
+            reported_output_tokens: response.reported_tokens.output.map(|value| value as i64),
+            created_at: &Utc::now().to_rfc3339(),
+        },
+    )?;
+
+    Ok(StepResult {
+        summary: answer,
+        terminal: false,
+    })
+}
+
+fn execute_report(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let summary = if task.patch_applied {
+        if let Some(patch) = &task.patch_text {
+            format!("planned patch:\n{}", patch)
+        } else {
+            "no patch planned".to_string()
+        }
+    } else {
+        "task complete".to_string()
+    };
+
+    Ok(StepResult {
+        summary,
+        terminal: true,
+    })
+}
+
+fn record_agent_trace(
+    task: &task::TaskState,
+    step_index: usize,
+    prompt: &str,
+    executor: ExecutorKind,
+    input_tokens: usize,
+    output_tokens: usize,
+    observation: &str,
+) -> io::Result<()> {
+    store::insert_agent_trace(
+        Path::new(RUN_STORE_PATH),
+        &NewAgentTrace {
+            id: &trace_id(),
+            task_id: &task.id,
+            step_index: step_index as i64,
+            prompt,
+            response: &format!("{:?}", executor),
+            action_json: &format!("{{\"step\":\"{}\"}}", executor.name()),
+            observation,
             estimated_input_tokens: input_tokens as i64,
             estimated_output_tokens: output_tokens as i64,
             reported_input_tokens: Some(input_tokens as i64),
             reported_output_tokens: Some(output_tokens as i64),
             created_at: &Utc::now().to_rfc3339(),
         },
-    )?;
-
-    Ok(Some(StepOutcome {
-        action: PlannerAction {
-            action: ActionKind::Trace,
-            args: ActionArgs {
-                command: Some(env.test_command.clone()),
-                ..Default::default()
-            },
-            reason: "deterministic reproduce (triage classified debug_failure)".to_string(),
-        },
-        observation,
-        done: false,
-        blocked: false,
-    }))
+    )
 }
 
 /// Cheap, single-purpose classifier. Sends only the goal and a small enum of
-/// intents to the triage model — no tool schemas, no history — so it stays a
-/// low-cost triage call rather than a full planner turn.
+/// intents to the weak model — no tool schemas, no history — so it stays a
+/// low-cost classification call rather than a full planner turn.
 fn classify_task(
     provider: &OpenAiProvider,
     goal: &str,
@@ -393,7 +760,7 @@ fn classify_task(
     let prompt = format!("Classify this software task into exactly one intent.\nTask: {goal}");
     let input_estimate = estimate_tokens(prompt.as_bytes());
     let request = ModelRequest {
-        purpose: ModelPurpose::TaskTriage,
+        purpose: ModelPurpose::IntentClassification,
         system: None,
         prompt,
         estimated_tokens: EstimatedTokenUsage {
@@ -543,16 +910,12 @@ fn planner_tools() -> Vec<ToolDefinition> {
 }
 
 /// Map a tool-call result back to the internal `PlannerAction` representation.
-fn action_from_tool_call(
-    tool: &str,
-    args: serde_json::Value,
-) -> io::Result<PlannerAction> {
+fn action_from_tool_call(tool: &str, args: serde_json::Value) -> io::Result<PlannerAction> {
     let str_field = |key: &str| -> Option<String> {
         args.get(key).and_then(|v| v.as_str()).map(str::to_string)
     };
-    let usize_field = |key: &str| -> Option<usize> {
-        args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
-    };
+    let usize_field =
+        |key: &str| -> Option<usize> { args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize) };
     let strvec_field = |key: &str| -> Vec<String> {
         args.get(key)
             .and_then(|v| v.as_array())
@@ -569,11 +932,17 @@ fn action_from_tool_call(
     let (kind, action_args) = match tool {
         "search" => (
             ActionKind::Search,
-            ActionArgs { query: str_field("query"), ..Default::default() },
+            ActionArgs {
+                query: str_field("query"),
+                ..Default::default()
+            },
         ),
         "sym" => (
             ActionKind::ReadSymbol,
-            ActionArgs { symbol: str_field("symbol"), ..Default::default() },
+            ActionArgs {
+                symbol: str_field("symbol"),
+                ..Default::default()
+            },
         ),
         "win" => (
             ActionKind::ReadWindow,
@@ -596,7 +965,10 @@ fn action_from_tool_call(
         "finish" => (ActionKind::Finish, ActionArgs::default()),
         "ask" => (
             ActionKind::AskUser,
-            ActionArgs { question: str_field("question"), ..Default::default() },
+            ActionArgs {
+                question: str_field("question"),
+                ..Default::default()
+            },
         ),
         other => {
             return Err(io::Error::new(
@@ -648,7 +1020,7 @@ fn planner_prompt(task: &task::TaskState) -> String {
             goal => task.goal,
             acceptance => task.acceptance,
             constraints => task.constraints,
-            environment => detect_project_env(Path::new(".")),
+            environment => task.project,
             failure => task.current_failure,
             observations => observations,
             hypotheses => hypotheses,
@@ -661,22 +1033,146 @@ fn planner_prompt(task: &task::TaskState) -> String {
         .expect("planner prompt renders")
 }
 
-fn model_request(task: &task::TaskState, prompt: &str) -> ModelRequest {
+fn model_request(task: &task::TaskState, purpose: ModelPurpose, prompt: &str) -> ModelRequest {
     let mut metadata = BTreeMap::new();
     metadata.insert("task_id".to_string(), task.id.clone());
 
+    let system = match purpose {
+        ModelPurpose::AgentPlanner => Some(PLANNER_SYSTEM_PROMPT.to_string()),
+        _ => None,
+    };
+    let system_tokens = system
+        .as_ref()
+        .map(|s| estimate_tokens(s.as_bytes()))
+        .unwrap_or(0);
+
     ModelRequest {
-        purpose: ModelPurpose::AgentPlanner,
-        system: Some(PLANNER_SYSTEM_PROMPT.to_string()),
+        purpose,
+        system,
         prompt: prompt.to_string(),
         estimated_tokens: EstimatedTokenUsage {
-            input: estimate_tokens(PLANNER_SYSTEM_PROMPT.as_bytes())
-                + estimate_tokens(prompt.as_bytes()),
+            input: system_tokens + estimate_tokens(prompt.as_bytes()),
             output: MAX_OUTPUT_TOKENS,
         },
         max_output_tokens: Some(MAX_OUTPUT_TOKENS),
         metadata,
     }
+}
+
+fn patch_plan_prompt(task: &task::TaskState) -> String {
+    let observations: Vec<_> = task.observations.iter().rev().take(8).rev().collect();
+    let mut prompt = format!(
+        "Write a minimal patch plan for the following task.\n\nGoal: {}\n",
+        task.goal
+    );
+    if let Some(failure) = &task.current_failure {
+        prompt.push_str(&format!(
+            "Current failure: {} — {}\n",
+            failure.kind, failure.summary
+        ));
+    }
+    if !observations.is_empty() {
+        prompt.push_str("\nKnown context:\n");
+        for observation in observations {
+            prompt.push_str(&format!("- {}\n", observation.summary));
+        }
+    }
+    if !task.acceptance.is_empty() {
+        prompt.push_str(&format!("\nAcceptance: {}\n", task.acceptance.join("; ")));
+    }
+    prompt.push_str("\nPatch plan (concise, file-level changes):\n");
+    prompt
+}
+
+/// Convert a planner action into a queued NextAction for deterministic execution.
+fn planner_action_to_next_action(action: &PlannerAction) -> task::NextAction {
+    let command = match action.action {
+        ActionKind::Search => format!(
+            "haycut search {}",
+            action.args.query.as_deref().unwrap_or("")
+        ),
+        ActionKind::ReadSymbol => format!(
+            "haycut read-symbol {}",
+            action.args.symbol.as_deref().unwrap_or("")
+        ),
+        ActionKind::ReadWindow => format!(
+            "haycut read-window {} --line {} --radius {}",
+            action.args.file.as_deref().unwrap_or(""),
+            action.args.line.unwrap_or(1),
+            action.args.radius.unwrap_or(read_window::DEFAULT_RADIUS)
+        ),
+        ActionKind::Trace => {
+            let mut parts = vec![action.args.command.clone().unwrap_or_default()];
+            parts.extend(action.args.args.clone());
+            format!("haycut trace {}", parts.join(" "))
+        }
+        _ => "haycut agent step".to_string(),
+    };
+
+    task::NextAction {
+        command,
+        reason: action.reason.clone(),
+        expected_answer: "context needed for patch plan".to_string(),
+        estimated_tokens: 500,
+        hypothesis: None,
+    }
+}
+
+/// Execute a queued NextAction command string deterministically.
+fn execute_next_action(action: &task::NextAction) -> io::Result<String> {
+    let parts: Vec<&str> = action.command.split_whitespace().collect();
+    let Some(("haycut", subcommand, args)) = parts
+        .split_first()
+        .and_then(|(first, rest)| rest.split_first().map(|(sub, args)| (*first, *sub, args)))
+    else {
+        return Ok(format!("unrecognised queued action: {}", action.command));
+    };
+
+    match subcommand {
+        "search" => execute_search(args.join(" ").as_str()),
+        "read-symbol" => execute_read_symbol(args.join(" ").as_str()),
+        "read-window" => parse_read_window_args(args),
+        "trace" => {
+            let action = PlannerAction {
+                action: ActionKind::Trace,
+                args: ActionArgs {
+                    command: Some(args.join(" ")),
+                    ..Default::default()
+                },
+                reason: action.reason.clone(),
+            };
+            execute_trace(&action)
+        }
+        _ => Ok(format!("unrecognised subcommand `{subcommand}`")),
+    }
+}
+
+fn parse_read_window_args(args: &[&str]) -> io::Result<String> {
+    let mut file: Option<String> = None;
+    let mut line: Option<usize> = None;
+    let mut radius: Option<usize> = None;
+
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if *arg == "--line" {
+            if let Some(value) = iter.next() {
+                line = value.parse().ok();
+            }
+        } else if *arg == "--radius" {
+            if let Some(value) = iter.next() {
+                radius = value.parse().ok();
+            }
+        } else if file.is_none() {
+            file = Some(arg.to_string());
+        }
+    }
+
+    let file = file.unwrap_or_default();
+    execute_read_window(
+        &file,
+        line.unwrap_or(1),
+        radius.unwrap_or(read_window::DEFAULT_RADIUS),
+    )
 }
 
 /// A deterministic, cheap description of the project's toolchain. HayCut
@@ -806,8 +1302,6 @@ fn detect_node_env(root: &Path) -> ProjectEnv {
     }
 }
 
-
-
 fn validate_action(action: &PlannerAction, task: &task::TaskState) -> io::Result<()> {
     if task.budget.packet_tokens_used >= task.budget.hard_tokens {
         return Err(io::Error::new(
@@ -829,33 +1323,6 @@ fn validate_action(action: &PlannerAction, task: &task::TaskState) -> io::Result
         ActionKind::Trace => require_text(action.args.command.as_deref(), "trace.command"),
         ActionKind::ProposePatchPlan | ActionKind::Finish => Ok(()),
         ActionKind::AskUser => require_text(action.args.question.as_deref(), "ask_user.question"),
-    }
-}
-
-fn execute_action(action: &PlannerAction) -> io::Result<String> {
-    match action.action {
-        ActionKind::Search => execute_search(action.args.query.as_deref().unwrap_or_default()),
-        ActionKind::ReadSymbol => {
-            execute_read_symbol(action.args.symbol.as_deref().unwrap_or_default())
-        }
-        ActionKind::ReadWindow => execute_read_window(
-            action.args.file.as_deref().unwrap_or_default(),
-            action.args.line.unwrap_or(1),
-            action.args.radius.unwrap_or(read_window::DEFAULT_RADIUS),
-        ),
-        ActionKind::Trace => execute_trace(action),
-        ActionKind::ProposePatchPlan => Ok(if action.reason.trim().is_empty() {
-            "planner says patch context is sufficient".to_string()
-        } else {
-            action.reason.clone()
-        }),
-        ActionKind::Finish => Ok(action.reason.clone()),
-        ActionKind::AskUser => Ok(action
-            .args
-            .question
-            .as_deref()
-            .unwrap_or_default()
-            .to_string()),
     }
 }
 
@@ -901,28 +1368,6 @@ fn execute_trace(action: &PlannerAction) -> io::Result<String> {
     command.extend(action.args.args.clone());
     let exit_code = trace::run(command, None, Some(TaskTarget::Current));
     Ok(format!("trace exited with code {exit_code}"))
-}
-
-fn action_locations(action: &PlannerAction) -> Vec<String> {
-    match action.action {
-        ActionKind::ReadSymbol => action.args.symbol.iter().cloned().collect(),
-        ActionKind::ReadWindow => action
-            .args
-            .file
-            .as_ref()
-            .zip(action.args.line)
-            .map(|(file, line)| vec![format!("{file}:{line}")])
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn next_step_index(task: &task::TaskState) -> usize {
-    task.observations
-        .iter()
-        .filter(|observation| observation.source.starts_with("agent:step:"))
-        .count()
-        + 1
 }
 
 fn require_text(value: Option<&str>, field: &str) -> io::Result<()> {
@@ -1015,6 +1460,17 @@ mod tests {
                 locations: vec!["src/config.rs:213:9".to_string()],
             }),
             closed_at: None,
+            project: Some(task::ProjectCard {
+                language: "Rust (cargo)".to_string(),
+                test_command: "cargo test".to_string(),
+                build_command: Some("cargo build".to_string()),
+            }),
+            verification: None,
+            route: Vec::new(),
+            patch_text: None,
+            patch_applied: false,
+            retry_count: 0,
+            last_failure_signature: None,
         }
     }
 
@@ -1052,7 +1508,10 @@ mod tests {
 
         let prompt = planner_prompt(&task);
 
-        assert!(!prompt.contains("\n\n"), "prompt had a blank line:\n{prompt}");
+        assert!(
+            !prompt.contains("\n\n"),
+            "prompt had a blank line:\n{prompt}"
+        );
         assert!(!prompt.contains("none"));
         assert!(!prompt.contains("Acceptance:"));
         assert!(!prompt.contains("CURRENT FAILURE"));
@@ -1144,26 +1603,23 @@ mod tests {
         );
         assert_eq!(parse_intent(Some("refactor")), task::TaskIntent::Refactor);
         // Unknown or missing labels fall back to the non-destructive intent.
-        assert_eq!(parse_intent(Some("nonsense")), task::TaskIntent::AnswerQuestion);
+        assert_eq!(
+            parse_intent(Some("nonsense")),
+            task::TaskIntent::AnswerQuestion
+        );
         assert_eq!(parse_intent(None), task::TaskIntent::AnswerQuestion);
     }
 
     #[test]
-    fn only_debug_failure_reproduces_first() {
-        assert!(task::TaskIntent::DebugFailure.reproduce_first());
-        assert!(!task::TaskIntent::ImplementFeature.reproduce_first());
-        assert!(!task::TaskIntent::Refactor.reproduce_first());
-        assert!(!task::TaskIntent::AnswerQuestion.reproduce_first());
-    }
-
-    #[test]
     fn action_from_tool_call_maps_sym_to_read_symbol() {
-        let args =
-            serde_json::json!({ "symbol": "create_default_config_at", "reason": "inspect" });
+        let args = serde_json::json!({ "symbol": "create_default_config_at", "reason": "inspect" });
         let action = action_from_tool_call("sym", args).expect("should map");
 
         assert_eq!(action.action, ActionKind::ReadSymbol);
-        assert_eq!(action.args.symbol.as_deref(), Some("create_default_config_at"));
+        assert_eq!(
+            action.args.symbol.as_deref(),
+            Some("create_default_config_at")
+        );
         assert_eq!(action.reason, "inspect");
     }
 

@@ -42,7 +42,7 @@ HayCut provides a harness around coding agents and model workflows with:
 - **Loop detection**
     Stop repeated file reads, repeated failed test runs and context expansion without new information.
 - **Model routing**:
-    Use cheap or local models for triage, summarisation and ranking; reserve stronger models for reasoning and patch decisions.
+    Use cheap or local models for classification, summarisation and ranking; reserve stronger models for reasoning and patch decisions.
 - **Verification-first reporting**:
     Measure token savings only alongside task success, tests passed and patch quality.
 
