@@ -129,7 +129,6 @@ function renderDetail(detail) {
   document.getElementById("detail-id").textContent = detail.id;
 
   renderStatCards(detail);
-  renderRouteTimeline(detail.route);
   renderWorkflowGraph(detail.workflow);
   renderChecks(detail.checks);
   renderPatch(detail.patch_text);
@@ -160,25 +159,24 @@ function renderStatCards(detail) {
     .join("");
 }
 
-function renderRouteTimeline(route) {
-  const list = document.getElementById("route-timeline");
-  if (!route || route.length === 0) {
-    list.innerHTML = '<div class="empty-note">No route recorded yet.</div>';
-    return;
-  }
-  list.innerHTML = route
-    .map(
-      (entry) => `
-      <li class="route-step exec-${escapeHtml(entry.executor)}">
-        <div class="route-step-head">
-          <span class="route-step-name">${escapeHtml(entry.step)}</span>
-          <span class="exec-tag">${escapeHtml(entry.executor.replace("_", " "))}</span>
-        </div>
-        <div class="route-step-outcome">${escapeHtml(entry.outcome)}</div>
-      </li>`
-    )
-    .join("");
-}
+// Mirrors NodeOp::executor() in src/commands/agent/workflow.rs.
+const NODE_EXECUTOR = {
+  classify_intent: "weak_model",
+  detect_project: "deterministic",
+  resolve_verification: "deterministic",
+  run_baseline: "command",
+  extract_evidence: "deterministic",
+  select_context: "weak_model",
+  plan_context: "strong_model",
+  read_context: "deterministic",
+  plan_patch: "strong_model",
+  apply_patch: "deterministic",
+  run_final_verification: "command",
+  retry_fix: "deterministic",
+  ask_user: "deterministic",
+  direct_answer: "strong_model",
+  report: "deterministic",
+};
 
 function renderWorkflowGraph(workflow) {
   const list = document.getElementById("workflow-graph");
@@ -191,11 +189,13 @@ function renderWorkflowGraph(workflow) {
     .map((node) => {
       const deps = node.depends_on && node.depends_on.length > 0 ? node.depends_on.join(", ") : "—";
       const outcome = node.outcome ? escapeHtml(node.outcome) : "";
+      const executor = NODE_EXECUTOR[node.op] || "deterministic";
       return `
-      <li class="workflow-node status-${escapeHtml(node.status)}">
+      <li class="workflow-node status-${escapeHtml(node.status)} exec-${escapeHtml(executor)}">
         <div class="workflow-node-head">
           <span class="workflow-node-id">${escapeHtml(node.id)}</span>
           <span class="workflow-node-op">${escapeHtml(node.op.replace(/_/g, " "))}</span>
+          <span class="exec-tag">${escapeHtml(executor.replace("_", " "))}</span>
           <span class="status-tag">${escapeHtml(node.status)}</span>
         </div>
         <div class="workflow-node-deps">depends on: ${escapeHtml(deps)}</div>

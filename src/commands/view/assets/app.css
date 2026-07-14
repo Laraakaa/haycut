@@ -386,48 +386,7 @@ body {
   margin-top: 3px;
 }
 
-/* ---------------------------------------------------------------- route timeline */
-
-.route-timeline {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  border-left: 2px solid var(--border);
-  margin-left: 8px;
-}
-
-.route-step {
-  position: relative;
-  padding: 8px 0 8px 22px;
-  border-bottom: 1px solid var(--border);
-}
-
-.route-step:last-child {
-  border-bottom: none;
-}
-
-.route-step::before {
-  content: "";
-  position: absolute;
-  left: -6px;
-  top: 14px;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--exec-color, var(--text-faint));
-  box-shadow: 0 0 6px var(--exec-color, transparent);
-}
-
-.route-step-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.route-step-name {
-  font-weight: 700;
-  color: var(--text);
-}
+/* ---------------------------------------------------------------- executor tag */
 
 .exec-tag {
   font-size: 10px;
@@ -438,13 +397,6 @@ body {
   color: var(--exec-color);
   border: 1px solid var(--exec-color);
   background: color-mix(in srgb, var(--exec-color) 12%, transparent);
-}
-
-.route-step-outcome {
-  color: var(--text-dim);
-  margin-top: 4px;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 /* executor colors */
