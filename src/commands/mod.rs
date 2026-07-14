@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod eval;
 pub mod files;
 pub mod index;
 pub mod init;
@@ -12,3 +13,4 @@ pub mod search;
 pub mod suggest;
 pub mod task;
 pub mod trace;
+pub mod view;

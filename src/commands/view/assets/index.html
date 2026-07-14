@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HayCut // View</title>
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">HAYCUT</span><span class="brand-cut">//</span><span class="brand-sub">VIEW</span>
+    </div>
+    <div class="tagline">less context. more signal.</div>
+    <div class="live-dot" id="live-indicator" title="No live runs"></div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>RUNS</span>
+        <button id="refresh-btn" class="ghost-btn" title="Refresh run list">&#8635;</button>
+      </div>
+      <div id="run-list" class="run-list">
+        <div class="empty-note">Loading runs&hellip;</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="empty-state" class="empty-state">
+        <div class="empty-glyph">&#9741;</div>
+        <p>Select a run on the left to inspect its route, LLM calls, and token spend.</p>
+      </div>
+
+      <div id="run-detail" class="run-detail hidden">
+        <section class="detail-head">
+          <div class="detail-title-row">
+            <h1 id="detail-title">&mdash;</h1>
+            <span id="detail-status" class="badge">&mdash;</span>
+          </div>
+          <div class="detail-meta">
+            <div><span class="meta-label">goal</span><span id="detail-goal">&mdash;</span></div>
+            <div><span class="meta-label">verify</span><span id="detail-verify">&mdash;</span></div>
+            <div><span class="meta-label">id</span><span id="detail-id">&mdash;</span></div>
+          </div>
+        </section>
+
+        <nav class="tabs" id="tabs">
+          <button class="tab active" data-tab="overview">Overview</button>
+          <button class="tab" data-tab="calls">LLM Calls</button>
+          <button class="tab" data-tab="context">Context</button>
+          <button class="tab" data-tab="tokens">Tokens</button>
+        </nav>
+
+        <section class="tab-panel active" id="panel-overview">
+          <div class="card-row" id="stat-cards"></div>
+          <h2 class="panel-heading">Route</h2>
+          <ol id="route-timeline" class="route-timeline"></ol>
+          <h2 class="panel-heading">Workflow graph</h2>
+          <ol id="workflow-graph" class="workflow-graph"></ol>
+          <div id="checks-block">
+            <h2 class="panel-heading">Checks</h2>
+            <div id="checks-list" class="checks-list"></div>
+          </div>
+          <div id="patch-block" class="patch-block hidden">
+            <h2 class="panel-heading">Patch</h2>
+            <pre id="patch-text" class="code-block"></pre>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="panel-calls">
+          <div id="calls-list" class="calls-list"></div>
+        </section>
+
+        <section class="tab-panel" id="panel-context">
+          <h2 class="panel-heading">Token flow</h2>
+          <div id="context-bars" class="context-bars"></div>
+          <h2 class="panel-heading">Off-site context surfaced</h2>
+          <div id="available-context" class="available-context"></div>
+          <h2 class="panel-heading">Evidence runs</h2>
+          <table class="runs-table" id="runs-table">
+            <thead><tr><th>command</th><th>exit</th><th>raw</th><th>packet</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section class="tab-panel" id="panel-tokens">
+          <h2 class="panel-heading">Model usage</h2>
+          <div id="model-usage" class="model-usage"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

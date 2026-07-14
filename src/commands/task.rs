@@ -57,9 +57,17 @@ pub struct TaskState {
     /// Flight-recorder route of steps executed so far.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route: Vec<RouteEntry>,
-    /// Planned patch text produced by the strong-model planner.
+    /// Rendered patch summary produced by the strong-model planner. Kept for
+    /// human/eval-facing display; when `patch_edits` is set this is derived
+    /// from it, otherwise it may hold free-form planner text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_text: Option<String>,
+    /// Structured, machine-appliable edits produced by the strong-model
+    /// planner via the `propose_edits` tool. Each edit names an exact
+    /// find/replace anchor so a deterministic applier can apply it without
+    /// re-parsing prose or diff hunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_edits: Option<Vec<PatchEdit>>,
     /// Whether the planned patch has been (stub) applied.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub patch_applied: bool,
@@ -69,6 +77,29 @@ pub struct TaskState {
     /// Signature of the failure that triggered the last retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_signature: Option<String>,
+    /// Off-site symbols found by deterministic call-stack follow, listed to
+    /// the strong planner but not injected into any prompt until it `pull`s
+    /// one by id. Keeps default context minimal while making the body one
+    /// tool call away.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_context: Vec<AvailableContext>,
+    /// Self-writing DAG of nodes driving the agent state machine.
+    #[serde(default)]
+    pub workflow: crate::commands::agent::workflow::Workflow,
+}
+
+/// A candidate off-site symbol surfaced by deterministic call-stack follow.
+/// `relevant` is `Some(bool)` once the weak model has judged it, `None` if
+/// the gate was unavailable or failed (never dropped either way).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AvailableContext {
+    pub id: String,
+    pub symbol: String,
+    pub path: String,
+    pub start_line: usize,
+    pub body: String,
+    #[serde(default)]
+    pub relevant: Option<bool>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -90,6 +121,16 @@ pub struct VerificationPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_baseline_exit: Option<i32>,
     pub expected_final_exit: i32,
+}
+
+/// One structured, machine-appliable edit: replace the exact `find` text in
+/// `path` with `replace`. Deliberately minimal (no diff hunks/context lines)
+/// so the strong model can express a fix in a handful of tokens.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PatchEdit {
+    pub path: String,
+    pub find: String,
+    pub replace: String,
 }
 
 /// One entry in the agent route flight recorder.
@@ -183,6 +224,11 @@ pub fn attach_current_run(
     let mut task = load_current()?;
     let run_id = evidence.run_id.clone();
 
+    // `packet_tokens_used` also accumulates model-call costs (see
+    // `execute_classify_intent`/`execute_plan_patch` in agent.rs). Only add
+    // this run's cost once, on first attach — recomputing the total from
+    // `task.runs` here would silently discard those model-token additions
+    // every time a command runs after a model call.
     if !task.runs.iter().any(|run| run.id == run_id) {
         task.runs.push(TaskRun {
             id: run_id.clone(),
@@ -191,9 +237,12 @@ pub fn attach_current_run(
             raw_tokens: packet.raw_tokens,
             packet_tokens: packet.packet_tokens,
         });
+        task.budget.packet_tokens_used = task
+            .budget
+            .packet_tokens_used
+            .saturating_add(packet.packet_tokens);
     }
 
-    task.budget.packet_tokens_used = task.runs.iter().map(|run| run.packet_tokens).sum();
     task.budget.raw_tokens_avoided = task
         .runs
         .iter()
@@ -285,9 +334,12 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         verification: None,
         route: Vec::new(),
         patch_text: None,
+        patch_edits: None,
         patch_applied: false,
         retry_count: 0,
         last_failure_signature: None,
+        available_context: Vec::new(),
+        workflow: crate::commands::agent::workflow::Workflow::new(),
     };
 
     save_current(&task)?;
@@ -555,7 +607,7 @@ fn next_actions_for(
     }]
 }
 
-fn function_under_test(evidence: &EvidencePacket, cwd: &Path) -> Option<String> {
+pub(crate) fn function_under_test(evidence: &EvidencePacket, cwd: &Path) -> Option<String> {
     let primary = evidence.primary_diagnostic.as_ref()?;
     let file = primary.file.as_ref()?;
     let line = primary.line?;
@@ -575,7 +627,7 @@ fn function_under_test(evidence: &EvidencePacket, cwd: &Path) -> Option<String> 
         .find_map(|line| function_call_name(line))
 }
 
-fn function_call_name(line: &str) -> Option<String> {
+pub(crate) fn function_call_name(line: &str) -> Option<String> {
     let before_paren = line.split('(').next()?.trim_end();
     let name = before_paren
         .chars()

@@ -3,7 +3,7 @@ use std::{fs, io, path::Path};
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub const RUN_STORE_PATH: &str = ".haycut/haycut.sqlite3";
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 #[derive(Debug)]
 pub struct NewRun<'a> {
@@ -101,6 +101,8 @@ pub struct NewAgentTrace<'a> {
     pub id: &'a str,
     pub task_id: &'a str,
     pub step_index: i64,
+    pub model: &'a str,
+    pub purpose: &'a str,
     pub prompt: &'a str,
     pub response: &'a str,
     pub action_json: &'a str,
@@ -117,6 +119,8 @@ pub struct StoredAgentTrace {
     pub id: String,
     pub task_id: String,
     pub step_index: i64,
+    pub model: String,
+    pub purpose: String,
     pub prompt: String,
     pub response: String,
     pub action_json: String,
@@ -361,8 +365,13 @@ pub fn upsert_task(db_path: &Path, task: &StoredTask, current: bool) -> io::Resu
     let conn = open_migrated(db_path)?;
 
     conn.execute(
-        "INSERT OR REPLACE INTO tasks (id, title, status, task_json, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO tasks (id, title, status, task_json, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            title = excluded.title,
+            status = excluded.status,
+            task_json = excluded.task_json,
+            updated_at = excluded.updated_at",
         params![
             task.id,
             task.title,
@@ -428,14 +437,16 @@ pub fn insert_agent_trace(db_path: &Path, trace: &NewAgentTrace<'_>) -> io::Resu
 
     conn.execute(
         "INSERT INTO agent_traces (
-            id, task_id, step_index, prompt, response, action_json, observation,
+            id, task_id, step_index, model, purpose, prompt, response, action_json, observation,
             estimated_input_tokens, estimated_output_tokens,
             reported_input_tokens, reported_output_tokens, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             trace.id,
             trace.task_id,
             trace.step_index,
+            trace.model,
+            trace.purpose,
             trace.prompt,
             trace.response,
             trace.action_json,
@@ -456,8 +467,8 @@ pub fn agent_traces_for_task(db_path: &Path, task_id: &str) -> io::Result<Vec<St
     let conn = open_migrated(db_path)?;
     let mut statement = conn
         .prepare(
-            "SELECT id, task_id, step_index, prompt, response, action_json, observation,
-                estimated_input_tokens, estimated_output_tokens,
+            "SELECT id, task_id, step_index, model, purpose, prompt, response, action_json,
+                observation, estimated_input_tokens, estimated_output_tokens,
                 reported_input_tokens, reported_output_tokens, created_at
             FROM agent_traces
             WHERE task_id = ?1
@@ -471,15 +482,17 @@ pub fn agent_traces_for_task(db_path: &Path, task_id: &str) -> io::Result<Vec<St
                 id: row.get(0)?,
                 task_id: row.get(1)?,
                 step_index: row.get(2)?,
-                prompt: row.get(3)?,
-                response: row.get(4)?,
-                action_json: row.get(5)?,
-                observation: row.get(6)?,
-                estimated_input_tokens: row.get(7)?,
-                estimated_output_tokens: row.get(8)?,
-                reported_input_tokens: row.get(9)?,
-                reported_output_tokens: row.get(10)?,
-                created_at: row.get(11)?,
+                model: row.get(3)?,
+                purpose: row.get(4)?,
+                prompt: row.get(5)?,
+                response: row.get(6)?,
+                action_json: row.get(7)?,
+                observation: row.get(8)?,
+                estimated_input_tokens: row.get(9)?,
+                estimated_output_tokens: row.get(10)?,
+                reported_input_tokens: row.get(11)?,
+                reported_output_tokens: row.get(12)?,
+                created_at: row.get(13)?,
             })
         })
         .map_err(io::Error::other)?;
@@ -655,6 +668,8 @@ fn migrate(conn: &Connection) -> io::Result<()> {
             id text primary key,
             task_id text not null,
             step_index integer not null,
+            model text not null default '',
+            purpose text not null default '',
             prompt text not null,
             response text not null,
             action_json text not null,
@@ -875,6 +890,8 @@ mod tests {
                 id: "trace-1",
                 task_id: "task-1",
                 step_index: 1,
+                model: "gpt-4o-mini",
+                purpose: "agent_planner",
                 prompt: "TASK\nGoal: Fix failing config test",
                 response: r#"{"action":"read_symbol"}"#,
                 action_json: r#"{"action":"read_symbol"}"#,
@@ -892,6 +909,8 @@ mod tests {
 
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].step_index, 1);
+        assert_eq!(traces[0].model, "gpt-4o-mini");
+        assert_eq!(traces[0].purpose, "agent_planner");
         assert_eq!(traces[0].estimated_input_tokens, 100);
         assert_eq!(traces[0].reported_output_tokens, Some(12));
         assert!(traces[0].observation.contains("create_default_config_at"));

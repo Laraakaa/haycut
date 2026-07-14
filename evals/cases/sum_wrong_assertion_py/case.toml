@@ -1,0 +1,9 @@
+goal = "The test suite fails; find the cause and propose a minimal fix."
+verify = "pytest"
+max_steps = 12
+
+[checks]
+max_tokens = 20000
+expected_markers = ["sum", "4"]
+relevant_paths = ["test_sum.py", "sum_fixture.py"]
+max_read_radius = 60

@@ -5,11 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::task::{CurrentFailure, TaskIntent, TaskState};
 
-/// A single decision in the agent task-state machine.
-/// `TaskState + Capabilities + Policy -> NextStep`.
+/// Stable, monotonic node identifier ("n1", "n2", ...).
+pub type NodeId = String;
+
+/// The concrete operation a graph node performs. Maps 1:1 onto the
+/// `execute_*` functions in `agent.rs` — no new behaviour, only a new
+/// structural home for what was `NextStep`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NextStep {
+pub enum NodeOp {
     /// Cheap weak-model intent classification.
     ClassifyIntent,
     /// Deterministic project-environment detection from marker files.
@@ -20,6 +24,9 @@ pub enum NextStep {
     RunBaseline,
     /// Extract a compact failure observation from the baseline run.
     ExtractEvidence,
+    /// Cheap weak-model selection of which off-site symbols the failure
+    /// depends on, resolved deterministically into context.
+    SelectContext,
     /// Strong-model planning of what context to read next.
     PlanContext,
     /// Deterministic read of a symbol, window, or search result.
@@ -38,8 +45,6 @@ pub enum NextStep {
     DirectAnswer,
     /// Produce the final report.
     Report,
-    /// Terminal state.
-    Stop(StopReason),
 }
 
 /// Why the agent stopped.
@@ -60,7 +65,7 @@ pub enum StopReason {
     MaxSteps,
 }
 
-/// What kind of executor should run a step.
+/// What kind of executor should run a node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
@@ -68,52 +73,54 @@ pub enum ExecutorKind {
     Deterministic,
     /// Cheap model: intent classification, ranking, summarisation.
     WeakModel,
-    /// Capable model: planning, patch generation, final report.
+    /// Capable model: planning, patch generation, direct answers.
     StrongModel,
     /// External process: test/build commands.
     Command,
 }
 
-impl NextStep {
-    /// Executor kind that should run this step.
+impl NodeOp {
+    /// Executor kind that should run this node.
     pub fn executor(&self) -> ExecutorKind {
         match self {
-            NextStep::ClassifyIntent => ExecutorKind::WeakModel,
-            NextStep::DetectProject => ExecutorKind::Deterministic,
-            NextStep::ResolveVerification => ExecutorKind::Deterministic,
-            NextStep::RunBaseline => ExecutorKind::Command,
-            NextStep::ExtractEvidence => ExecutorKind::Deterministic,
-            NextStep::PlanContext => ExecutorKind::StrongModel,
-            NextStep::ReadContext => ExecutorKind::Deterministic,
-            NextStep::PlanPatch => ExecutorKind::StrongModel,
-            NextStep::ApplyPatch => ExecutorKind::Deterministic,
-            NextStep::RunFinalVerification => ExecutorKind::Command,
-            NextStep::RetryFix => ExecutorKind::Deterministic,
-            NextStep::AskUser => ExecutorKind::Deterministic,
-            NextStep::DirectAnswer => ExecutorKind::StrongModel,
-            NextStep::Report => ExecutorKind::StrongModel,
-            NextStep::Stop(_) => ExecutorKind::Deterministic,
+            NodeOp::ClassifyIntent => ExecutorKind::WeakModel,
+            NodeOp::DetectProject => ExecutorKind::Deterministic,
+            NodeOp::ResolveVerification => ExecutorKind::Deterministic,
+            NodeOp::RunBaseline => ExecutorKind::Command,
+            NodeOp::ExtractEvidence => ExecutorKind::Deterministic,
+            NodeOp::SelectContext => ExecutorKind::WeakModel,
+            NodeOp::PlanContext => ExecutorKind::StrongModel,
+            NodeOp::ReadContext => ExecutorKind::Deterministic,
+            NodeOp::PlanPatch => ExecutorKind::StrongModel,
+            NodeOp::ApplyPatch => ExecutorKind::Deterministic,
+            NodeOp::RunFinalVerification => ExecutorKind::Command,
+            NodeOp::RetryFix => ExecutorKind::Deterministic,
+            NodeOp::AskUser => ExecutorKind::Deterministic,
+            NodeOp::DirectAnswer => ExecutorKind::StrongModel,
+            // `execute_report` only formats the already-computed patch_text /
+            // task-complete summary; it never calls a model.
+            NodeOp::Report => ExecutorKind::Deterministic,
         }
     }
 
     /// Short snake_case name used in route logging and tests.
     pub fn name(&self) -> &'static str {
         match self {
-            NextStep::ClassifyIntent => "classify_intent",
-            NextStep::DetectProject => "detect_project",
-            NextStep::ResolveVerification => "resolve_verification",
-            NextStep::RunBaseline => "run_baseline",
-            NextStep::ExtractEvidence => "extract_evidence",
-            NextStep::PlanContext => "plan_context",
-            NextStep::ReadContext => "read_context",
-            NextStep::PlanPatch => "plan_patch",
-            NextStep::ApplyPatch => "apply_patch",
-            NextStep::RunFinalVerification => "run_final_verification",
-            NextStep::RetryFix => "retry_fix",
-            NextStep::AskUser => "ask_user",
-            NextStep::DirectAnswer => "direct_answer",
-            NextStep::Report => "report",
-            NextStep::Stop(_) => "stop",
+            NodeOp::ClassifyIntent => "classify_intent",
+            NodeOp::DetectProject => "detect_project",
+            NodeOp::ResolveVerification => "resolve_verification",
+            NodeOp::RunBaseline => "run_baseline",
+            NodeOp::ExtractEvidence => "extract_evidence",
+            NodeOp::SelectContext => "select_context",
+            NodeOp::PlanContext => "plan_context",
+            NodeOp::ReadContext => "read_context",
+            NodeOp::PlanPatch => "plan_patch",
+            NodeOp::ApplyPatch => "apply_patch",
+            NodeOp::RunFinalVerification => "run_final_verification",
+            NodeOp::RetryFix => "retry_fix",
+            NodeOp::AskUser => "ask_user",
+            NodeOp::DirectAnswer => "direct_answer",
+            NodeOp::Report => "report",
         }
     }
 }
@@ -130,18 +137,242 @@ impl ExecutorKind {
     }
 }
 
-/// Per-intent policy flags controlling the state-machine route.
+/// Lifecycle of a graph node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+/// A single node in the task's workflow graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Node {
+    pub id: NodeId,
+    pub op: NodeOp,
+    #[serde(default)]
+    pub depends_on: Vec<NodeId>,
+    pub status: NodeStatus,
+    #[serde(default)]
+    pub produced_by: Option<NodeId>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+/// The task's self-writing DAG: the graph is the source of truth for what
+/// runs next. Nodes are appended dynamically as `next_ready_node` decides
+/// what the task needs, wired to the node that produced the decision.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Workflow {
+    pub nodes: Vec<Node>,
+    #[serde(default)]
+    pub seq: u32,
+}
+
+impl Workflow {
+    /// A fresh task's workflow: a single seed node awaiting classification.
+    pub fn new() -> Self {
+        let mut workflow = Workflow::default();
+        workflow.push(NodeOp::ClassifyIntent, Vec::new(), None);
+        workflow
+    }
+
+    fn push(&mut self, op: NodeOp, depends_on: Vec<NodeId>, produced_by: Option<NodeId>) -> NodeId {
+        self.seq += 1;
+        let id = format!("n{}", self.seq);
+        self.nodes.push(Node {
+            id: id.clone(),
+            op,
+            depends_on,
+            status: NodeStatus::Pending,
+            produced_by,
+            outcome: None,
+        });
+        id
+    }
+
+    fn node_mut(&mut self, id: &str) -> Option<&mut Node> {
+        self.nodes.iter_mut().find(|node| node.id == id)
+    }
+
+    pub fn mark_running(&mut self, id: &str) {
+        if let Some(node) = self.node_mut(id) {
+            node.status = NodeStatus::Running;
+        }
+    }
+
+    /// Mark a node done, upserting it if it is missing (some executors
+    /// reload the task mid-step, which can drop an in-memory, not-yet-saved
+    /// node — this keeps the graph consistent regardless).
+    pub fn complete(&mut self, id: NodeId, op: NodeOp, outcome: String) {
+        match self.node_mut(&id) {
+            Some(node) => {
+                node.status = NodeStatus::Done;
+                node.outcome = Some(outcome);
+            }
+            None => {
+                self.nodes.push(Node {
+                    id,
+                    op,
+                    depends_on: Vec::new(),
+                    status: NodeStatus::Done,
+                    produced_by: None,
+                    outcome: Some(outcome),
+                });
+            }
+        }
+    }
+
+    pub fn mark_failed(&mut self, id: &str) {
+        if let Some(node) = self.node_mut(id) {
+            node.status = NodeStatus::Failed;
+        }
+    }
+}
+
+/// The outcome of asking the graph what runs next.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Decision {
+    Ready(NodeId, NodeOp),
+    Stop(StopReason),
+}
+
+/// Pure, testable decision: given the current task state, decide the next
+/// operation. No side effects, no model calls.
+fn decide(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
+    // Hard stop: budget exhausted.
+    if task.budget.packet_tokens_used >= task.budget.hard_tokens {
+        return Err(StopReason::BudgetExhausted);
+    }
+
+    let Some(intent) = task.intent else {
+        return Ok(NodeOp::ClassifyIntent);
+    };
+
+    let policy = IntentPolicy::for_intent(intent);
+
+    // Final-verification loop: if the last final verification failed, decide
+    // whether to retry, loop-detect, give up, or ask the user.
+    if let Some(last_final) = task
+        .route
+        .iter()
+        .rev()
+        .find(|entry| entry.step == NodeOp::RunFinalVerification.name())
+    {
+        let failed = !outcome_passed(&last_final.outcome);
+        if failed {
+            return resolve_retry(task, max_retries);
+        }
+    }
+
+    if task.project.is_none() {
+        return Ok(NodeOp::DetectProject);
+    }
+
+    if policy.requires_verification && task.verification.is_none() {
+        return Ok(NodeOp::ResolveVerification);
+    }
+
+    if policy.requires_verification && !has_step(task, NodeOp::RunBaseline.name()) {
+        return Ok(NodeOp::RunBaseline);
+    }
+
+    if policy.expect_baseline_failure
+        && task.current_failure.is_none()
+        && !has_step(task, NodeOp::ExtractEvidence.name())
+    {
+        return Ok(NodeOp::ExtractEvidence);
+    }
+
+    if policy.patch_expected
+        && task.current_failure.is_some()
+        && !has_step(task, NodeOp::SelectContext.name())
+    {
+        return Ok(NodeOp::SelectContext);
+    }
+
+    if needs_more_context(task, policy) {
+        if task.next_actions.is_empty() {
+            return Ok(NodeOp::PlanContext);
+        }
+        return Ok(NodeOp::ReadContext);
+    }
+
+    if policy.patch_expected {
+        if task.patch_text.is_none() {
+            return Ok(NodeOp::PlanPatch);
+        }
+        if !task.patch_applied {
+            return Ok(NodeOp::ApplyPatch);
+        }
+        if policy.require_final_verification
+            && !has_step(task, NodeOp::RunFinalVerification.name())
+        {
+            return Ok(NodeOp::RunFinalVerification);
+        }
+    }
+
+    if !policy.patch_expected && !has_step(task, NodeOp::DirectAnswer.name()) {
+        return Ok(NodeOp::DirectAnswer);
+    }
+
+    if !has_step(task, NodeOp::Report.name()) {
+        return Ok(NodeOp::Report);
+    }
+
+    let verified = policy.require_final_verification && has_passing_final_verification(task)
+        || !policy.patch_expected;
+    Err(if verified {
+        StopReason::Verified
+    } else {
+        StopReason::Blocked
+    })
+}
+
+/// Ask the graph which node is ready to run next, appending it (chained to
+/// the last-completed node) if it doesn't already exist as a pending node.
+/// This is the self-writing step: each call may extend the graph based on
+/// what the task has learned so far.
+pub fn next_ready_node(workflow: &mut Workflow, task: &TaskState, max_retries: usize) -> Decision {
+    match decide(task, max_retries) {
+        Err(reason) => Decision::Stop(reason),
+        Ok(op) => {
+            if let Some(node) = workflow
+                .nodes
+                .iter()
+                .find(|node| node.status == NodeStatus::Pending && node.op == op)
+            {
+                Decision::Ready(node.id.clone(), op)
+            } else {
+                let parent = workflow
+                    .nodes
+                    .iter()
+                    .rev()
+                    .find(|node| node.status == NodeStatus::Done)
+                    .map(|node| node.id.clone());
+                let depends_on = parent.iter().cloned().collect();
+                let id = workflow.push(op.clone(), depends_on, parent);
+                Decision::Ready(id, op)
+            }
+        }
+    }
+}
+
+/// Per-intent policy flags controlling the graph's route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IntentPolicy {
-    pub needs_repo: bool,
-    pub requires_verification: bool,
-    pub expect_baseline_failure: bool,
-    pub patch_expected: bool,
-    pub require_final_verification: bool,
+struct IntentPolicy {
+    needs_repo: bool,
+    requires_verification: bool,
+    expect_baseline_failure: bool,
+    patch_expected: bool,
+    require_final_verification: bool,
 }
 
 impl IntentPolicy {
-    pub fn for_intent(intent: TaskIntent) -> Self {
+    fn for_intent(intent: TaskIntent) -> Self {
         match intent {
             TaskIntent::DebugFailure => Self {
                 needs_repo: true,
@@ -175,121 +406,28 @@ impl IntentPolicy {
     }
 }
 
-/// Pure, testable policy engine: given the current task state, decide the
-/// next step. No side effects, no model calls.
-pub fn select_next_step(task: &TaskState, max_retries: usize) -> NextStep {
-    // Hard stop: budget exhausted.
-    if task.budget.packet_tokens_used >= task.budget.hard_tokens {
-        return NextStep::Stop(StopReason::BudgetExhausted);
-    }
-
-    let Some(intent) = task.intent else {
-        return NextStep::ClassifyIntent;
-    };
-
-    let policy = IntentPolicy::for_intent(intent);
-
-    // Baseline verification loop: if the last final verification failed, decide
-    // whether to retry, loop-detect, give up, or ask the user.
-    if let Some(last_final) = task
-        .route
-        .iter()
-        .rev()
-        .find(|entry| entry.step == NextStep::RunFinalVerification.name())
-    {
-        let failed = !outcome_passed(&last_final.outcome);
-        if failed {
-            return resolve_retry(task, policy, max_retries);
-        }
-    }
-
-    // Route progression.
-    if task.project.is_none() {
-        return NextStep::DetectProject;
-    }
-
-    if policy.requires_verification && task.verification.is_none() {
-        return NextStep::ResolveVerification;
-    }
-
-    if policy.requires_verification && !has_step(task, NextStep::RunBaseline.name()) {
-        return NextStep::RunBaseline;
-    }
-
-    if policy.expect_baseline_failure
-        && task.current_failure.is_none()
-        && !has_step(task, NextStep::ExtractEvidence.name())
-    {
-        return NextStep::ExtractEvidence;
-    }
-
-    // Context-gathering phase.
-    if needs_more_context(task, policy) {
-        if task.next_actions.is_empty() {
-            return NextStep::PlanContext;
-        }
-        return NextStep::ReadContext;
-    }
-
-    // Patch phase.
-    if policy.patch_expected {
-        if task.patch_text.is_none() {
-            return NextStep::PlanPatch;
-        }
-        if !task.patch_applied {
-            return NextStep::ApplyPatch;
-        }
-        if policy.require_final_verification
-            && !has_step(task, NextStep::RunFinalVerification.name())
-        {
-            return NextStep::RunFinalVerification;
-        }
-    }
-
-    // Non-patch intents: direct answer.
-    if !policy.patch_expected && !has_step(task, NextStep::DirectAnswer.name()) {
-        return NextStep::DirectAnswer;
-    }
-
-    // Terminal report.
-    if !has_step(task, NextStep::Report.name()) {
-        return NextStep::Report;
-    }
-
-    // Determine the correct stop reason from history.
-    let verified = policy.require_final_verification && has_passing_final_verification(task)
-        || !policy.patch_expected;
-    let reason = if verified {
-        StopReason::Verified
-    } else {
-        StopReason::Blocked
-    };
-
-    NextStep::Stop(reason)
-}
-
 /// Decide what to do after a failed final verification.
-fn resolve_retry(task: &TaskState, _policy: IntentPolicy, max_retries: usize) -> NextStep {
+fn resolve_retry(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
     if task.retry_count >= max_retries {
-        return NextStep::Stop(StopReason::BudgetExhausted);
+        return Err(StopReason::BudgetExhausted);
     }
 
     let current_signature = task.current_failure.as_ref().map(failure_signature);
     let previous_signature = task.last_failure_signature.clone();
 
     if current_signature.is_some() && current_signature == previous_signature {
-        return NextStep::Stop(StopReason::LoopDetected);
+        return Err(StopReason::LoopDetected);
     }
 
     if task.patch_text.is_some() {
-        return NextStep::RetryFix;
+        return Ok(NodeOp::RetryFix);
     }
 
     if task.budget.packet_tokens_used >= task.budget.soft_tokens {
-        return NextStep::AskUser;
+        return Ok(NodeOp::AskUser);
     }
 
-    NextStep::Stop(StopReason::Blocked)
+    Err(StopReason::Blocked)
 }
 
 /// Whether the agent still needs more context before it can plan a patch or
@@ -299,21 +437,17 @@ fn needs_more_context(task: &TaskState, policy: IntentPolicy) -> bool {
         return false;
     }
 
-    // Non-patch intents take the direct-answer path: no context gathering.
     if !policy.patch_expected {
         return false;
     }
 
-    // If the planner already queued reads, we are still in context gathering.
     if !task.next_actions.is_empty() {
         return true;
     }
 
-    // Patch intents: we must run the planner at least once (which may queue
-    // deterministic reads) before a patch can be planned.
     if task.patch_text.is_none()
-        && !has_step(task, NextStep::PlanContext.name())
-        && !has_step(task, NextStep::ReadContext.name())
+        && !has_step(task, NodeOp::PlanContext.name())
+        && !has_step(task, NodeOp::ReadContext.name())
     {
         return true;
     }
@@ -337,14 +471,19 @@ fn has_passing_final_verification(task: &TaskState) -> bool {
     task.route
         .iter()
         .rev()
-        .find(|entry| entry.step == NextStep::RunFinalVerification.name())
+        .find(|entry| entry.step == NodeOp::RunFinalVerification.name())
         .map(|entry| outcome_passed(&entry.outcome))
         .unwrap_or(false)
 }
 
 /// Parse a command outcome string for pass/fail.
 fn outcome_passed(outcome: &str) -> bool {
-    outcome.trim().starts_with("pass") || outcome.trim() == "0" || outcome.contains("exit 0")
+    let outcome = outcome.trim();
+    outcome.starts_with("pass")
+        || outcome == "0"
+        || outcome.contains("exit 0")
+        || outcome.contains("exited 0")
+        || outcome.contains("(pass)")
 }
 
 fn has_step(task: &TaskState, name: &str) -> bool {
@@ -383,9 +522,12 @@ mod tests {
             verification: None,
             route: Vec::new(),
             patch_text: None,
+            patch_edits: None,
             patch_applied: false,
             retry_count: 0,
             last_failure_signature: None,
+            available_context: Vec::new(),
+            workflow: Workflow::new(),
         }
     }
 
@@ -395,7 +537,7 @@ mod tests {
         task
     }
 
-    fn push_route(task: &mut TaskState, step: NextStep, outcome: &str) {
+    fn push_route(task: &mut TaskState, step: NodeOp, outcome: &str) {
         task.route.push(RouteEntry {
             step: step.name().to_string(),
             executor: step.executor(),
@@ -403,16 +545,27 @@ mod tests {
         });
     }
 
+    fn decision(task: &TaskState, max_retries: usize) -> Decision {
+        let mut workflow = task.workflow.clone();
+        next_ready_node(&mut workflow, task, max_retries)
+    }
+
     #[test]
     fn empty_task_starts_with_classify() {
         let task = empty_task();
-        assert_eq!(select_next_step(&task, 2), NextStep::ClassifyIntent);
+        assert_eq!(
+            decision(&task, 2),
+            Decision::Ready("n1".to_string(), NodeOp::ClassifyIntent)
+        );
     }
 
     #[test]
     fn classified_task_detects_project() {
         let task = task_with_intent(TaskIntent::DebugFailure);
-        assert_eq!(select_next_step(&task, 2), NextStep::DetectProject);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::DetectProject)
+        ));
     }
 
     #[test]
@@ -428,7 +581,10 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        assert_eq!(select_next_step(&task, 2), NextStep::RunBaseline);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::RunBaseline)
+        ));
     }
 
     #[test]
@@ -444,8 +600,11 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
-        assert_eq!(select_next_step(&task, 2), NextStep::ExtractEvidence);
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::ExtractEvidence)
+        ));
     }
 
     #[test]
@@ -461,10 +620,10 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
-            NextStep::ExtractEvidence,
+            NodeOp::ExtractEvidence,
             "assertion left 13 right 12",
         );
         task.current_failure = Some(CurrentFailure {
@@ -472,7 +631,15 @@ mod tests {
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
         });
-        assert_eq!(select_next_step(&task, 2), NextStep::PlanContext);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::SelectContext)
+        ));
+        push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::PlanContext)
+        ));
     }
 
     #[test]
@@ -488,13 +655,13 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
-            NextStep::ExtractEvidence,
+            NodeOp::ExtractEvidence,
             "assertion left 13 right 12",
         );
-        push_route(&mut task, NextStep::PlanContext, "read src/lib.rs");
+        push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
         task.next_actions.push(NextAction {
             command: "haycut read-window src/lib.rs --line 42".to_string(),
             reason: "inspect".to_string(),
@@ -502,7 +669,10 @@ mod tests {
             estimated_tokens: 500,
             hypothesis: None,
         });
-        assert_eq!(select_next_step(&task, 2), NextStep::ReadContext);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::ReadContext)
+        ));
     }
 
     #[test]
@@ -518,20 +688,24 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
-            NextStep::ExtractEvidence,
+            NodeOp::ExtractEvidence,
             "assertion left 13 right 12",
         );
-        push_route(&mut task, NextStep::PlanContext, "read src/lib.rs");
-        push_route(&mut task, NextStep::ReadContext, "window src/lib.rs:42");
+        push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
+        push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
+        push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
         task.current_failure = Some(CurrentFailure {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
         });
-        assert_eq!(select_next_step(&task, 2), NextStep::PlanPatch);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::PlanPatch)
+        ));
     }
 
     #[test]
@@ -547,21 +721,27 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
-            NextStep::ExtractEvidence,
+            NodeOp::ExtractEvidence,
             "assertion left 13 right 12",
         );
-        push_route(&mut task, NextStep::PlanContext, "read src/lib.rs");
-        push_route(&mut task, NextStep::ReadContext, "window src/lib.rs:42");
-        push_route(&mut task, NextStep::PlanPatch, "change expected value");
+        push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
+        push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
+        push_route(&mut task, NodeOp::PlanPatch, "change expected value");
         task.patch_text = Some("change expected value".to_string());
-        assert_eq!(select_next_step(&task, 2), NextStep::ApplyPatch);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::ApplyPatch)
+        ));
 
-        push_route(&mut task, NextStep::ApplyPatch, "planned, not applied");
+        push_route(&mut task, NodeOp::ApplyPatch, "planned, not applied");
         task.patch_applied = true;
-        assert_eq!(select_next_step(&task, 2), NextStep::RunFinalVerification);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::RunFinalVerification)
+        ));
     }
 
     #[test]
@@ -577,20 +757,27 @@ mod tests {
             expected_baseline_exit: Some(101),
             expected_final_exit: 0,
         });
-        push_route(&mut task, NextStep::RunBaseline, "fail exit 101");
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
-            NextStep::ExtractEvidence,
+            NodeOp::ExtractEvidence,
             "assertion left 13 right 12",
         );
-        push_route(&mut task, NextStep::PlanContext, "read src/lib.rs");
-        push_route(&mut task, NextStep::ReadContext, "window src/lib.rs:42");
-        push_route(&mut task, NextStep::PlanPatch, "change expected value");
-        push_route(&mut task, NextStep::ApplyPatch, "planned, not applied");
-        push_route(&mut task, NextStep::RunFinalVerification, "pass exit 0");
+        push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
+        push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
+        push_route(&mut task, NodeOp::PlanPatch, "change expected value");
+        push_route(&mut task, NodeOp::ApplyPatch, "applied 1 edit(s)");
+        push_route(
+            &mut task,
+            NodeOp::RunFinalVerification,
+            "final verification `cargo test` exited 0 (pass)",
+        );
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
-        assert_eq!(select_next_step(&task, 2), NextStep::Report);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::Report)
+        ));
     }
 
     #[test]
@@ -601,7 +788,10 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        assert_eq!(select_next_step(&task, 2), NextStep::DirectAnswer);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::DirectAnswer)
+        ));
     }
 
     #[test]
@@ -609,8 +799,8 @@ mod tests {
         let mut task = empty_task();
         task.budget.packet_tokens_used = task.budget.hard_tokens;
         assert_eq!(
-            select_next_step(&task, 2),
-            NextStep::Stop(StopReason::BudgetExhausted)
+            decision(&task, 2),
+            Decision::Stop(StopReason::BudgetExhausted)
         );
     }
 
@@ -635,11 +825,11 @@ mod tests {
         task.last_failure_signature = task.current_failure.as_ref().map(failure_signature);
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
-        push_route(&mut task, NextStep::RunFinalVerification, "fail exit 101");
+        push_route(&mut task, NodeOp::RunFinalVerification, "fail exit 101");
 
         assert_eq!(
-            select_next_step(&task, 2),
-            NextStep::Stop(StopReason::LoopDetected)
+            decision(&task, 2),
+            Decision::Stop(StopReason::LoopDetected)
         );
     }
 
@@ -665,9 +855,12 @@ mod tests {
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
         task.retry_count = 0;
-        push_route(&mut task, NextStep::RunFinalVerification, "fail exit 101");
+        push_route(&mut task, NodeOp::RunFinalVerification, "fail exit 101");
 
-        assert_eq!(select_next_step(&task, 2), NextStep::RetryFix);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::RetryFix)
+        ));
     }
 
     #[test]
@@ -692,11 +885,11 @@ mod tests {
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
         task.retry_count = 2;
-        push_route(&mut task, NextStep::RunFinalVerification, "fail exit 101");
+        push_route(&mut task, NodeOp::RunFinalVerification, "fail exit 101");
 
         assert_eq!(
-            select_next_step(&task, 2),
-            NextStep::Stop(StopReason::BudgetExhausted)
+            decision(&task, 2),
+            Decision::Stop(StopReason::BudgetExhausted)
         );
     }
 
@@ -711,5 +904,25 @@ mod tests {
         let sig2 = failure_signature(&failure);
         assert_eq!(sig1, sig2);
         assert!(!sig1.is_empty());
+    }
+
+    #[test]
+    fn graph_extends_with_dependency_chain() {
+        let task = empty_task();
+        let mut workflow = task.workflow.clone();
+        let first = next_ready_node(&mut workflow, &task, 2);
+        let Decision::Ready(seed_id, NodeOp::ClassifyIntent) = first else {
+            panic!("expected seeded ClassifyIntent node");
+        };
+        assert_eq!(workflow.nodes.len(), 1);
+        workflow.complete(seed_id.clone(), NodeOp::ClassifyIntent, "debug".to_string());
+
+        let mut task2 = task_with_intent(TaskIntent::DebugFailure);
+        task2.workflow = workflow;
+        let second = next_ready_node(&mut task2.workflow.clone(), &task2, 2);
+        let Decision::Ready(next_id, NodeOp::DetectProject) = second else {
+            panic!("expected DetectProject node");
+        };
+        assert_ne!(next_id, seed_id);
     }
 }

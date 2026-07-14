@@ -37,5 +37,11 @@ OPEN HYPOTHESES
 {{ hypothesis.id }} {{ hypothesis.confidence }}: {{ hypothesis.summary }}
 {% endfor %}
 {% endif %}
+{% if available_context %}
+AVAILABLE CONTEXT (not loaded)
+{% for candidate in available_context %}
+{{ candidate.id }}: {{ candidate.symbol }} @ {{ candidate.path }} — relevance: {% if candidate.relevant == true %}relevant{% elif candidate.relevant == false %}not relevant{% else %}unknown{% endif %}
+{% endfor %}
+{% endif %}
 BUDGET
 Used packet tokens: {{ budget.used }} / {{ budget.soft }} soft, {{ budget.hard }} hard.

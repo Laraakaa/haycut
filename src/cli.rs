@@ -124,6 +124,12 @@ pub enum Commands {
         command: AgentCommand,
     },
 
+    /// Run gold-set eval cases against the agent
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
+
     /// Search repository files for an exact string
     Search {
         /// Maximum number of matches to show
@@ -133,6 +139,17 @@ pub enum Commands {
         /// Exact text to search for
         #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
         query: Vec<String>,
+    },
+
+    /// Serve a local dashboard for analyzing eval and agent runs
+    View {
+        /// Port to serve the dashboard on
+        #[arg(long, default_value_t = commands::view::DEFAULT_PORT)]
+        port: u16,
+
+        /// Directory containing eval results
+        #[arg(long, default_value = "evals/results")]
+        results_dir: PathBuf,
     },
 }
 
@@ -170,16 +187,36 @@ pub enum TaskCommand {
 }
 
 #[derive(Subcommand)]
+pub enum EvalCommand {
+    /// List available eval cases
+    List {
+        /// Directory containing eval cases
+        #[arg(long, default_value = "evals/cases")]
+        cases_dir: PathBuf,
+    },
+
+    /// Run an eval case and write a report
+    Run {
+        /// Case name (directory under --cases-dir)
+        case: String,
+
+        /// Directory containing eval cases
+        #[arg(long, default_value = "evals/cases")]
+        cases_dir: PathBuf,
+
+        /// Directory to write eval results into
+        #[arg(long, default_value = "evals/results")]
+        results_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum AgentCommand {
     /// Loop until done, blocked, budget exhausted, or max steps hit
     Run {
         /// Use the current task
         #[arg(long, value_enum)]
         task: Option<TaskTarget>,
-
-        /// Verification command, e.g. `cargo test`
-        #[arg(long)]
-        verify: Option<String>,
 
         /// Maximum planner steps to execute
         #[arg(long, default_value_t = commands::agent::DEFAULT_MAX_STEPS)]
@@ -245,7 +282,16 @@ impl Cli {
             Some(Commands::Suggest) => commands::suggest::run(),
             Some(Commands::Task { command }) => commands::task::run(command),
             Some(Commands::Agent { command }) => commands::agent::run(command),
+            Some(Commands::Eval { command }) => match command {
+                EvalCommand::List { cases_dir } => commands::eval::run_list(&cases_dir),
+                EvalCommand::Run {
+                    case,
+                    cases_dir,
+                    results_dir,
+                } => commands::eval::run_case(&cases_dir, &results_dir, &case),
+            },
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
+            Some(Commands::View { port, results_dir }) => commands::view::run(port, results_dir),
             None => 0,
         }
     }

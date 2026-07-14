@@ -1,2 +1,7 @@
 /target
+**/target/
 .haycut/
+.tokensave
+.headroom
+/evals/results/
+evals/cases/*/repo/Cargo.lock

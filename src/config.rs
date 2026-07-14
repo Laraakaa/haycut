@@ -29,7 +29,14 @@ pub struct ModelConfig {
     /// Model identifier to pass in the request body.
     pub model: String,
     /// Name of the environment variable that holds the API key.
-    pub api_key_env_var: String,
+    /// Ignored if `api_key` is set.
+    #[serde(default)]
+    pub api_key_env_var: Option<String>,
+    /// API key value directly in the config file. Takes precedence over
+    /// `api_key_env_var` if both are set. Less secure than an environment
+    /// variable, but convenient for keys that only reach a local proxy.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Per-request timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -39,7 +46,8 @@ impl Default for ModelConfig {
         Self {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
-            api_key_env_var: "OPENAI_API_KEY".to_string(),
+            api_key_env_var: Some("OPENAI_API_KEY".to_string()),
+            api_key: None,
             timeout_secs: 60,
         }
     }
@@ -111,10 +119,16 @@ impl UserConfig {
          # Configure the model used by `haycut agent`.\n\
          # Remove the leading `#` characters and fill in your values.\n\
          #\n\
+         # Provide the API key either via an environment variable\n\
+         # (api_key_env_var) or directly in this file (api_key). If both are\n\
+         # set, api_key takes precedence. A direct value is less secure but\n\
+         # convenient for local-only keys (e.g. a local LLM proxy).\n\
+         #\n\
          # [model]\n\
          # base_url = \"https://api.openai.com/v1\"\n\
          # model = \"gpt-4o-mini\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # # api_key = \"sk-...\"\n\
          # timeout_secs = 60\n\
          #\n\
          # Optional explicit cheap model for weak-model steps.\n\
@@ -124,6 +138,15 @@ impl UserConfig {
          # base_url = \"https://api.openai.com/v1\"\n\
          # model = \"gpt-4o-mini\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # # api_key = \"sk-...\"\n\
+         # timeout_secs = 60\n\
+         #\n\
+         # weak_model can also point at a local, OpenAI-compatible endpoint\n\
+         # such as Ollama. No API key is required for local endpoints.\n\
+         #\n\
+         # [weak_model]\n\
+         # base_url = \"http://localhost:11434/v1\"\n\
+         # model = \"qwen2.5:7b-instruct\"\n\
          # timeout_secs = 60\n\
          #\n\
          # Optional explicit capable model for planning/patch generation.\n\
@@ -133,6 +156,7 @@ impl UserConfig {
          # base_url = \"https://api.openai.com/v1\"\n\
          # model = \"gpt-4o\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
+         # # api_key = \"sk-...\"\n\
          # timeout_secs = 120\n"
             .to_string()
     }

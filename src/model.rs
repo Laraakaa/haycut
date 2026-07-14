@@ -30,6 +30,11 @@ pub struct ModelRequest {
     pub prompt: String,
     pub estimated_tokens: EstimatedTokenUsage,
     pub max_output_tokens: Option<usize>,
+    /// Reasoning-effort hint for reasoning-capable models (e.g. gpt-5). Lower
+    /// effort means fewer hidden reasoning tokens, which dominate output cost.
+    /// The provider forwards it only for models that accept it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -58,6 +63,11 @@ pub struct EstimatedTokenUsage {
 pub struct ReportedTokenUsage {
     pub input: Option<usize>,
     pub output: Option<usize>,
+    /// Portion of `input` served from a prompt cache, when the provider
+    /// reports it (e.g. OpenAI's `prompt_tokens_details.cached_tokens`).
+    /// `None` when the provider doesn't expose cache accounting.
+    #[serde(default)]
+    pub cached_input: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -92,6 +102,19 @@ impl ModelPurpose {
             }
         }
     }
+}
+
+/// Load the configured provider for a model tier (`[weak_model]` /
+/// `[strong_model]`, falling back to the main `[model]`), so every graph
+/// node builds its request the same way regardless of which op it runs.
+pub fn resolve_provider(
+    tier: ModelTier,
+) -> Result<Option<OpenAiProvider>, Box<dyn std::error::Error>> {
+    let config = match tier {
+        ModelTier::Weak => crate::config::Config::load_weak_model()?,
+        ModelTier::Strong => crate::config::Config::load_strong_model()?,
+    };
+    Ok(config.map(OpenAiProvider::new))
 }
 
 impl ModelCallRecord {
@@ -203,12 +226,21 @@ impl OpenAiProvider {
         }
     }
 
-    fn api_key(&self) -> anyhow::Result<String> {
-        std::env::var(&self.config.api_key_env_var).map_err(|_| {
+    /// Resolves the API key to use, if any. Returns `Ok(None)` when neither
+    /// `api_key` nor `api_key_env_var` is configured — local, unauthenticated
+    /// endpoints (e.g. Ollama) don't need one.
+    fn api_key(&self) -> anyhow::Result<Option<String>> {
+        if let Some(key) = &self.config.api_key {
+            return Ok(Some(key.clone()));
+        }
+        let Some(env_var) = &self.config.api_key_env_var else {
+            return Ok(None);
+        };
+        std::env::var(env_var).map(Some).map_err(|_| {
             anyhow::anyhow!(
                 "environment variable '{}' is not set; \
                  set it to the API key for {}",
-                self.config.api_key_env_var,
+                env_var,
                 self.config.base_url
             )
         })
@@ -221,6 +253,10 @@ impl ModelProvider for OpenAiProvider {
             model: &self.config.model,
             messages: chat_messages(&request),
             max_tokens: request.max_output_tokens,
+            reasoning_effort: reasoning_effort(
+                &self.config.model,
+                request.reasoning_effort.as_deref(),
+            ),
             tools: None,
             tool_choice: None,
         };
@@ -228,6 +264,7 @@ impl ModelProvider for OpenAiProvider {
         let reported = ReportedTokenUsage {
             input: raw.usage.as_ref().map(|u| u.prompt_tokens),
             output: raw.usage.as_ref().map(|u| u.completion_tokens),
+            cached_input: raw.usage.as_ref().and_then(|u| u.cached_tokens()),
         };
         let finish_reason = raw.choices.first().and_then(|c| c.finish_reason.clone());
         let text = raw
@@ -259,6 +296,10 @@ impl ModelProvider for OpenAiProvider {
             model: &self.config.model,
             messages: chat_messages(&request),
             max_tokens: request.max_output_tokens,
+            reasoning_effort: reasoning_effort(
+                &self.config.model,
+                request.reasoning_effort.as_deref(),
+            ),
             tools: Some(
                 tools
                     .iter()
@@ -278,6 +319,7 @@ impl ModelProvider for OpenAiProvider {
         let reported = ReportedTokenUsage {
             input: raw.usage.as_ref().map(|u| u.prompt_tokens),
             output: raw.usage.as_ref().map(|u| u.completion_tokens),
+            cached_input: raw.usage.as_ref().and_then(|u| u.cached_tokens()),
         };
         let finish_reason = raw.choices.first().and_then(|c| c.finish_reason.clone());
         let tool_call = raw
@@ -313,52 +355,52 @@ impl OpenAiProvider {
     ) -> anyhow::Result<OpenAiChatResponse> {
         let api_key = self.api_key()?;
         let url = format!("{}/chat/completions", self.config.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.config.timeout_secs))
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(self.config.timeout_secs)))
+            .http_status_as_error(false)
             .build();
-        let http_result = agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .set("Content-Type", "application/json")
-            .send_json(serde_json::to_value(&body)?);
-        match http_result {
-            Ok(http_response) => http_response
-                .into_json()
-                .map_err(|e| anyhow::anyhow!("invalid JSON from model API: {e}")),
-            Err(ureq::Error::Status(status, http_response)) => {
-                let snippet = http_response
-                    .into_string()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(256)
-                    .collect::<String>();
-                let reported = ReportedTokenUsage::default();
-                self.ledger.record(ModelCallRecord {
-                    purpose: request.purpose,
-                    estimated_tokens: request.estimated_tokens,
-                    reported_tokens: reported,
-                });
-                Err(anyhow::anyhow!(
-                    "model API returned HTTP {status} for {} ({}/{}): {snippet}",
-                    request.purpose,
-                    self.config.base_url,
-                    self.config.model
-                ))
-            }
-            Err(ureq::Error::Transport(transport)) => {
-                let reported = ReportedTokenUsage::default();
-                self.ledger.record(ModelCallRecord {
-                    purpose: request.purpose,
-                    estimated_tokens: request.estimated_tokens,
-                    reported_tokens: reported,
-                });
-                Err(anyhow::anyhow!(
-                    "transport error calling model API ({}/{}): {transport}",
-                    self.config.base_url,
-                    self.config.model
-                ))
-            }
+        let agent: ureq::Agent = config.into();
+        let mut request_builder = agent.post(&url).header("Content-Type", "application/json");
+        if let Some(api_key) = &api_key {
+            request_builder = request_builder.header("Authorization", &format!("Bearer {api_key}"));
         }
+        let mut http_response = request_builder
+            .send_json(serde_json::to_value(&body)?)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "transport error calling model API ({}/{}): {e}",
+                    self.config.base_url,
+                    self.config.model
+                )
+            })?;
+
+        if !http_response.status().is_success() {
+            let status = http_response.status().as_u16();
+            let snippet = http_response
+                .body_mut()
+                .read_to_string()
+                .unwrap_or_default()
+                .chars()
+                .take(256)
+                .collect::<String>();
+            let reported = ReportedTokenUsage::default();
+            self.ledger.record(ModelCallRecord {
+                purpose: request.purpose,
+                estimated_tokens: request.estimated_tokens,
+                reported_tokens: reported,
+            });
+            return Err(anyhow::anyhow!(
+                "model API returned HTTP {status} for {} ({}/{}): {snippet}",
+                request.purpose,
+                self.config.base_url,
+                self.config.model
+            ));
+        }
+
+        http_response
+            .body_mut()
+            .read_json::<OpenAiChatResponse>()
+            .map_err(|e| anyhow::anyhow!("invalid JSON from model API: {e}"))
     }
 }
 
@@ -367,6 +409,39 @@ pub struct ToolDefinition {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: serde_json::Value,
+}
+
+/// Fixed per-tool overhead (function-calling envelope: role/type framing
+/// around each tool that a raw schema dump doesn't capture) observed against
+/// reported provider usage. Calibrated, not exact — see `estimate_tool_tokens`.
+const TOOL_CALL_FRAMING_OVERHEAD: usize = 15;
+
+/// Rough token estimate for a tool schema. Local `estimated_tokens` figures
+/// were previously computed from prompt text alone, so any request using
+/// `complete_with_tools` silently under-counted input tokens by the size of
+/// the function name/description/parameters JSON the provider actually bills
+/// against the prompt. Adding this closes most of that gap.
+///
+/// The generic `estimate_tokens` chars/4 heuristic is calibrated for prose;
+/// JSON schemas are punctuation-dense (braces, quotes, colons all tokenize
+/// individually), so they use a lower chars/token divisor here. Both this
+/// divisor and `TOOL_CALL_FRAMING_OVERHEAD` are calibrated against observed
+/// `reported_input_tokens` vs `estimated_input_tokens` from eval runs; a
+/// fixed residual gap may still remain since real tokenizer boundaries
+/// aren't reproduced exactly.
+pub fn estimate_tool_tokens(tools: &[ToolDefinition]) -> usize {
+    const JSON_CHARS_PER_TOKEN: usize = 3;
+
+    tools
+        .iter()
+        .map(|tool| {
+            let params_bytes = serde_json::to_vec(&tool.parameters).unwrap_or_default();
+            crate::util::estimate_tokens(tool.name.as_bytes())
+                + crate::util::estimate_tokens(tool.description.as_bytes())
+                + (params_bytes.len() / JSON_CHARS_PER_TOKEN)
+                + TOOL_CALL_FRAMING_OVERHEAD
+        })
+        .sum()
 }
 
 /// Build the chat message list for a request, prepending the system/policy
@@ -387,6 +462,15 @@ fn chat_messages(request: &ModelRequest) -> Vec<OpenAiMessage<'_>> {
     messages
 }
 
+/// gpt-5 family and Claude models accept a `reasoning_effort` hint (litellm
+/// maps the tiers onto Claude's thinking-token budget); other OpenAI-compatible
+/// models reject unknown fields, so only forward it for models that support it.
+fn reasoning_effort<'a>(model: &str, requested: Option<&'a str>) -> Option<&'a str> {
+    let requested = requested?;
+    let supported = model.contains("gpt-5") || model.contains("claude");
+    supported.then_some(requested)
+}
+
 // ── OpenAI wire types (private) ──────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -395,6 +479,8 @@ struct OpenAiChatRequest<'a> {
     messages: Vec<OpenAiMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,6 +541,22 @@ struct OpenAiToolCallFunction {
 struct OpenAiUsage {
     prompt_tokens: usize,
     completion_tokens: usize,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+impl OpenAiUsage {
+    fn cached_tokens(&self) -> Option<usize> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<usize>,
 }
 
 /// Mock provider that returns pre-loaded responses and records every call in a
@@ -544,8 +646,33 @@ mod tests {
                 output: 12,
             },
             max_output_tokens: Some(64),
+            reasoning_effort: None,
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn api_key_is_none_when_unconfigured() {
+        let provider = OpenAiProvider::new(crate::config::ModelConfig {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5:7b-instruct".to_string(),
+            api_key_env_var: None,
+            api_key: None,
+            timeout_secs: 60,
+        });
+        assert_eq!(provider.api_key().unwrap(), None);
+    }
+
+    #[test]
+    fn api_key_prefers_explicit_key_over_env_var() {
+        let provider = OpenAiProvider::new(crate::config::ModelConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key_env_var: Some("HAYCUT_TEST_UNSET_ENV_VAR".to_string()),
+            api_key: Some("explicit-key".to_string()),
+            timeout_secs: 60,
+        });
+        assert_eq!(provider.api_key().unwrap(), Some("explicit-key".to_string()));
     }
 
     #[test]
@@ -597,6 +724,7 @@ mod tests {
                 output: 12,
             },
             max_output_tokens: Some(64),
+            reasoning_effort: None,
             metadata: BTreeMap::new(),
         };
         let response = ModelResponse {
@@ -604,6 +732,7 @@ mod tests {
             reported_tokens: ReportedTokenUsage {
                 input: Some(40),
                 output: Some(8),
+                ..Default::default()
             },
             finish_reason: Some("stop".to_string()),
             metadata: BTreeMap::new(),
@@ -635,6 +764,7 @@ mod tests {
                 reported_tokens: ReportedTokenUsage {
                     input: Some(10),
                     output: Some(4),
+                    ..Default::default()
                 },
                 finish_reason: Some("stop".to_string()),
                 metadata: BTreeMap::new(),

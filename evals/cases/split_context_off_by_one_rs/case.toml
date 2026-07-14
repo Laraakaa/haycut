@@ -1,0 +1,9 @@
+goal = "The test suite fails; find the cause and propose a minimal fix."
+verify = "cargo test"
+max_steps = 12
+
+[checks]
+max_tokens = 25000
+expected_markers = ["src/pricing.rs"]
+relevant_paths = ["src/pricing.rs", "src/cart.rs"]
+max_read_radius = 60
