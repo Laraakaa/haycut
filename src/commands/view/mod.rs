@@ -9,7 +9,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 pub mod model;
 mod sources;
 
-pub const DEFAULT_PORT: u16 = 8787;
+pub const DEFAULT_PORT: u16 = 4290;
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_JS: &str = include_str!("assets/app.js");
