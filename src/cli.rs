@@ -240,6 +240,17 @@ pub enum AgentCommand {
         #[arg(long, value_enum)]
         task: Option<TaskTarget>,
     },
+
+    /// Start an interactive terminal session driven by the engine control API
+    Session {
+        /// Use the current task
+        #[arg(long, value_enum)]
+        task: Option<TaskTarget>,
+
+        /// Task goal when not using --task current
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
+        goal: Vec<String>,
+    },
 }
 
 pub fn run() -> i32 {

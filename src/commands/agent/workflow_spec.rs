@@ -170,8 +170,10 @@ fn guard_for(op: NodeOp) -> Option<WorkflowGuard> {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::agent::AgentAction;
     use crate::commands::task::{
-        CurrentFailure, NextAction, ProjectCard, RouteEntry, TaskBudget, VerificationPlan,
+        CurrentFailure, ProjectCard, RouteEntry, TaskBudget, VerificationCheck,
+        VerificationCommand, VerificationPlan, VerificationScope,
     };
 
     use super::*;
@@ -194,6 +196,7 @@ mod tests {
             observations: Vec::new(),
             hypotheses: Vec::new(),
             next_actions: Vec::new(),
+            pending_agent_action: None,
             intent: None,
             current_failure: None,
             closed_at: None,
@@ -211,6 +214,11 @@ mod tests {
             available_context: Vec::new(),
             workflow_spec: None,
             workflow: Workflow::new(),
+            pending_interaction: None,
+            pending_approval: None,
+            messages: Vec::new(),
+            explicit_verify_commands: Vec::new(),
+            inspected_digests: Default::default(),
         }
     }
 
@@ -281,9 +289,15 @@ mod tests {
             }
             NodeOp::ResolveVerification => {
                 task.verification = Some(VerificationPlan {
-                    command: vec!["cargo".to_string(), "test".to_string()],
+                    checks: vec![VerificationCheck {
+                        command: VerificationCommand {
+                            program: "cargo".to_string(),
+                            args: vec!["test".to_string()],
+                        },
+                        required: true,
+                        scope: VerificationScope::FullProject,
+                    }],
                     expected_baseline_exit: (intent == TaskIntent::DebugFailure).then_some(101),
-                    expected_final_exit: 0,
                 });
             }
             NodeOp::ExtractEvidence => {
@@ -295,16 +309,18 @@ mod tests {
                 });
             }
             NodeOp::PlanContext => {
-                task.next_actions.push(NextAction {
-                    command: "haycut read-window src/lib.rs --line 42".to_string(),
-                    reason: "inspect".to_string(),
-                    expected_answer: "why it fails".to_string(),
-                    estimated_tokens: 500,
-                    hypothesis: None,
+                task.pending_agent_action = Some(AgentAction::ReadWindow {
+                    path: "src/lib.rs".into(),
+                    line: 42,
+                    radius: 20,
                 });
             }
             NodeOp::ReadContext => {
-                task.next_actions.clear();
+                // The single-pass compatibility route only lists one
+                // PlanContext/ReadContext pair, so the simulated planner
+                // decides to patch on this round trip; the real, iterative
+                // loop (see workflow.rs tests) can repeat this pair.
+                task.pending_agent_action = Some(AgentAction::PlanPatch);
             }
             NodeOp::PlanPatch => {
                 task.patch_text = Some("change expected value".to_string());

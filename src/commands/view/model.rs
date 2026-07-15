@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{
-    agent::workflow::Workflow,
+    agent::{
+        primitive::{self, ContextCategory, PrimitiveId, PrimitiveVersion},
+        workflow::Workflow,
+        workflow_spec::{WorkflowGuard, WorkflowSpec},
+    },
     eval::{CheckResult, Verdict},
     task::{RouteEntry, TaskState},
 };
-use crate::store::StoredAgentTrace;
+use crate::context::comparison::ContextCompilationComparison;
+use crate::store::{StoredAgentTrace, StoredRequestManifest};
 
 fn default_billed() -> bool {
     true
@@ -107,6 +112,163 @@ pub struct AvailableContextView {
     pub relevant: Option<bool>,
 }
 
+/// One node of the compiled workflow DAG for a task.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowNodeSpecView {
+    pub id: String,
+    pub primitive_id: PrimitiveId,
+    pub primitive_version: PrimitiveVersion,
+    pub dependencies: Vec<String>,
+    pub guard: Option<WorkflowGuard>,
+}
+
+/// The compiled `WorkflowSpec` for a task: entrypoints plus the DAG of nodes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowSpecView {
+    pub schema_version: u8,
+    pub compiler_version: String,
+    pub entrypoints: Vec<String>,
+    pub nodes: Vec<WorkflowNodeSpecView>,
+}
+
+impl From<&WorkflowSpec> for WorkflowSpecView {
+    fn from(spec: &WorkflowSpec) -> Self {
+        WorkflowSpecView {
+            schema_version: spec.schema_version,
+            compiler_version: spec.compiler_version.clone(),
+            entrypoints: spec.entrypoints.clone(),
+            nodes: spec
+                .nodes
+                .iter()
+                .map(|node| WorkflowNodeSpecView {
+                    id: node.id.clone(),
+                    primitive_id: node.primitive_id.clone(),
+                    primitive_version: node.primitive_version,
+                    dependencies: node.dependencies.clone(),
+                    guard: node.guard,
+                })
+                .collect()
+        }
+    }
+}
+
+/// Static, run-independent listing of one registered primitive, replacing
+/// the frontend's previously hardcoded executor/phase lookup table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrimitiveSpecView {
+    pub id: PrimitiveId,
+    pub version: PrimitiveVersion,
+    pub phase: String,
+    pub executor: crate::commands::agent::workflow::ExecutorKind,
+    pub required_context: Vec<ContextCategory>,
+    pub optional_context: Vec<ContextCategory>,
+}
+
+fn primitive_registry_view() -> Vec<PrimitiveSpecView> {
+    primitive::registry()
+        .iter()
+        .map(|entry| PrimitiveSpecView {
+            id: entry.spec.id.clone(),
+            version: entry.spec.version,
+            phase: entry.spec.phase.as_str().to_string(),
+            executor: entry.spec.executor,
+            required_context: entry.spec.required_context.clone(),
+            optional_context: entry.spec.optional_context.clone(),
+        })
+        .collect()
+}
+
+/// One typed context segment inside a request manifest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestManifestSegmentView {
+    pub segment_id: String,
+    pub position: i64,
+    pub role: String,
+    pub category: String,
+    pub representation: String,
+    pub producer_id: String,
+    pub producer_version: i64,
+    pub content_digest: String,
+    pub dependency_digests_json: String,
+    pub byte_size: i64,
+    pub estimated_tokens: i64,
+    pub cache_policy: String,
+}
+
+/// One prepared/completed LLM request manifest, with the shadow-mode
+/// legacy-vs-compiled comparison verdict when available.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestManifestView {
+    pub id: String,
+    pub step_index: i64,
+    pub node_id: Option<String>,
+    pub primitive_id: String,
+    pub primitive_version: i64,
+    pub phase: String,
+    pub model: String,
+    pub purpose: String,
+    pub status: String,
+    pub estimated_input_tokens: i64,
+    pub estimated_output_tokens: i64,
+    pub reported_input_tokens: Option<i64>,
+    pub reported_output_tokens: Option<i64>,
+    pub billed: bool,
+    pub error_summary: Option<String>,
+    pub latency_ms: Option<i64>,
+    pub prepared_at: String,
+    pub completed_at: Option<String>,
+    pub segments: Vec<RequestManifestSegmentView>,
+    pub comparison: Option<ContextCompilationComparison>,
+}
+
+impl From<StoredRequestManifest> for RequestManifestView {
+    fn from(manifest: StoredRequestManifest) -> Self {
+        let comparison = manifest
+            .comparison_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        RequestManifestView {
+            id: manifest.id,
+            step_index: manifest.step_index,
+            node_id: manifest.node_id,
+            primitive_id: manifest.primitive_id,
+            primitive_version: manifest.primitive_version,
+            phase: manifest.phase,
+            model: manifest.model,
+            purpose: manifest.purpose,
+            status: manifest.status,
+            estimated_input_tokens: manifest.estimated_input_tokens,
+            estimated_output_tokens: manifest.estimated_output_tokens,
+            reported_input_tokens: manifest.reported_input_tokens,
+            reported_output_tokens: manifest.reported_output_tokens,
+            billed: manifest.billed,
+            error_summary: manifest.error_summary,
+            latency_ms: manifest.latency_ms,
+            prepared_at: manifest.prepared_at,
+            completed_at: manifest.completed_at,
+            segments: manifest
+                .segments
+                .into_iter()
+                .map(|segment| RequestManifestSegmentView {
+                    segment_id: segment.segment_id,
+                    position: segment.position,
+                    role: segment.role,
+                    category: segment.category,
+                    representation: segment.representation,
+                    producer_id: segment.producer_id,
+                    producer_version: segment.producer_version,
+                    content_digest: segment.content_digest,
+                    dependency_digests_json: segment.dependency_digests_json,
+                    byte_size: segment.byte_size,
+                    estimated_tokens: segment.estimated_tokens,
+                    cache_policy: segment.cache_policy,
+                })
+                .collect(),
+            comparison,
+        }
+    }
+}
+
 /// Normalized view of one agent run, whether it came from an eval report.json
 /// or a live (or completed) task in the SQLite store.
 #[derive(Clone, Debug, Serialize)]
@@ -130,6 +292,9 @@ pub struct RunDetail {
     pub overall: Option<Verdict>,
     pub patch_text: Option<String>,
     pub available_context: Vec<AvailableContextView>,
+    pub workflow_spec: Option<WorkflowSpecView>,
+    pub manifests: Vec<RequestManifestView>,
+    pub primitives: Vec<PrimitiveSpecView>,
 }
 
 /// Deserialize mirror of the private `EvalReport` written by `haycut eval
@@ -192,6 +357,9 @@ impl EvalReportFile {
             overall: Some(self.overall),
             patch_text: self.patch_text,
             available_context: Vec::new(),
+            workflow_spec: None,
+            manifests: Vec::new(),
+            primitives: primitive_registry_view(),
         }
     }
 
@@ -224,6 +392,7 @@ pub fn task_to_detail(
     status: &str,
     task: &TaskState,
     traces: &[StoredAgentTrace],
+    manifests: Vec<StoredRequestManifest>,
 ) -> RunDetail {
     let steps: Vec<StepView> = traces.iter().map(trace_to_step).collect();
     let model_usage = aggregate_model_usage(&steps);
@@ -276,7 +445,13 @@ pub fn task_to_detail(
         verify: task
             .verification
             .as_ref()
-            .map(|plan| plan.command.join(" "))
+            .map(|plan| {
+                plan.checks
+                    .iter()
+                    .map(|check| check.command.display())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default(),
         max_steps: None,
         route: task.route.clone(),
@@ -302,6 +477,9 @@ pub fn task_to_detail(
         overall: None,
         patch_text: task.patch_text.clone(),
         available_context,
+        workflow_spec: task.workflow_spec.as_ref().map(WorkflowSpecView::from),
+        manifests: manifests.into_iter().map(RequestManifestView::from).collect(),
+        primitives: primitive_registry_view(),
     }
 }
 

@@ -37,6 +37,12 @@ pub struct TaskState {
     pub observations: Vec<Observation>,
     pub hypotheses: Vec<Hypothesis>,
     pub next_actions: Vec<NextAction>,
+    /// Typed action queued by the strong planner for `ReadContext` to execute
+    /// deterministically, or a terminal decision (`PlanPatch`/`AskUser`/
+    /// `Finish`) awaiting routing. Distinct from `next_actions`, which is the
+    /// heuristic evidence-derived suggestion queue surfaced by `task status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_agent_action: Option<crate::commands::agent::AgentAction>,
     /// Cheap-classifier verdict of what kind of work this task is. Set once on
     /// the first agent step and used to route deterministic shortcuts (e.g.
     /// reproduce-first for debug tasks).
@@ -98,6 +104,31 @@ pub struct TaskState {
     /// Self-writing DAG of nodes driving the agent state machine.
     #[serde(default)]
     pub workflow: crate::commands::agent::workflow::Workflow,
+
+    // Interactive engine session state (see `agent::engine`).
+    /// Question the workflow is blocked on, awaiting a user reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_interaction: Option<crate::commands::agent::engine::PendingInteraction>,
+    /// Proposed mutation awaiting explicit user approval or rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<crate::commands::agent::engine::ApprovalRequest>,
+    /// Durable transcript of user/agent messages exchanged in a session
+    /// (questions, replies, rejections, steering instructions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<crate::commands::agent::engine::TaskMessage>,
+    /// Raw user-supplied verification commands from `task start --verify`
+    /// (comma-separated) or the REPL's `verify <command>`, kept so
+    /// `execute_resolve_verification` can augment or override
+    /// project-detected defaults instead of only falling back to them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_verify_commands: Vec<String>,
+    /// Content digest recorded for each file the agent has read as context,
+    /// keyed by path relative to the project root. Used for optimistic
+    /// concurrency: a patch may apply to a pre-existing dirty file if its
+    /// current content still matches the digest recorded here, and is
+    /// refused as a recoverable conflict if it doesn't.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub inspected_digests: std::collections::HashMap<String, crate::commands::agent::patch::FileDigest>,
 }
 
 /// A candidate off-site symbol surfaced by deterministic call-stack follow.
@@ -128,23 +159,132 @@ pub struct ProjectCard {
     pub build_command: Option<String>,
 }
 
-/// Verification command plan with expected exit codes.
+/// A verification command to run, independent of any particular shell.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct VerificationPlan {
-    pub command: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_baseline_exit: Option<i32>,
-    pub expected_final_exit: i32,
+pub struct VerificationCommand {
+    pub program: String,
+    pub args: Vec<String>,
 }
 
-/// One structured, machine-appliable edit: replace the exact `find` text in
-/// `path` with `replace`. Deliberately minimal (no diff hunks/context lines)
-/// so the strong model can express a fix in a handful of tokens.
+impl VerificationCommand {
+    /// Parse a shell-word-split command string, e.g. `"cargo test"`.
+    pub fn parse(input: &str) -> Option<Self> {
+        let mut parts = input.split_whitespace();
+        let program = parts.next()?.to_string();
+        Some(VerificationCommand {
+            program,
+            args: parts.map(str::to_string).collect(),
+        })
+    }
+
+    pub fn as_vec(&self) -> Vec<String> {
+        std::iter::once(self.program.clone())
+            .chain(self.args.iter().cloned())
+            .collect()
+    }
+
+    pub fn display(&self) -> String {
+        self.as_vec().join(" ")
+    }
+}
+
+/// What part of the project a `VerificationCheck` is expected to exercise.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationScope {
+    #[default]
+    FullProject,
+    ChangedFilesOnly,
+    Targeted,
+}
+
+/// One verification check: a command to run, whether it must pass for the
+/// task to be considered done, and what part of the project it exercises.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PatchEdit {
-    pub path: String,
-    pub find: String,
-    pub replace: String,
+pub struct VerificationCheck {
+    pub command: VerificationCommand,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub scope: VerificationScope,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Structured, user-overridable verification plan: an ordered list of
+/// checks. Project detection seeds sensible defaults (`ResolveVerification`);
+/// explicit `--verify`/`verify <command>` input augments or overrides them
+/// rather than only being a fallback.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VerificationPlan {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<VerificationCheck>,
+    /// Exit code the *first required* check is expected to produce before
+    /// any fix is applied (e.g. 101 for a failing `cargo test` baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_baseline_exit: Option<i32>,
+}
+
+impl VerificationPlan {
+    /// The command baseline/legacy call sites should run: the first
+    /// required check if any, else the first check at all.
+    pub fn primary_command(&self) -> Option<&VerificationCommand> {
+        self.checks
+            .iter()
+            .find(|check| check.required)
+            .or_else(|| self.checks.first())
+            .map(|check| &check.command)
+    }
+}
+
+/// One structured, machine-appliable file operation. `Replace` keeps exact,
+/// single-occurrence anchor matching (cheap and safe); `Create`/`Delete`/
+/// `Rename` extend the vocabulary beyond in-place edits. `Delete`/`Rename`
+/// carry an `expected_digest` so they only apply against the file contents
+/// the agent actually inspected; `Replace` may optionally carry one too.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PatchEdit {
+    Replace {
+        path: String,
+        find: String,
+        replace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<crate::commands::agent::patch::FileDigest>,
+    },
+    Create {
+        path: String,
+        content: String,
+        /// Overwrite an existing file instead of failing. Must be explicitly
+        /// set; `Create` refuses to clobber an existing file by default.
+        #[serde(default)]
+        overwrite: bool,
+    },
+    Delete {
+        path: String,
+        expected_digest: crate::commands::agent::patch::FileDigest,
+    },
+    Rename {
+        from: String,
+        to: String,
+        expected_digest: crate::commands::agent::patch::FileDigest,
+    },
+}
+
+impl PatchEdit {
+    /// The file this edit primarily targets, for scope/display purposes.
+    /// `Rename` reports its source path, since that's what a failure's call
+    /// path would already reference.
+    pub fn primary_path(&self) -> &str {
+        match self {
+            PatchEdit::Replace { path, .. } => path,
+            PatchEdit::Create { path, .. } => path,
+            PatchEdit::Delete { path, .. } => path,
+            PatchEdit::Rename { from, .. } => from,
+        }
+    }
 }
 
 /// One entry in the agent route flight recorder.
@@ -351,6 +491,7 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         observations: Vec::new(),
         hypotheses: Vec::new(),
         next_actions: Vec::new(),
+        pending_agent_action: None,
         intent: None,
         current_failure: None,
         closed_at: None,
@@ -368,6 +509,21 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         available_context: Vec::new(),
         workflow_spec: None,
         workflow: crate::commands::agent::workflow::Workflow::new(),
+        pending_interaction: None,
+        pending_approval: None,
+        messages: Vec::new(),
+        explicit_verify_commands: verify
+            .as_deref()
+            .map(|commands| {
+                commands
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        inspected_digests: Default::default(),
     };
     task.workflow_spec =
         Some(crate::commands::agent::workflow_spec::compile_compatibility_spec(&task));

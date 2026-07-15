@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+use crate::commands::agent::AgentAction;
 use crate::commands::task::{CurrentFailure, TaskIntent, TaskState};
 
 /// Stable, monotonic node identifier ("n1", "n2", ...).
@@ -318,11 +319,27 @@ fn decide(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
         return Ok(NodeOp::SelectContext);
     }
 
-    if needs_more_context(task, policy) {
-        if task.next_actions.is_empty() {
-            return Ok(NodeOp::PlanContext);
+    if policy.patch_expected {
+        match &task.pending_agent_action {
+            None => return Ok(NodeOp::PlanContext),
+            Some(AgentAction::AskUser { .. }) => {
+                if !has_step(task, NodeOp::AskUser.name()) {
+                    return Ok(NodeOp::AskUser);
+                }
+                return Err(StopReason::Blocked);
+            }
+            Some(AgentAction::Finish) => {
+                if !has_step(task, NodeOp::Report.name()) {
+                    return Ok(NodeOp::Report);
+                }
+                return Err(StopReason::Blocked);
+            }
+            Some(AgentAction::PlanPatch) => {
+                // Fall through to the patch flow below — this is the only
+                // planner action that enters patch generation.
+            }
+            Some(_context_action) => return Ok(NodeOp::ReadContext),
         }
-        return Ok(NodeOp::ReadContext);
     }
 
     if policy.patch_expected {
@@ -456,31 +473,6 @@ fn resolve_retry(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopRea
     Err(StopReason::Blocked)
 }
 
-/// Whether the agent still needs more context before it can plan a patch or
-/// answer. Uses existing observations, hypotheses, and next_actions.
-fn needs_more_context(task: &TaskState, policy: IntentPolicy) -> bool {
-    if !policy.needs_repo {
-        return false;
-    }
-
-    if !policy.patch_expected {
-        return false;
-    }
-
-    if !task.next_actions.is_empty() {
-        return true;
-    }
-
-    if task.patch_text.is_none()
-        && !has_step(task, NodeOp::PlanContext.name())
-        && !has_step(task, NodeOp::ReadContext.name())
-    {
-        return true;
-    }
-
-    false
-}
-
 /// Normalised signature of a failure for loop detection.
 pub fn failure_signature(failure: &CurrentFailure) -> String {
     let mut hasher = DefaultHasher::new();
@@ -520,8 +512,23 @@ fn has_step(task: &TaskState, name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::commands::task::{
-        NextAction, ProjectCard, RouteEntry, TaskBudget, VerificationPlan,
+        ProjectCard, RouteEntry, TaskBudget, VerificationCheck, VerificationCommand,
+        VerificationPlan, VerificationScope,
     };
+
+    fn cargo_test_verification(expected_baseline_exit: Option<i32>) -> VerificationPlan {
+        VerificationPlan {
+            checks: vec![VerificationCheck {
+                command: VerificationCommand {
+                    program: "cargo".to_string(),
+                    args: vec!["test".to_string()],
+                },
+                required: true,
+                scope: VerificationScope::FullProject,
+            }],
+            expected_baseline_exit,
+        }
+    }
 
     fn empty_task() -> TaskState {
         TaskState {
@@ -541,6 +548,7 @@ mod tests {
             observations: Vec::new(),
             hypotheses: Vec::new(),
             next_actions: Vec::new(),
+            pending_agent_action: None,
             intent: None,
             current_failure: None,
             closed_at: None,
@@ -558,6 +566,11 @@ mod tests {
             available_context: Vec::new(),
             workflow_spec: None,
             workflow: Workflow::new(),
+            pending_interaction: None,
+            pending_approval: None,
+            messages: Vec::new(),
+            explicit_verify_commands: Vec::new(),
+            inspected_digests: Default::default(),
         }
     }
 
@@ -608,11 +621,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         assert!(matches!(
             decision(&task, 2),
             Decision::Ready(_, NodeOp::RunBaseline)
@@ -627,11 +636,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         assert!(matches!(
             decision(&task, 2),
@@ -647,11 +652,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
@@ -683,11 +684,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
@@ -695,17 +692,140 @@ mod tests {
             "assertion left 13 right 12",
         );
         push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
-        task.next_actions.push(NextAction {
-            command: "haycut read-window src/lib.rs --line 42".to_string(),
-            reason: "inspect".to_string(),
-            expected_answer: "why it fails".to_string(),
-            estimated_tokens: 500,
-            hypothesis: None,
+        task.pending_agent_action = Some(AgentAction::ReadWindow {
+            path: "src/lib.rs".into(),
+            line: 42,
+            radius: 20,
         });
         assert!(matches!(
             decision(&task, 2),
             Decision::Ready(_, NodeOp::ReadContext)
         ));
+    }
+
+    #[test]
+    fn debug_failure_loops_through_multiple_context_actions_before_patching() {
+        // Exit criteria: a task can perform at least two consecutive context
+        // actions before patch planning — readiness must come from an
+        // explicit planner decision, not from route-history bookkeeping.
+        let mut task = task_with_intent(TaskIntent::DebugFailure);
+        task.project = Some(ProjectCard {
+            language: "Rust".to_string(),
+            test_command: "cargo test".to_string(),
+            build_command: Some("cargo build".to_string()),
+        });
+        task.verification = Some(cargo_test_verification(Some(101)));
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
+        push_route(
+            &mut task,
+            NodeOp::ExtractEvidence,
+            "assertion left 13 right 12",
+        );
+        push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
+
+        // First round trip: PlanContext queues a context action.
+        push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
+        task.pending_agent_action = Some(AgentAction::ReadWindow {
+            path: "src/lib.rs".into(),
+            line: 42,
+            radius: 20,
+        });
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::ReadContext)
+        ));
+
+        // ReadContext consumes the action and clears it; the planner is
+        // consulted again rather than falling through to patch planning.
+        push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
+        task.pending_agent_action = None;
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::PlanContext)
+        ));
+
+        // Second round trip: another context action before the planner
+        // finally decides to patch.
+        push_route(&mut task, NodeOp::PlanContext, "read src/cart.rs");
+        task.pending_agent_action = Some(AgentAction::ReadSymbol {
+            target: "apply_bulk_discount".to_string(),
+        });
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::ReadContext)
+        ));
+
+        push_route(&mut task, NodeOp::ReadContext, "symbol apply_bulk_discount");
+        task.pending_agent_action = Some(AgentAction::PlanPatch);
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::PlanPatch)
+        ));
+    }
+
+    #[test]
+    fn debug_failure_ask_user_blocks_with_question_preserved() {
+        let mut task = task_with_intent(TaskIntent::DebugFailure);
+        task.project = Some(ProjectCard {
+            language: "Rust".to_string(),
+            test_command: "cargo test".to_string(),
+            build_command: Some("cargo build".to_string()),
+        });
+        task.verification = Some(cargo_test_verification(Some(101)));
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
+        push_route(
+            &mut task,
+            NodeOp::ExtractEvidence,
+            "assertion left 13 right 12",
+        );
+        push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
+        push_route(&mut task, NodeOp::PlanContext, "ask user");
+        task.pending_agent_action = Some(AgentAction::AskUser {
+            question: "Which behaviour is correct?".to_string(),
+        });
+
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::AskUser)
+        ));
+        assert_eq!(
+            task.pending_agent_action,
+            Some(AgentAction::AskUser {
+                question: "Which behaviour is correct?".to_string()
+            })
+        );
+
+        push_route(&mut task, NodeOp::AskUser, "ask user: Which behaviour is correct?");
+        assert_eq!(decision(&task, 2), Decision::Stop(StopReason::Blocked));
+    }
+
+    #[test]
+    fn debug_failure_finish_reports_without_patch() {
+        let mut task = task_with_intent(TaskIntent::DebugFailure);
+        task.project = Some(ProjectCard {
+            language: "Rust".to_string(),
+            test_command: "cargo test".to_string(),
+            build_command: Some("cargo build".to_string()),
+        });
+        task.verification = Some(cargo_test_verification(Some(101)));
+        push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
+        push_route(
+            &mut task,
+            NodeOp::ExtractEvidence,
+            "assertion left 13 right 12",
+        );
+        push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
+        push_route(&mut task, NodeOp::PlanContext, "finish");
+        task.pending_agent_action = Some(AgentAction::Finish);
+
+        assert!(matches!(
+            decision(&task, 2),
+            Decision::Ready(_, NodeOp::Report)
+        ));
+        assert!(task.patch_text.is_none());
+
+        push_route(&mut task, NodeOp::Report, "task complete");
+        assert_eq!(decision(&task, 2), Decision::Stop(StopReason::Blocked));
     }
 
     #[test]
@@ -716,11 +836,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
@@ -730,6 +846,7 @@ mod tests {
         push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
         push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
         push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
+        task.pending_agent_action = Some(AgentAction::PlanPatch);
         task.current_failure = Some(CurrentFailure {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
@@ -750,11 +867,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
@@ -764,6 +877,7 @@ mod tests {
         push_route(&mut task, NodeOp::PlanContext, "read src/lib.rs");
         push_route(&mut task, NodeOp::ReadContext, "window src/lib.rs:42");
         push_route(&mut task, NodeOp::PlanPatch, "change expected value");
+        task.pending_agent_action = Some(AgentAction::PlanPatch);
         task.patch_text = Some("change expected value".to_string());
         assert!(matches!(
             decision(&task, 2),
@@ -786,11 +900,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
         push_route(
             &mut task,
@@ -806,6 +916,7 @@ mod tests {
             NodeOp::RunFinalVerification,
             "final verification `cargo test` exited 0 (pass)",
         );
+        task.pending_agent_action = Some(AgentAction::PlanPatch);
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
         assert!(matches!(
@@ -846,11 +957,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         task.current_failure = Some(CurrentFailure {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
@@ -873,11 +980,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         task.current_failure = Some(CurrentFailure {
             kind: "test_failure".to_string(),
             summary: "new failure".to_string(),
@@ -904,11 +1007,7 @@ mod tests {
             test_command: "cargo test".to_string(),
             build_command: Some("cargo build".to_string()),
         });
-        task.verification = Some(VerificationPlan {
-            command: vec!["cargo".to_string(), "test".to_string()],
-            expected_baseline_exit: Some(101),
-            expected_final_exit: 0,
-        });
+        task.verification = Some(cargo_test_verification(Some(101)));
         task.current_failure = Some(CurrentFailure {
             kind: "test_failure".to_string(),
             summary: "new failure".to_string(),

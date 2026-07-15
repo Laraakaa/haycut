@@ -783,7 +783,7 @@ fn context_planner_tools_v1(capabilities: ToolProfileCapabilities) -> Vec<ToolDe
 fn patch_editor_tools_v1() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: "propose_edits",
-        description: "Minimal exact string edits that fix the failure. Each `find` must appear verbatim, and uniquely, in `path`.",
+        description: "Minimal file operations that fix the failure. `kind` selects the operation: `replace` (default) swaps exact, uniquely-occurring `find` text in `path` for `replace`; `create` writes a new file at `path` (set `overwrite` to replace an existing one); `delete` removes `path`; `rename` moves `from` to `to`. `delete`/`rename` require `expected_digest` (the digest of the file as last inspected) so the operation is refused if the file changed since.",
         parameters: serde_json::json!({
             "type": "object",
             "required": ["edits"],
@@ -794,12 +794,18 @@ fn patch_editor_tools_v1() -> Vec<ToolDefinition> {
                     "minItems": 1,
                     "items": {
                         "type": "object",
-                        "required": ["path", "find", "replace"],
+                        "required": ["kind"],
                         "additionalProperties": false,
                         "properties": {
-                            "path":    { "type": "string" },
-                            "find":    { "type": "string" },
-                            "replace": { "type": "string" }
+                            "kind":            { "type": "string", "enum": ["replace", "create", "delete", "rename"] },
+                            "path":            { "type": "string" },
+                            "find":            { "type": "string" },
+                            "replace":         { "type": "string" },
+                            "content":         { "type": "string" },
+                            "from":            { "type": "string" },
+                            "to":              { "type": "string" },
+                            "overwrite":       { "type": "boolean" },
+                            "expected_digest": { "type": "string" }
                         }
                     }
                 }

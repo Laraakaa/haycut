@@ -104,10 +104,12 @@ fn load_task_run(db_path: &Path, task_id: &str) -> io::Result<RunDetail> {
 
     let task = serde_json::from_str(&stored.task_json).map_err(io::Error::other)?;
     let traces = store::agent_traces_for_task(db_path, task_id)?;
+    let manifests = store::request_manifests_for_task(db_path, task_id)?;
     Ok(task_to_detail(
         format!("{TASK_PREFIX}{task_id}"),
         &stored.status,
         &task,
         &traces,
+        manifests,
     ))
 }

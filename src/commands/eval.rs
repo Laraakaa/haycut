@@ -1047,6 +1047,7 @@ mod tests {
             observations: Vec::new(),
             hypotheses: Vec::new(),
             next_actions: Vec::new(),
+            pending_agent_action: None,
             intent: None,
             current_failure: None,
             closed_at: None,
@@ -1064,6 +1065,11 @@ mod tests {
             available_context: Vec::new(),
             workflow_spec: None,
             workflow: crate::commands::agent::workflow::Workflow::new(),
+            pending_interaction: None,
+            pending_approval: None,
+            messages: Vec::new(),
+            explicit_verify_commands: Vec::new(),
+            inspected_digests: Default::default(),
         }
     }
 

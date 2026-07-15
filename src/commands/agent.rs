@@ -26,8 +26,11 @@ use crate::{
     util::{estimate_tokens, format_count},
 };
 
+pub mod command_policy;
+pub mod engine;
 pub mod patch;
 pub mod primitive;
+pub mod session;
 pub mod workflow;
 pub mod workflow_spec;
 use workflow::{Decision, NodeOp};
@@ -60,6 +63,7 @@ pub fn run(command: AgentCommand) -> i32 {
         } => run_loop(task, goal.join(" "), max_steps, apply),
         AgentCommand::Step { task } => run_step(task),
         AgentCommand::Trace { task } => run_trace(task),
+        AgentCommand::Session { task, goal } => session::run(task, goal.join(" ")),
     }
 }
 
@@ -120,6 +124,27 @@ pub struct ActionArgs {
     pub question: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
+}
+
+/// Typed action threaded from planner output through to deterministic
+/// execution, without ever being serialized into a shell-like command string
+/// and re-parsed (the source of quoting bugs and impossible "unrecognised
+/// queued action" states). A single `AgentAction` covers both the
+/// context-gathering actions `ReadContext` executes and the terminal
+/// decisions (`PlanPatch`/`AskUser`/`Finish`) that route the workflow
+/// elsewhere; `PlanContext` sets whichever kind the planner chose, and only
+/// context-gathering variants are ever consumed by `ReadContext`.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AgentAction {
+    Search { query: String },
+    ReadSymbol { target: String },
+    ReadWindow { path: PathBuf, line: usize, radius: usize },
+    RunCommand { program: String, args: Vec<String> },
+    PullContext { id: String },
+    PlanPatch,
+    AskUser { question: String },
+    Finish,
 }
 
 #[derive(Debug)]
@@ -535,49 +560,88 @@ fn execute_detect_project(task: &mut task::TaskState) -> io::Result<StepResult> 
     })
 }
 
+/// Build the structured verification plan for this task: explicit
+/// `--verify`/`verify <command>` input becomes required, full-project
+/// checks that always run; the project-detected test command is added too
+/// (as required, unless the user already supplied their own commands, in
+/// which case it's kept as an optional check so user intent still wins
+/// without silently dropping the project default).
 fn execute_resolve_verification(task: &mut task::TaskState) -> io::Result<StepResult> {
-    let Some(project) = task.project.clone() else {
+    let mut checks = Vec::new();
+    let has_explicit = !task.explicit_verify_commands.is_empty();
+
+    for raw in &task.explicit_verify_commands {
+        if let Some(command) = task::VerificationCommand::parse(raw) {
+            checks.push(task::VerificationCheck {
+                command,
+                required: true,
+                scope: task::VerificationScope::FullProject,
+            });
+        }
+    }
+
+    let project = task.project.clone();
+    if let Some(project) = &project
+        && let Some(command) = task::VerificationCommand::parse(&project.test_command)
+    {
+        checks.push(task::VerificationCheck {
+            command,
+            required: !has_explicit,
+            scope: task::VerificationScope::FullProject,
+        });
+    }
+
+    if checks.is_empty() {
         return Ok(StepResult {
-            summary: "no project detected; cannot resolve verification".to_string(),
+            summary: "no verification checks resolved (no project detected and no --verify given)"
+                .to_string(),
             terminal: false,
         });
-    };
+    }
 
-    let command: Vec<String> = project
-        .test_command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
     let expected_baseline_exit = match task.intent {
         Some(task::TaskIntent::DebugFailure) => Some(101),
         _ => None,
     };
 
+    let summary = format!(
+        "verification plan: {}",
+        checks
+            .iter()
+            .map(|check| format!(
+                "{}{}",
+                check.command.display(),
+                if check.required { "" } else { " (optional)" }
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     task.verification = Some(task::VerificationPlan {
-        command: command.clone(),
+        checks,
         expected_baseline_exit,
-        expected_final_exit: 0,
     });
 
     Ok(StepResult {
-        summary: format!("verification plan: `{}`", project.test_command),
+        summary,
         terminal: false,
     })
 }
 
 fn execute_run_baseline(task: &mut task::TaskState) -> io::Result<StepResult> {
-    let Some(plan) = task.verification.clone() else {
+    let Some(command) = task.verification.as_ref().and_then(|plan| plan.primary_command().cloned())
+    else {
         return Ok(StepResult {
             summary: "no verification plan".to_string(),
             terminal: false,
         });
     };
 
-    let exit_code = trace::run(plan.command.clone(), None, Some(TaskTarget::Current));
+    let exit_code = trace::run(command.as_vec(), None, Some(TaskTarget::Current));
     // trace::run persists evidence via attach_current_run; reload to see it.
     *task = task::load_current()?;
 
-    let summary = format!("baseline `{}` exited {exit_code}", plan.command.join(" "));
+    let summary = format!("baseline `{}` exited {exit_code}", command.display());
     Ok(StepResult {
         summary,
         terminal: false,
@@ -1012,12 +1076,10 @@ fn execute_plan_context(task: &mut task::TaskState, step_index: usize) -> io::Re
     let action = action_from_tool_call(&tool_name, args_value)?;
     validate_action(&action, task)?;
 
-    // Convert the planner action into queued next_actions so ReadContext can
-    // execute them deterministically.
-    if action.action != ActionKind::Finish && action.action != ActionKind::AskUser {
-        task.next_actions
-            .push(planner_action_to_next_action(&action));
-    }
+    // Thread the planner's decision through as a typed AgentAction — never a
+    // stringified command re-parsed later — so ReadContext (or the workflow
+    // decision, for terminal actions) can act on it deterministically.
+    task.pending_agent_action = Some(agent_action_from_planner_action(&action));
 
     let cost = estimated.input + response.reported_tokens.output.unwrap_or(estimated.output);
     task.budget.packet_tokens_used = task.budget.packet_tokens_used.saturating_add(cost);
@@ -1052,18 +1114,38 @@ fn execute_plan_context(task: &mut task::TaskState, step_index: usize) -> io::Re
 }
 
 fn execute_read_context(task: &mut task::TaskState) -> io::Result<StepResult> {
-    let Some(action) = task.next_actions.first().cloned() else {
+    let Some(action) = task.pending_agent_action.clone() else {
         return Ok(StepResult {
             summary: "no queued context action".to_string(),
             terminal: false,
         });
     };
 
-    if let Some(id) = action.command.strip_prefix("haycut pull-context ") {
-        return execute_pull_context(task, id.trim());
+    if let AgentAction::PullContext { id } = &action {
+        task.pending_agent_action = None;
+        return execute_pull_context(task, id);
     }
 
-    let observation = execute_next_action(&action)?;
+    let observation = match &action {
+        AgentAction::Search { query } => execute_search(query)?,
+        AgentAction::ReadSymbol { target } => execute_read_symbol(task, target)?,
+        AgentAction::ReadWindow { path, line, radius } => {
+            execute_read_window(task, &path.to_string_lossy(), *line, *radius)?
+        }
+        AgentAction::RunCommand { program, args } => execute_run_command(task, program, args)?,
+        // PlanPatch/AskUser/Finish are terminal decisions the workflow routes
+        // away from ReadContext (see `decide()`); reaching here indicates a
+        // routing bug rather than a normal outcome.
+        AgentAction::PullContext { .. } => unreachable!("handled above"),
+        AgentAction::PlanPatch | AgentAction::AskUser { .. } | AgentAction::Finish => {
+            task.pending_agent_action = None;
+            return Ok(StepResult {
+                summary: "no-op: terminal action reached read_context".to_string(),
+                terminal: false,
+            });
+        }
+    };
+
     task.observations.push(task::Observation {
         id: format!("obs{}", task.observations.len() + 1),
         source: "agent:read_context".to_string(),
@@ -1075,7 +1157,7 @@ fn execute_read_context(task: &mut task::TaskState) -> io::Result<StepResult> {
             packet: estimate_tokens(observation.as_bytes()),
         },
     });
-    task.next_actions.remove(0);
+    task.pending_agent_action = None;
 
     Ok(StepResult {
         summary: observation,
@@ -1088,8 +1170,6 @@ fn execute_read_context(task: &mut task::TaskState) -> io::Result<StepResult> {
 /// `available_context`. No re-scan, no model — the body was already read
 /// during `execute_select_context`.
 fn execute_pull_context(task: &mut task::TaskState, id: &str) -> io::Result<StepResult> {
-    task.next_actions.remove(0);
-
     let Some(index) = task
         .available_context
         .iter()
@@ -1232,36 +1312,86 @@ fn patch_edits_from_tool_call(
             )
         })?;
 
-    Ok(edits
-        .iter()
-        .map(|edit| task::PatchEdit {
-            path: edit
-                .get("path")
+    edits.iter().map(patch_edit_from_json).collect()
+}
+
+fn patch_edit_from_json(edit: &serde_json::Value) -> io::Result<task::PatchEdit> {
+    let str_field = |name: &str| {
+        edit.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let digest_field = |name: &str| -> io::Result<patch::FileDigest> {
+        edit.get(name)
+            .and_then(|v| v.as_str())
+            .map(|value| patch::FileDigest(value.to_string()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("propose_edits: `{name}` is required for this edit kind"),
+                )
+            })
+    };
+    // Default to `replace` so the flat legacy shape (no `kind`) still maps.
+    let kind = edit.get("kind").and_then(|v| v.as_str()).unwrap_or("replace");
+
+    Ok(match kind {
+        "replace" => task::PatchEdit::Replace {
+            path: str_field("path"),
+            find: str_field("find"),
+            replace: str_field("replace"),
+            expected_digest: edit
+                .get("expected_digest")
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            find: edit
-                .get("find")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            replace: edit
-                .get("replace")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        })
-        .collect())
+                .map(|value| patch::FileDigest(value.to_string())),
+        },
+        "create" => task::PatchEdit::Create {
+            path: str_field("path"),
+            content: str_field("content"),
+            overwrite: edit.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
+        "delete" => task::PatchEdit::Delete {
+            path: str_field("path"),
+            expected_digest: digest_field("expected_digest")?,
+        },
+        "rename" => task::PatchEdit::Rename {
+            from: str_field("from"),
+            to: str_field("to"),
+            expected_digest: digest_field("expected_digest")?,
+        },
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("propose_edits: unknown edit kind `{other}`"),
+            ));
+        }
+    })
 }
 
 /// Render structured edits into the compact, human/eval-facing `patch_text`.
+/// Every edit kind is rendered so patch approval displays all planned file
+/// operations, not just replacements.
 fn render_patch_edits(edits: &[task::PatchEdit]) -> String {
     if edits.is_empty() {
         return "no edits proposed".to_string();
     }
     edits
         .iter()
-        .map(|edit| format!("{}: \"{}\" -> \"{}\"", edit.path, edit.find, edit.replace))
+        .map(|edit| match edit {
+            task::PatchEdit::Replace { path, find, replace, .. } => {
+                format!("replace {path}: \"{find}\" -> \"{replace}\"")
+            }
+            task::PatchEdit::Create { path, overwrite, .. } => {
+                if *overwrite {
+                    format!("create {path} (overwrite)")
+                } else {
+                    format!("create {path}")
+                }
+            }
+            task::PatchEdit::Delete { path, .. } => format!("delete {path}"),
+            task::PatchEdit::Rename { from, to, .. } => format!("rename {from} -> {to}"),
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1289,16 +1419,49 @@ fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
         });
     }
 
-    let summary = match task.patch_edits.as_deref() {
+    let root = patch::project_root()?;
+    let outcome = match task.patch_edits.as_deref() {
         Some(edits) if !edits.is_empty() && task.apply_requested => {
-            patch::apply_edits(&patch::project_root()?, edits)?
+            match patch::apply_edits(&root, edits, &task.inspected_digests) {
+                Ok(summary) => Ok(summary),
+                Err(error) if patch::is_conflict(&error) => Err(error),
+                Err(error) => return Err(error),
+            }
         }
         Some(edits) if !edits.is_empty() => {
-            let preview = patch::preview_edits(&patch::project_root()?, edits)?;
-            format!("preview only; rerun with --apply to write:\n{preview}")
+            match patch::preview_edits(&root, edits, &task.inspected_digests) {
+                Ok(preview) => Ok(format!("preview only; rerun with --apply to write:\n{preview}")),
+                Err(error) if patch::is_conflict(&error) => Err(error),
+                Err(error) => return Err(error),
+            }
         }
-        _ => "no edits to apply".to_string(),
+        _ => Ok("no edits to apply".to_string()),
     };
+
+    // Working-tree ownership conflicts (a file changed after the agent
+    // inspected it) are recoverable: report them as a planner observation
+    // and return to planning instead of failing the whole task.
+    let summary = match outcome {
+        Ok(summary) => summary,
+        Err(conflict) => {
+            let reason = conflict.to_string();
+            task.observations.push(task::Observation {
+                id: format!("obs{}", task.observations.len() + 1),
+                source: "policy:working_tree_conflict".to_string(),
+                kind: "working_tree_conflict".to_string(),
+                summary: reason.clone(),
+                locations: Vec::new(),
+                tokens: task::ObservationTokens { raw: 0, packet: 0 },
+            });
+            task.patch_text = None;
+            task.patch_edits = None;
+            return Ok(StepResult {
+                summary: format!("patch conflict: {reason}"),
+                terminal: false,
+            });
+        }
+    };
+
     task.patch_applied = task.apply_requested && !summary.starts_with("no edits");
     task.patch_previewed = !task.apply_requested && !summary.starts_with("no edits");
     Ok(StepResult {
@@ -1338,7 +1501,7 @@ fn patch_scope_violation(task: &task::TaskState) -> Option<String> {
         return None;
     }
     let touched: std::collections::BTreeSet<&str> =
-        edits.iter().map(|edit| edit.path.as_str()).collect();
+        edits.iter().map(|edit| edit.primary_path()).collect();
 
     if touched.is_disjoint(&helper_files) {
         Some(format!(
@@ -1351,6 +1514,10 @@ fn patch_scope_violation(task: &task::TaskState) -> Option<String> {
     }
 }
 
+/// Run every check in the resolved verification plan, in order, and report
+/// required and optional outcomes separately so the final report/approval
+/// can distinguish a broken required check (task not actually done) from a
+/// failing optional one (worth a note, not a blocker).
 fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<StepResult> {
     let Some(plan) = task.verification.clone() else {
         return Ok(StepResult {
@@ -1358,16 +1525,34 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
             terminal: false,
         });
     };
+    if plan.checks.is_empty() {
+        return Ok(StepResult {
+            summary: "no verification checks to run".to_string(),
+            terminal: false,
+        });
+    }
 
-    let exit_code = trace::run(plan.command.clone(), None, Some(TaskTarget::Current));
-    *task = task::load_current()?;
+    let mut required_failures = Vec::new();
+    let mut lines = Vec::with_capacity(plan.checks.len());
 
-    let passed = exit_code == plan.expected_final_exit;
-    let summary = format!(
-        "final verification `{}` exited {exit_code} ({})",
-        plan.command.join(" "),
-        if passed { "pass" } else { "fail" }
-    );
+    for check in &plan.checks {
+        let exit_code = trace::run(check.command.as_vec(), None, Some(TaskTarget::Current));
+        *task = task::load_current()?;
+
+        let passed = exit_code == 0;
+        let label = if check.required { "required" } else { "optional" };
+        lines.push(format!(
+            "{label} `{}` exited {exit_code} ({})",
+            check.command.display(),
+            if passed { "pass" } else { "fail" }
+        ));
+        if !passed && check.required {
+            required_failures.push(check.command.display());
+        }
+    }
+
+    let overall = if required_failures.is_empty() { "pass" } else { "fail" };
+    let summary = format!("final verification ({overall}): {}", lines.join("; "));
 
     Ok(StepResult {
         summary,
@@ -1385,6 +1570,7 @@ fn execute_retry_fix(task: &mut task::TaskState) -> io::Result<StepResult> {
     task.patch_edits = None;
     task.patch_applied = false;
     task.next_actions.clear();
+    task.pending_agent_action = None;
 
     Ok(StepResult {
         summary: format!("retry fix attempt {}", task.retry_count),
@@ -1392,9 +1578,13 @@ fn execute_retry_fix(task: &mut task::TaskState) -> io::Result<StepResult> {
     })
 }
 
-fn execute_ask_user(_task: &mut task::TaskState) -> io::Result<StepResult> {
+fn execute_ask_user(task: &mut task::TaskState) -> io::Result<StepResult> {
+    let summary = match &task.pending_agent_action {
+        Some(AgentAction::AskUser { question }) => format!("ask user: {question}"),
+        _ => "ask user".to_string(),
+    };
     Ok(StepResult {
-        summary: "ask user".to_string(),
+        summary,
         terminal: true,
     })
 }
@@ -2074,99 +2264,89 @@ fn compact_observation(summary: &str) -> String {
         .join("\n")
 }
 
-/// Convert a planner action into a queued NextAction for deterministic execution.
-fn planner_action_to_next_action(action: &PlannerAction) -> task::NextAction {
-    let command = match action.action {
-        ActionKind::Search => format!(
-            "haycut search {}",
-            action.args.query.as_deref().unwrap_or("")
-        ),
-        ActionKind::ReadSymbol => format!(
-            "haycut read-symbol {}",
-            action.args.symbol.as_deref().unwrap_or("")
-        ),
-        ActionKind::ReadWindow => format!(
-            "haycut read-window {} --line {} --radius {}",
-            action.args.file.as_deref().unwrap_or(""),
-            action.args.line.unwrap_or(1),
-            action.args.radius.unwrap_or(read_window::DEFAULT_RADIUS)
-        ),
-        ActionKind::Trace => {
-            let mut parts = vec![action.args.command.clone().unwrap_or_default()];
-            parts.extend(action.args.args.clone());
-            format!("haycut trace {}", parts.join(" "))
-        }
-        ActionKind::PullContext => format!(
-            "haycut pull-context {}",
-            action.args.id.as_deref().unwrap_or("")
-        ),
-        _ => "haycut agent step".to_string(),
-    };
-
-    task::NextAction {
-        command,
-        reason: action.reason.clone(),
-        expected_answer: "context needed for patch plan".to_string(),
-        estimated_tokens: 500,
-        hypothesis: None,
+/// Convert a planner action into the typed `AgentAction` threaded through the
+/// workflow — no intermediate command string, so paths with spaces and
+/// command arguments containing quotes are represented correctly.
+fn agent_action_from_planner_action(action: &PlannerAction) -> AgentAction {
+    match action.action {
+        ActionKind::Search => AgentAction::Search {
+            query: action.args.query.clone().unwrap_or_default(),
+        },
+        ActionKind::ReadSymbol => AgentAction::ReadSymbol {
+            target: action.args.symbol.clone().unwrap_or_default(),
+        },
+        ActionKind::ReadWindow => AgentAction::ReadWindow {
+            path: PathBuf::from(action.args.file.clone().unwrap_or_default()),
+            line: action.args.line.unwrap_or(1),
+            radius: action.args.radius.unwrap_or(read_window::DEFAULT_RADIUS),
+        },
+        ActionKind::Trace => AgentAction::RunCommand {
+            program: action.args.command.clone().unwrap_or_default(),
+            args: action.args.args.clone(),
+        },
+        ActionKind::PullContext => AgentAction::PullContext {
+            id: action.args.id.clone().unwrap_or_default(),
+        },
+        ActionKind::ProposePatchPlan => AgentAction::PlanPatch,
+        ActionKind::Finish => AgentAction::Finish,
+        ActionKind::AskUser => AgentAction::AskUser {
+            question: action.args.question.clone().unwrap_or_default(),
+        },
     }
 }
 
-/// Execute a queued NextAction command string deterministically.
-fn execute_next_action(action: &task::NextAction) -> io::Result<String> {
-    let parts: Vec<&str> = action.command.split_whitespace().collect();
-    let Some(("haycut", subcommand, args)) = parts
-        .split_first()
-        .and_then(|(first, rest)| rest.split_first().map(|(sub, args)| (*first, *sub, args)))
-    else {
-        return Ok(format!("unrecognised queued action: {}", action.command));
+/// Run an arbitrary command the planner asked to `trace`, gated by command
+/// risk policy (Phase 7 of `plan_3_safety_and_execution.md`): low-risk
+/// commands (tests, builds, read-only Git, ...) auto-run under a timeout;
+/// medium-risk commands (package installs, codegen, commands that touch
+/// tracked files, ...) require the same `--apply` authorization a patch
+/// write needs; high-risk commands (destructive filesystem/Git ops, network
+/// publishing, credential access) are denied outright. Denials and
+/// approval-required commands are never executed — they come back as a
+/// planner-visible observation describing why, not a hard error.
+fn execute_run_command(task: &task::TaskState, program: &str, args: &[String]) -> io::Result<String> {
+    let risk = command_policy::classify(program, args);
+    let command_display = format!("{program} {}", args.join(" "));
+
+    if risk == command_policy::RiskTier::High {
+        return Ok(format!(
+            "command policy: denied `{}` — classified high risk (destructive or credential-sensitive); not executed",
+            command_display.trim()
+        ));
+    }
+    if risk == command_policy::RiskTier::Medium && !task.apply_requested {
+        return Ok(format!(
+            "command policy: `{}` classified medium risk and requires approval; rerun the agent with --apply to authorize, or run it manually",
+            command_display.trim()
+        ));
+    }
+
+    let cwd = patch::project_root().unwrap_or_else(|_| PathBuf::from("."));
+    let timeout = command_policy::timeout_for(risk);
+    let outcome = command_policy::run_with_timeout(program, args, &cwd, timeout)?;
+    let approved = match risk {
+        command_policy::RiskTier::Low => "auto (low risk)",
+        command_policy::RiskTier::Medium => "user (--apply)",
+        command_policy::RiskTier::High => unreachable!("high risk denied above"),
+    };
+    let timeout_note = if outcome.timed_out {
+        format!(" [timed out after {}ms, process killed]", timeout.as_millis())
+    } else {
+        String::new()
     };
 
-    match subcommand {
-        "search" => execute_search(args.join(" ").as_str()),
-        "read-symbol" => execute_read_symbol(args.join(" ").as_str()),
-        "read-window" => parse_read_window_args(args),
-        "trace" => {
-            let action = PlannerAction {
-                action: ActionKind::Trace,
-                args: ActionArgs {
-                    command: Some(args.join(" ")),
-                    ..Default::default()
-                },
-                reason: action.reason.clone(),
-            };
-            execute_trace(&action)
-        }
-        _ => Ok(format!("unrecognised subcommand `{subcommand}`")),
-    }
-}
-
-fn parse_read_window_args(args: &[&str]) -> io::Result<String> {
-    let mut file: Option<String> = None;
-    let mut line: Option<usize> = None;
-    let mut radius: Option<usize> = None;
-
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if *arg == "--line" {
-            if let Some(value) = iter.next() {
-                line = value.parse().ok();
-            }
-        } else if *arg == "--radius" {
-            if let Some(value) = iter.next() {
-                radius = value.parse().ok();
-            }
-        } else if file.is_none() {
-            file = Some(arg.to_string());
-        }
-    }
-
-    let file = file.unwrap_or_default();
-    execute_read_window(
-        &file,
-        line.unwrap_or(1),
-        radius.unwrap_or(read_window::DEFAULT_RADIUS),
-    )
+    Ok(format!(
+        "ran `{}` in {} — exit={} duration={}ms approved={approved}{timeout_note}\nstdout: {}\nstderr: {}",
+        command_display.trim(),
+        cwd.display(),
+        outcome
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        outcome.duration.as_millis(),
+        truncate(&outcome.stdout, 400),
+        truncate(&outcome.stderr, 400),
+    ))
 }
 
 /// A deterministic, cheap description of the project's toolchain. HayCut
@@ -2339,7 +2519,7 @@ fn execute_search(query: &str) -> io::Result<String> {
     Ok(output)
 }
 
-fn execute_read_symbol(symbol: &str) -> io::Result<String> {
+fn execute_read_symbol(task: &mut task::TaskState, symbol: &str) -> io::Result<String> {
     let root = patch::project_root()?;
     let target = if let Some((path, name)) = symbol.rsplit_once("::") {
         let (_, relative_path) = patch::resolve_existing_path(&root, path)?;
@@ -2348,6 +2528,7 @@ fn execute_read_symbol(symbol: &str) -> io::Result<String> {
         symbol.to_string()
     };
     let item = read_symbol::read_symbol(&root, &target)?;
+    record_inspected_digest(task, &root, Path::new(&item.path));
     Ok(format!(
         "read_symbol `{}` -> {} lines {}-{} ({} tokens)\n{}",
         symbol,
@@ -2359,19 +2540,29 @@ fn execute_read_symbol(symbol: &str) -> io::Result<String> {
     ))
 }
 
-fn execute_read_window(file: &str, line: usize, radius: usize) -> io::Result<String> {
+fn execute_read_window(
+    task: &mut task::TaskState,
+    file: &str,
+    line: usize,
+    radius: usize,
+) -> io::Result<String> {
     let root = patch::project_root()?;
-    let (path, _) = patch::resolve_existing_path(&root, file)?;
+    let (path, relative_path) = patch::resolve_existing_path(&root, file)?;
+    record_inspected_digest(task, &root, &relative_path);
     let window = read_window::read_window(path, line, radius, false)?;
     Ok(truncate(&window.render(), 2_000))
 }
 
-fn execute_trace(action: &PlannerAction) -> io::Result<String> {
-    let mut command = Vec::new();
-    command.push(action.args.command.clone().unwrap_or_default());
-    command.extend(action.args.args.clone());
-    let exit_code = trace::run(command, None, Some(TaskTarget::Current));
-    Ok(format!("trace exited with code {exit_code}"))
+/// Record the current content digest of `path` (relative to the project
+/// root) on `task.inspected_digests`, so a later patch attempt can tell
+/// "dirty before we looked" apart from "changed after we looked" per the
+/// working-tree ownership contract in `plan_3_safety_and_execution.md`.
+/// Best-effort: a digest failure never fails the read itself.
+fn record_inspected_digest(task: &mut task::TaskState, root: &Path, relative_path: &Path) {
+    if let Ok(Some(digest)) = patch::digest_file(&root.join(relative_path)) {
+        task.inspected_digests
+            .insert(relative_path.to_string_lossy().to_string(), digest);
+    }
 }
 
 fn require_text(value: Option<&str>, field: &str) -> io::Result<()> {
@@ -2457,6 +2648,7 @@ mod tests {
                 status: "open".to_string(),
             }],
             next_actions: Vec::new(),
+            pending_agent_action: None,
             intent: None,
             current_failure: Some(task::CurrentFailure {
                 kind: "test_failure".to_string(),
@@ -2483,6 +2675,11 @@ mod tests {
             available_context: Vec::new(),
             workflow_spec: None,
             workflow: workflow::Workflow::new(),
+            pending_interaction: None,
+            pending_approval: None,
+            messages: Vec::new(),
+            explicit_verify_commands: Vec::new(),
+            inspected_digests: Default::default(),
         }
     }
 
@@ -2844,6 +3041,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_action_preserves_paths_with_spaces_and_quoted_command_args() {
+        // The old bridge stringified the action into a `haycut ...` command
+        // and re-split it on whitespace, corrupting paths with spaces and
+        // arguments containing quotes. The typed AgentAction must round-trip
+        // these verbatim.
+        let read_window = PlannerAction {
+            action: ActionKind::ReadWindow,
+            args: ActionArgs {
+                file: Some("src/my dir/has spaces.rs".to_string()),
+                line: Some(10),
+                radius: Some(5),
+                ..Default::default()
+            },
+            reason: "inspect".to_string(),
+        };
+        assert_eq!(
+            agent_action_from_planner_action(&read_window),
+            AgentAction::ReadWindow {
+                path: PathBuf::from("src/my dir/has spaces.rs"),
+                line: 10,
+                radius: 5,
+            }
+        );
+
+        let trace = PlannerAction {
+            action: ActionKind::Trace,
+            args: ActionArgs {
+                command: Some("echo".to_string()),
+                args: vec!["say \"hello world\"".to_string(), "a b".to_string()],
+                ..Default::default()
+            },
+            reason: "run".to_string(),
+        };
+        assert_eq!(
+            agent_action_from_planner_action(&trace),
+            AgentAction::RunCommand {
+                program: "echo".to_string(),
+                args: vec!["say \"hello world\"".to_string(), "a b".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn rejects_missing_read_symbol_argument() {
         let action = PlannerAction {
             action: ActionKind::ReadSymbol,
@@ -2872,13 +3112,6 @@ mod tests {
     fn pull_context_injects_body_and_clears_candidate() {
         let mut task = task_fixture();
         task.available_context.push(available_context_fixture());
-        task.next_actions.push(task::NextAction {
-            command: "haycut pull-context c1".to_string(),
-            reason: "looks relevant".to_string(),
-            expected_answer: String::new(),
-            estimated_tokens: 0,
-            hypothesis: None,
-        });
 
         let result = execute_pull_context(&mut task, "c1").unwrap();
 
@@ -2896,13 +3129,6 @@ mod tests {
     #[test]
     fn pull_context_unknown_id_leaves_state_unchanged() {
         let mut task = task_fixture();
-        task.next_actions.push(task::NextAction {
-            command: "haycut pull-context missing".to_string(),
-            reason: "no such candidate".to_string(),
-            expected_answer: String::new(),
-            estimated_tokens: 0,
-            hypothesis: None,
-        });
 
         let result = execute_pull_context(&mut task, "missing").unwrap();
 
@@ -2926,10 +3152,11 @@ mod tests {
     #[test]
     fn patch_scope_violation_fires_only_for_relevant_unpulled_candidates() {
         let mut task = task_fixture();
-        task.patch_edits = Some(vec![task::PatchEdit {
+        task.patch_edits = Some(vec![task::PatchEdit::Replace {
             path: "src/cart.rs".to_string(),
             find: "x".to_string(),
             replace: "y".to_string(),
+            expected_digest: None,
         }]);
 
         // Unknown relevance never blocks the patch.

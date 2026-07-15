@@ -52,6 +52,8 @@
           <button class="tab" data-tab="calls">LLM Calls</button>
           <button class="tab" data-tab="context">Context</button>
           <button class="tab" data-tab="tokens">Tokens</button>
+          <button class="tab" data-tab="workflow-spec">Workflow</button>
+          <button class="tab" data-tab="requests">Requests</button>
         </nav>
 
         <section class="tab-panel active" id="panel-overview">
@@ -87,6 +89,17 @@
         <section class="tab-panel" id="panel-tokens">
           <h2 class="panel-heading">Model usage</h2>
           <div id="model-usage" class="model-usage"></div>
+        </section>
+
+        <section class="tab-panel" id="panel-workflow-spec">
+          <h2 class="panel-heading">Compiled workflow spec</h2>
+          <div id="workflow-spec-meta" class="workflow-spec-meta"></div>
+          <ol id="workflow-spec-graph" class="workflow-graph"></ol>
+        </section>
+
+        <section class="tab-panel" id="panel-requests">
+          <h2 class="panel-heading">Request manifests</h2>
+          <div id="manifests-list" class="calls-list"></div>
         </section>
       </div>
     </main>

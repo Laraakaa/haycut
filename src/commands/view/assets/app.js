@@ -129,12 +129,14 @@ function renderDetail(detail) {
   document.getElementById("detail-id").textContent = detail.id;
 
   renderStatCards(detail);
-  renderWorkflowGraph(detail.workflow);
+  renderWorkflowGraph(detail.workflow, primitiveIndex(detail));
   renderChecks(detail.checks);
   renderPatch(detail.patch_text);
   renderCalls(detail.steps);
   renderContext(detail);
   renderModelUsage(detail.model_usage);
+  renderWorkflowSpec(detail);
+  renderManifests(detail.manifests);
 }
 
 function renderStatCards(detail) {
@@ -159,26 +161,18 @@ function renderStatCards(detail) {
     .join("");
 }
 
-// Mirrors NodeOp::executor() in src/commands/agent/workflow.rs.
-const NODE_EXECUTOR = {
-  classify_intent: "weak_model",
-  detect_project: "deterministic",
-  resolve_verification: "deterministic",
-  run_baseline: "command",
-  extract_evidence: "deterministic",
-  select_context: "weak_model",
-  plan_context: "strong_model",
-  read_context: "deterministic",
-  plan_patch: "strong_model",
-  apply_patch: "deterministic",
-  run_final_verification: "command",
-  retry_fix: "deterministic",
-  ask_user: "deterministic",
-  direct_answer: "strong_model",
-  report: "deterministic",
-};
+// primitiveIndex looks up executor/phase for a primitive_id from the
+// backend's static registry listing (RunDetail.primitives), replacing what
+// used to be a hardcoded NodeOp::executor() mirror kept in sync by hand.
+function primitiveIndex(detail) {
+  const index = new Map();
+  for (const primitive of detail.primitives || []) {
+    index.set(primitive.id, primitive);
+  }
+  return index;
+}
 
-function renderWorkflowGraph(workflow) {
+function renderWorkflowGraph(workflow, primitives) {
   const list = document.getElementById("workflow-graph");
   const nodes = workflow && workflow.nodes ? workflow.nodes : [];
   if (nodes.length === 0) {
@@ -189,7 +183,8 @@ function renderWorkflowGraph(workflow) {
     .map((node) => {
       const deps = node.depends_on && node.depends_on.length > 0 ? node.depends_on.join(", ") : "—";
       const outcome = node.outcome ? escapeHtml(node.outcome) : "";
-      const executor = NODE_EXECUTOR[node.op] || "deterministic";
+      const primitive = primitives.get(node.op);
+      const executor = primitive ? primitive.executor : "deterministic";
       return `
       <li class="workflow-node status-${escapeHtml(node.status)} exec-${escapeHtml(executor)}">
         <div class="workflow-node-head">
@@ -200,6 +195,46 @@ function renderWorkflowGraph(workflow) {
         </div>
         <div class="workflow-node-deps">depends on: ${escapeHtml(deps)}</div>
         ${outcome ? `<div class="workflow-node-outcome">${outcome}</div>` : ""}
+      </li>`;
+    })
+    .join("");
+}
+
+function renderWorkflowSpec(detail) {
+  const meta = document.getElementById("workflow-spec-meta");
+  const list = document.getElementById("workflow-spec-graph");
+  const spec = detail.workflow_spec;
+
+  if (!spec) {
+    meta.innerHTML = "";
+    list.innerHTML =
+      '<div class="empty-note">No compiled workflow spec recorded for this run.</div>';
+    return;
+  }
+
+  meta.innerHTML = `
+    <div class="workflow-spec-meta-row">
+      <span>schema v${escapeHtml(String(spec.schema_version))}</span>
+      <span>compiler ${escapeHtml(spec.compiler_version)}</span>
+      <span>entrypoints: ${escapeHtml((spec.entrypoints || []).join(", ") || "—")}</span>
+    </div>`;
+
+  const primitives = primitiveIndex(detail);
+  list.innerHTML = spec.nodes
+    .map((node) => {
+      const deps = node.dependencies.length > 0 ? node.dependencies.join(", ") : "—";
+      const primitive = primitives.get(node.primitive_id);
+      const executor = primitive ? primitive.executor : "deterministic";
+      const guard = node.guard ? `<span class="status-tag">${escapeHtml(node.guard)}</span>` : "";
+      return `
+      <li class="workflow-node exec-${escapeHtml(executor)}">
+        <div class="workflow-node-head">
+          <span class="workflow-node-id">${escapeHtml(node.id)}</span>
+          <span class="workflow-node-op">${escapeHtml(node.primitive_id)} v${escapeHtml(String(node.primitive_version))}</span>
+          <span class="exec-tag">${escapeHtml(executor.replace("_", " "))}</span>
+          ${guard}
+        </div>
+        <div class="workflow-node-deps">depends on: ${escapeHtml(deps)}</div>
       </li>`;
     })
     .join("");
@@ -384,6 +419,92 @@ function renderModelUsage(usage) {
   const nonBilled = usage.filter((row) => !row.billed);
   container.innerHTML =
     renderUsageGroup("Billed", billed) + renderUsageGroup("Non-billed", nonBilled);
+}
+
+function renderManifests(manifests) {
+  const list = document.getElementById("manifests-list");
+  if (!manifests || manifests.length === 0) {
+    list.innerHTML = '<div class="empty-note">No request manifests recorded yet.</div>';
+    return;
+  }
+
+  list.innerHTML = "";
+  for (const manifest of manifests) {
+    const card = document.createElement("div");
+    card.className = "call-card";
+
+    const inTok = manifest.reported_input_tokens ?? manifest.estimated_input_tokens;
+    const outTok = manifest.reported_output_tokens ?? manifest.estimated_output_tokens;
+    const comparison = manifest.comparison;
+    const verdictBadge = comparison
+      ? `<span class="badge ${badgeClass(comparison.verdict.toLowerCase())}">${escapeHtml(comparison.verdict)}</span>`
+      : "";
+
+    card.innerHTML = `
+      <div class="call-head">
+        <span class="call-chevron">&#9656;</span>
+        <span class="call-index">#${manifest.step_index}</span>
+        <span class="call-purpose">${escapeHtml(manifest.primitive_id)} v${escapeHtml(String(manifest.primitive_version))} &middot; ${escapeHtml(manifest.phase)}</span>
+        <span class="call-model">${escapeHtml(manifest.model)}</span>
+        <span class="badge ${badgeClass(manifest.status)}">${escapeHtml(manifest.status)}</span>
+        ${verdictBadge}
+        <span class="call-tokens">${inTok}in / ${outTok}out</span>
+      </div>
+      <div class="call-body">
+        <div class="call-section-label">Segments</div>
+        ${renderManifestSegments(manifest.segments)}
+        ${comparison ? renderManifestComparison(comparison) : ""}
+        ${manifest.error_summary ? `<div class="call-section-label">Error</div><pre class="code-block">${escapeHtml(manifest.error_summary)}</pre>` : ""}
+      </div>
+    `;
+    card.querySelector(".call-head").addEventListener("click", () => {
+      card.classList.toggle("open");
+    });
+    list.appendChild(card);
+  }
+}
+
+function renderManifestSegments(segments) {
+  if (!segments || segments.length === 0) {
+    return '<div class="empty-note">No segments recorded.</div>';
+  }
+  return `
+    <table class="runs-table">
+      <thead><tr><th>role</th><th>category</th><th>producer</th><th>digest</th><th>tokens</th></tr></thead>
+      <tbody>
+        ${segments
+          .map(
+            (segment) => `
+          <tr>
+            <td>${escapeHtml(segment.role)}</td>
+            <td>${escapeHtml(segment.category)}</td>
+            <td>${escapeHtml(segment.producer_id)} v${escapeHtml(String(segment.producer_version))}</td>
+            <td>${escapeHtml(segment.content_digest.slice(0, 12))}</td>
+            <td>${segment.estimated_tokens}</td>
+          </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderManifestComparison(comparison) {
+  const missing =
+    comparison.required_categories_missing && comparison.required_categories_missing.length
+      ? comparison.required_categories_missing.join(", ")
+      : "none";
+  const reasons =
+    comparison.reasons && comparison.reasons.length
+      ? comparison.reasons.map(escapeHtml).join(" &middot; ")
+      : "—";
+  return `
+    <div class="call-section-label">Shadow-mode comparison</div>
+    <div class="context-item">
+      <span>legacy ${comparison.legacy_tokens} tok / compiled ${comparison.compiled_tokens} tok</span>
+      <span>missing categories: ${escapeHtml(missing)}</span>
+      <span>authoritative: ${comparison.authoritative}</span>
+    </div>
+    <div class="check-reasons">${reasons}</div>`;
 }
 
 function onTabClick(event) {
