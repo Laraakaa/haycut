@@ -7,6 +7,10 @@ use crate::commands::{
 };
 use crate::store::StoredAgentTrace;
 
+fn default_billed() -> bool {
+    true
+}
+
 /// Where a run came from. Both kinds render through the same `RunDetail`
 /// shape so the frontend has one code path for eval analysis today and live
 /// agent progress later.
@@ -63,6 +67,8 @@ pub struct StepView {
     pub step_index: i64,
     pub model: String,
     pub purpose: String,
+    #[serde(default = "default_billed")]
+    pub billed: bool,
     pub prompt: String,
     pub response: String,
     pub action_json: String,
@@ -80,6 +86,8 @@ pub struct StepView {
 pub struct ModelUsageView {
     pub model: String,
     pub purpose: String,
+    #[serde(default = "default_billed")]
+    pub billed: bool,
     pub calls: usize,
     pub estimated_input_tokens: i64,
     pub estimated_output_tokens: i64,
@@ -112,6 +120,7 @@ pub struct RunDetail {
     pub max_steps: Option<usize>,
     pub route: Vec<RouteEntry>,
     pub workflow: Workflow,
+    pub terminal_reason: Option<crate::commands::agent::StopReason>,
     pub budget: BudgetView,
     pub token_summary: TokenSummaryView,
     pub steps: Vec<StepView>,
@@ -144,6 +153,8 @@ pub struct EvalReportFile {
     pub route: Vec<RouteEntry>,
     #[serde(default)]
     pub workflow: Workflow,
+    #[serde(default)]
+    pub terminal_reason: Option<crate::commands::agent::StopReason>,
     pub budget: BudgetView,
     pub token_summary: TokenSummaryView,
     #[serde(default)]
@@ -171,6 +182,7 @@ impl EvalReportFile {
             max_steps: Some(self.max_steps),
             route: self.route,
             workflow: self.workflow,
+            terminal_reason: self.terminal_reason,
             budget: self.budget,
             token_summary: self.token_summary,
             steps: self.steps,
@@ -216,14 +228,13 @@ pub fn task_to_detail(
     let steps: Vec<StepView> = traces.iter().map(trace_to_step).collect();
     let model_usage = aggregate_model_usage(&steps);
 
-    let packet_input_tokens: i64 = task
-        .runs
-        .iter()
-        .map(|run| run.packet_tokens as i64)
-        .sum();
+    let packet_input_tokens: i64 = task.runs.iter().map(|run| run.packet_tokens as i64).sum();
     let model_input_tokens: i64 = steps
         .iter()
-        .map(|step| step.reported_input_tokens.unwrap_or(step.estimated_input_tokens))
+        .map(|step| {
+            step.reported_input_tokens
+                .unwrap_or(step.estimated_input_tokens)
+        })
         .sum();
     let model_output_tokens: i64 = steps
         .iter()
@@ -270,6 +281,7 @@ pub fn task_to_detail(
         max_steps: None,
         route: task.route.clone(),
         workflow: task.workflow.clone(),
+        terminal_reason: task.terminal_reason,
         budget: BudgetView {
             packet_tokens_used: task.budget.packet_tokens_used,
             soft_tokens: task.budget.soft_tokens,
@@ -321,6 +333,7 @@ fn trace_to_step(trace: &StoredAgentTrace) -> StepView {
         step_index: trace.step_index,
         model: trace.model.clone(),
         purpose: trace.purpose.clone(),
+        billed: trace.billed,
         prompt: trace.prompt.clone(),
         response: trace.response.clone(),
         action_json: trace.action_json.clone(),
@@ -356,6 +369,7 @@ fn aggregate_model_usage(steps: &[StepView]) -> Vec<ModelUsageView> {
             usage.push(ModelUsageView {
                 model: step.model.clone(),
                 purpose: step.purpose.clone(),
+                billed: step.billed,
                 calls: 1,
                 estimated_input_tokens: step.estimated_input_tokens,
                 estimated_output_tokens: step.estimated_output_tokens,

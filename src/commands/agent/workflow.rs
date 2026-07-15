@@ -11,7 +11,7 @@ pub type NodeId = String;
 /// The concrete operation a graph node performs. Maps 1:1 onto the
 /// `execute_*` functions in `agent.rs` — no new behaviour, only a new
 /// structural home for what was `NextStep`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeOp {
     /// Cheap weak-model intent classification.
@@ -80,6 +80,30 @@ pub enum ExecutorKind {
 }
 
 impl NodeOp {
+    #[allow(dead_code)]
+    pub const ALL: [Self; 15] = [
+        Self::ClassifyIntent,
+        Self::DetectProject,
+        Self::ResolveVerification,
+        Self::RunBaseline,
+        Self::ExtractEvidence,
+        Self::SelectContext,
+        Self::PlanContext,
+        Self::ReadContext,
+        Self::PlanPatch,
+        Self::ApplyPatch,
+        Self::RunFinalVerification,
+        Self::RetryFix,
+        Self::AskUser,
+        Self::DirectAnswer,
+        Self::Report,
+    ];
+
+    #[allow(dead_code)]
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
     /// Executor kind that should run this node.
     pub fn executor(&self) -> ExecutorKind {
         match self {
@@ -306,10 +330,12 @@ fn decide(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
             return Ok(NodeOp::PlanPatch);
         }
         if !task.patch_applied {
+            if task.patch_previewed {
+                return Err(StopReason::Blocked);
+            }
             return Ok(NodeOp::ApplyPatch);
         }
-        if policy.require_final_verification
-            && !has_step(task, NodeOp::RunFinalVerification.name())
+        if policy.require_final_verification && !has_step(task, NodeOp::RunFinalVerification.name())
         {
             return Ok(NodeOp::RunFinalVerification);
         }
@@ -354,7 +380,7 @@ pub fn next_ready_node(workflow: &mut Workflow, task: &TaskState, max_retries: u
                     .find(|node| node.status == NodeStatus::Done)
                     .map(|node| node.id.clone());
                 let depends_on = parent.iter().cloned().collect();
-                let id = workflow.push(op.clone(), depends_on, parent);
+                let id = workflow.push(op, depends_on, parent);
                 Decision::Ready(id, op)
             }
         }
@@ -363,16 +389,16 @@ pub fn next_ready_node(workflow: &mut Workflow, task: &TaskState, max_retries: u
 
 /// Per-intent policy flags controlling the graph's route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct IntentPolicy {
-    needs_repo: bool,
-    requires_verification: bool,
-    expect_baseline_failure: bool,
-    patch_expected: bool,
-    require_final_verification: bool,
+pub(crate) struct IntentPolicy {
+    pub(crate) needs_repo: bool,
+    pub(crate) requires_verification: bool,
+    pub(crate) expect_baseline_failure: bool,
+    pub(crate) patch_expected: bool,
+    pub(crate) require_final_verification: bool,
 }
 
 impl IntentPolicy {
-    fn for_intent(intent: TaskIntent) -> Self {
+    pub(crate) fn for_intent(intent: TaskIntent) -> Self {
         match intent {
             TaskIntent::DebugFailure => Self {
                 needs_repo: true,
@@ -409,7 +435,7 @@ impl IntentPolicy {
 /// Decide what to do after a failed final verification.
 fn resolve_retry(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
     if task.retry_count >= max_retries {
-        return Err(StopReason::BudgetExhausted);
+        return Err(StopReason::Failed);
     }
 
     let current_signature = task.current_failure.as_ref().map(failure_signature);
@@ -524,9 +550,13 @@ mod tests {
             patch_text: None,
             patch_edits: None,
             patch_applied: false,
+            patch_previewed: false,
+            apply_requested: false,
+            terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,
             available_context: Vec::new(),
+            workflow_spec: None,
             workflow: Workflow::new(),
         }
     }
@@ -541,6 +571,8 @@ mod tests {
         task.route.push(RouteEntry {
             step: step.name().to_string(),
             executor: step.executor(),
+            primitive_id: None,
+            primitive_version: None,
             outcome: outcome.to_string(),
         });
     }
@@ -630,6 +662,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         });
         assert!(matches!(
             decision(&task, 2),
@@ -701,6 +734,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         });
         assert!(matches!(
             decision(&task, 2),
@@ -821,16 +855,14 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         });
         task.last_failure_signature = task.current_failure.as_ref().map(failure_signature);
         task.patch_text = Some("change expected value".to_string());
         task.patch_applied = true;
         push_route(&mut task, NodeOp::RunFinalVerification, "fail exit 101");
 
-        assert_eq!(
-            decision(&task, 2),
-            Decision::Stop(StopReason::LoopDetected)
-        );
+        assert_eq!(decision(&task, 2), Decision::Stop(StopReason::LoopDetected));
     }
 
     #[test]
@@ -850,6 +882,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "new failure".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         });
         task.last_failure_signature = Some("old-signature".to_string());
         task.patch_text = Some("change expected value".to_string());
@@ -880,6 +913,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "new failure".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         });
         task.last_failure_signature = Some("old-signature".to_string());
         task.patch_text = Some("change expected value".to_string());
@@ -887,10 +921,7 @@ mod tests {
         task.retry_count = 2;
         push_route(&mut task, NodeOp::RunFinalVerification, "fail exit 101");
 
-        assert_eq!(
-            decision(&task, 2),
-            Decision::Stop(StopReason::BudgetExhausted)
-        );
+        assert_eq!(decision(&task, 2), Decision::Stop(StopReason::Failed));
     }
 
     #[test]
@@ -899,6 +930,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "assertion left 13 right 12".to_string(),
             locations: vec!["src/lib.rs:42".to_string()],
+            detail: None,
         };
         let sig1 = failure_signature(&failure);
         let sig2 = failure_signature(&failure);

@@ -2,8 +2,10 @@ use std::{fs, io, path::Path};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::context::request::{ManifestStatus, RequestManifestDraft, RequestSegmentDescriptor};
+
 pub const RUN_STORE_PATH: &str = ".haycut/haycut.sqlite3";
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 6;
 
 #[derive(Debug)]
 pub struct NewRun<'a> {
@@ -111,6 +113,8 @@ pub struct NewAgentTrace<'a> {
     pub estimated_output_tokens: i64,
     pub reported_input_tokens: Option<i64>,
     pub reported_output_tokens: Option<i64>,
+    pub billed: bool,
+    pub manifest_id: Option<&'a str>,
     pub created_at: &'a str,
 }
 
@@ -129,7 +133,85 @@ pub struct StoredAgentTrace {
     pub estimated_output_tokens: i64,
     pub reported_input_tokens: Option<i64>,
     pub reported_output_tokens: Option<i64>,
+    pub billed: bool,
+    pub manifest_id: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct NewRequestManifest<'a> {
+    pub draft: &'a RequestManifestDraft,
+    pub model: &'a str,
+    pub billed: bool,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct RequestManifestCompletion<'a> {
+    pub status: ManifestStatus,
+    pub reported_input_tokens: Option<i64>,
+    pub reported_output_tokens: Option<i64>,
+    pub reported_cached_input_tokens: Option<i64>,
+    pub provider_request_id: Option<&'a str>,
+    pub latency_ms: i64,
+    pub error_summary: Option<&'a str>,
+    pub completed_at: &'a str,
+    pub comparison_json: Option<&'a str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StoredRequestManifest {
+    pub id: String,
+    pub task_id: String,
+    pub step_index: i64,
+    pub node_id: Option<String>,
+    pub workflow_compiler_version: Option<String>,
+    pub primitive_id: String,
+    pub primitive_version: i64,
+    pub phase: String,
+    pub model: String,
+    pub purpose: String,
+    pub prompt_id: Option<String>,
+    pub prompt_version: Option<i64>,
+    pub tool_profile_id: Option<String>,
+    pub tool_profile_version: Option<i64>,
+    pub reasoning_effort: Option<String>,
+    pub request_digest: String,
+    pub status: String,
+    pub estimated_input_tokens: i64,
+    pub estimated_output_tokens: i64,
+    pub reported_input_tokens: Option<i64>,
+    pub reported_output_tokens: Option<i64>,
+    pub reported_cached_input_tokens: Option<i64>,
+    pub provider_request_id: Option<String>,
+    pub latency_ms: Option<i64>,
+    pub billed: bool,
+    pub error_summary: Option<String>,
+    pub comparison_json: Option<String>,
+    pub prepared_at: String,
+    pub completed_at: Option<String>,
+    pub segments: Vec<StoredRequestManifestSegment>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct StoredRequestManifestSegment {
+    pub segment_id: String,
+    pub position: i64,
+    pub role: String,
+    pub category: String,
+    pub representation: String,
+    pub schema_version: i64,
+    pub producer_id: String,
+    pub producer_version: i64,
+    pub content_digest: String,
+    pub provenance_json: String,
+    pub dependency_digests_json: String,
+    pub byte_size: i64,
+    pub estimated_tokens: i64,
+    pub cache_policy: String,
 }
 
 impl StoredRun {
@@ -435,12 +517,12 @@ pub fn close_current_task(db_path: &Path, task_json: &str, closed_at: &str) -> i
 pub fn insert_agent_trace(db_path: &Path, trace: &NewAgentTrace<'_>) -> io::Result<()> {
     let conn = open_migrated(db_path)?;
 
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO agent_traces (
             id, task_id, step_index, model, purpose, prompt, response, action_json, observation,
             estimated_input_tokens, estimated_output_tokens,
-            reported_input_tokens, reported_output_tokens, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            reported_input_tokens, reported_output_tokens, billed, manifest_id, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             trace.id,
             trace.task_id,
@@ -455,10 +537,22 @@ pub fn insert_agent_trace(db_path: &Path, trace: &NewAgentTrace<'_>) -> io::Resu
             trace.estimated_output_tokens,
             trace.reported_input_tokens,
             trace.reported_output_tokens,
+            trace.billed,
+            trace.manifest_id,
             trace.created_at,
         ],
-    )
-    .map_err(io::Error::other)?;
+    );
+    if let Err(error) = result {
+        if let Some(manifest_id) = trace.manifest_id {
+            let _ = conn.execute(
+                "UPDATE request_manifests
+                SET status = 'recording_failed', error_summary = ?2
+                WHERE id = ?1",
+                params![manifest_id, error.to_string()],
+            );
+        }
+        return Err(io::Error::other(error));
+    }
 
     Ok(())
 }
@@ -469,7 +563,7 @@ pub fn agent_traces_for_task(db_path: &Path, task_id: &str) -> io::Result<Vec<St
         .prepare(
             "SELECT id, task_id, step_index, model, purpose, prompt, response, action_json,
                 observation, estimated_input_tokens, estimated_output_tokens,
-                reported_input_tokens, reported_output_tokens, created_at
+                reported_input_tokens, reported_output_tokens, billed, manifest_id, created_at
             FROM agent_traces
             WHERE task_id = ?1
             ORDER BY step_index ASC, created_at ASC, id ASC",
@@ -492,13 +586,272 @@ pub fn agent_traces_for_task(db_path: &Path, task_id: &str) -> io::Result<Vec<St
                 estimated_output_tokens: row.get(10)?,
                 reported_input_tokens: row.get(11)?,
                 reported_output_tokens: row.get(12)?,
-                created_at: row.get(13)?,
+                billed: row.get(13)?,
+                manifest_id: row.get(14)?,
+                created_at: row.get(15)?,
             })
         })
         .map_err(io::Error::other)?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(io::Error::other)
+}
+
+#[allow(dead_code)]
+pub fn insert_prepared_request_manifest(
+    db_path: &Path,
+    manifest: &NewRequestManifest<'_>,
+) -> io::Result<()> {
+    let mut conn = open_migrated(db_path)?;
+    let transaction = conn.transaction().map_err(io::Error::other)?;
+    let draft = manifest.draft;
+
+    transaction
+        .execute(
+            "INSERT INTO request_manifests (
+                schema_version, id, task_id, step_index, node_id, workflow_compiler_version,
+                primitive_id, primitive_version, phase, model, purpose,
+                prompt_id, prompt_version, tool_profile_id, tool_profile_version,
+                reasoning_effort, request_digest, status,
+                estimated_input_tokens, estimated_output_tokens, billed, comparison_json,
+                prepared_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            )",
+            params![
+                draft.schema_version as i64,
+                draft.id.as_str(),
+                draft.task_id.as_str(),
+                draft.step_index as i64,
+                draft.node_id.as_deref(),
+                draft.workflow_compiler_version.as_deref(),
+                draft.primitive_id.as_str(),
+                draft.primitive_version.get() as i64,
+                draft.phase.as_str(),
+                manifest.model,
+                draft.purpose.to_string(),
+                draft.prompt.as_ref().map(|prompt| prompt.id.as_str()),
+                draft
+                    .prompt
+                    .as_ref()
+                    .map(|prompt| prompt.version.get() as i64),
+                draft
+                    .tool_profile
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+                draft
+                    .tool_profile
+                    .as_ref()
+                    .map(|profile| profile.version.get() as i64),
+                draft.reasoning_effort.as_deref(),
+                draft.request_digest.as_str(),
+                enum_text(&draft.status)?,
+                draft.estimated_usage.input as i64,
+                draft.estimated_usage.output as i64,
+                manifest.billed,
+                draft.comparison_json.as_deref(),
+                draft.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(io::Error::other)?;
+
+    for segment in &draft.segments {
+        insert_manifest_segment(&transaction, &draft.id, segment)?;
+    }
+
+    transaction.commit().map_err(io::Error::other)
+}
+
+#[allow(dead_code)]
+fn insert_manifest_segment(
+    conn: &Connection,
+    manifest_id: &str,
+    segment: &RequestSegmentDescriptor,
+) -> io::Result<()> {
+    conn.execute(
+        "INSERT INTO request_manifest_segments (
+            manifest_id, position, segment_id, role, category, representation,
+            schema_version, producer_id, producer_version, content_digest,
+            provenance_json, dependency_digests_json, byte_size, estimated_tokens, cache_policy
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            manifest_id,
+            segment.position as i64,
+            segment.id.as_str(),
+            enum_text(&segment.role)?,
+            enum_text(&segment.category)?,
+            enum_text(&segment.representation)?,
+            segment.schema_version as i64,
+            segment.producer_id.as_str(),
+            segment.producer_version as i64,
+            segment.content_digest.as_str(),
+            serde_json::to_string(&segment.provenance).map_err(io::Error::other)?,
+            serde_json::to_string(&segment.dependency_digests).map_err(io::Error::other)?,
+            segment.byte_size as i64,
+            segment.estimated_tokens as i64,
+            enum_text(&segment.cache_policy)?,
+        ],
+    )
+    .map_err(io::Error::other)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn finalize_request_manifest(
+    db_path: &Path,
+    manifest_id: &str,
+    completion: &RequestManifestCompletion<'_>,
+) -> io::Result<()> {
+    let conn = open_migrated(db_path)?;
+    let changed = conn
+        .execute(
+            "UPDATE request_manifests SET
+                status = ?2,
+                reported_input_tokens = ?3,
+                reported_output_tokens = ?4,
+                reported_cached_input_tokens = ?5,
+                provider_request_id = ?6,
+                latency_ms = ?7,
+                error_summary = ?8,
+                comparison_json = COALESCE(?9, comparison_json),
+                completed_at = ?10
+            WHERE id = ?1 AND status = 'prepared'",
+            params![
+                manifest_id,
+                enum_text(&completion.status)?,
+                completion.reported_input_tokens,
+                completion.reported_output_tokens,
+                completion.reported_cached_input_tokens,
+                completion.provider_request_id,
+                completion.latency_ms,
+                completion.error_summary,
+                completion.comparison_json,
+                completion.completed_at,
+            ],
+        )
+        .map_err(io::Error::other)?;
+    if changed != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest {manifest_id} is missing or no longer prepared"),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn request_manifests_for_task(
+    db_path: &Path,
+    task_id: &str,
+) -> io::Result<Vec<StoredRequestManifest>> {
+    let conn = open_migrated(db_path)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id, task_id, step_index, node_id, workflow_compiler_version,
+                primitive_id, primitive_version, phase, model, purpose,
+                prompt_id, prompt_version, tool_profile_id, tool_profile_version,
+                reasoning_effort, request_digest, status,
+                estimated_input_tokens, estimated_output_tokens,
+                reported_input_tokens, reported_output_tokens, reported_cached_input_tokens,
+                provider_request_id, latency_ms, billed, error_summary, comparison_json,
+                prepared_at, completed_at
+            FROM request_manifests
+            WHERE task_id = ?1
+            ORDER BY step_index, prepared_at, id",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(params![task_id], |row| {
+            Ok(StoredRequestManifest {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                step_index: row.get(2)?,
+                node_id: row.get(3)?,
+                workflow_compiler_version: row.get(4)?,
+                primitive_id: row.get(5)?,
+                primitive_version: row.get(6)?,
+                phase: row.get(7)?,
+                model: row.get(8)?,
+                purpose: row.get(9)?,
+                prompt_id: row.get(10)?,
+                prompt_version: row.get(11)?,
+                tool_profile_id: row.get(12)?,
+                tool_profile_version: row.get(13)?,
+                reasoning_effort: row.get(14)?,
+                request_digest: row.get(15)?,
+                status: row.get(16)?,
+                estimated_input_tokens: row.get(17)?,
+                estimated_output_tokens: row.get(18)?,
+                reported_input_tokens: row.get(19)?,
+                reported_output_tokens: row.get(20)?,
+                reported_cached_input_tokens: row.get(21)?,
+                provider_request_id: row.get(22)?,
+                latency_ms: row.get(23)?,
+                billed: row.get(24)?,
+                error_summary: row.get(25)?,
+                comparison_json: row.get(26)?,
+                prepared_at: row.get(27)?,
+                completed_at: row.get(28)?,
+                segments: Vec::new(),
+            })
+        })
+        .map_err(io::Error::other)?;
+    let mut manifests = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?;
+    for manifest in &mut manifests {
+        manifest.segments = request_manifest_segments(&conn, &manifest.id)?;
+    }
+    Ok(manifests)
+}
+
+#[allow(dead_code)]
+fn request_manifest_segments(
+    conn: &Connection,
+    manifest_id: &str,
+) -> io::Result<Vec<StoredRequestManifestSegment>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT segment_id, position, role, category, representation,
+                schema_version, producer_id, producer_version, content_digest,
+                provenance_json, dependency_digests_json, byte_size, estimated_tokens, cache_policy
+            FROM request_manifest_segments
+            WHERE manifest_id = ?1
+            ORDER BY position",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(params![manifest_id], |row| {
+            Ok(StoredRequestManifestSegment {
+                segment_id: row.get(0)?,
+                position: row.get(1)?,
+                role: row.get(2)?,
+                category: row.get(3)?,
+                representation: row.get(4)?,
+                schema_version: row.get(5)?,
+                producer_id: row.get(6)?,
+                producer_version: row.get(7)?,
+                content_digest: row.get(8)?,
+                provenance_json: row.get(9)?,
+                dependency_digests_json: row.get(10)?,
+                byte_size: row.get(11)?,
+                estimated_tokens: row.get(12)?,
+                cache_policy: row.get(13)?,
+            })
+        })
+        .map_err(io::Error::other)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
+}
+
+#[allow(dead_code)]
+fn enum_text<T: serde::Serialize>(value: &T) -> io::Result<String> {
+    serde_json::to_value(value)
+        .map_err(io::Error::other)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "expected string enum"))
 }
 
 fn load_task_by_id(conn: &Connection, task_id: &str) -> io::Result<StoredTask> {
@@ -678,6 +1031,8 @@ fn migrate(conn: &Connection) -> io::Result<()> {
             estimated_output_tokens integer not null,
             reported_input_tokens integer,
             reported_output_tokens integer,
+            billed integer not null default 1,
+            manifest_id text,
             created_at text not null,
             foreign key(task_id) references tasks(id) on delete cascade
         );
@@ -686,18 +1041,123 @@ fn migrate(conn: &Connection) -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
 
+    if !column_exists(conn, "agent_traces", "billed")? {
+        conn.execute_batch(
+            "ALTER TABLE agent_traces ADD COLUMN billed integer not null default 1;",
+        )
+        .map_err(io::Error::other)?;
+    }
+
+    if !column_exists(conn, "agent_traces", "manifest_id")? {
+        conn.execute_batch("ALTER TABLE agent_traces ADD COLUMN manifest_id text;")
+            .map_err(io::Error::other)?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS request_manifests(
+            schema_version integer not null,
+            id text primary key,
+            task_id text not null,
+            step_index integer not null,
+            node_id text,
+            workflow_compiler_version text,
+            primitive_id text not null,
+            primitive_version integer not null,
+            phase text not null,
+            model text not null,
+            purpose text not null,
+            prompt_id text,
+            prompt_version integer,
+            tool_profile_id text,
+            tool_profile_version integer,
+            reasoning_effort text,
+            request_digest text not null,
+            status text not null,
+            estimated_input_tokens integer not null,
+            estimated_output_tokens integer not null,
+            reported_input_tokens integer,
+            reported_output_tokens integer,
+            reported_cached_input_tokens integer,
+            provider_request_id text,
+            latency_ms integer,
+            billed integer not null default 1,
+            error_summary text,
+            comparison_json text,
+            prepared_at text not null,
+            completed_at text,
+            foreign key(task_id) references tasks(id) on delete cascade
+        );
+
+        CREATE TABLE IF NOT EXISTS request_manifest_segments(
+            manifest_id text not null,
+            position integer not null,
+            segment_id text not null,
+            role text not null,
+            category text not null,
+            representation text not null,
+            schema_version integer not null,
+            producer_id text not null,
+            producer_version integer not null,
+            content_digest text not null,
+            provenance_json text not null,
+            dependency_digests_json text not null,
+            byte_size integer not null,
+            estimated_tokens integer not null,
+            cache_policy text not null,
+            primary key(manifest_id, position),
+            foreign key(manifest_id) references request_manifests(id) on delete cascade
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_request_manifests_task_step
+            ON request_manifests(task_id, step_index);
+        CREATE INDEX IF NOT EXISTS idx_request_manifests_digest
+            ON request_manifests(request_digest);
+        CREATE INDEX IF NOT EXISTS idx_request_manifests_primitive
+            ON request_manifests(primitive_id, primitive_version);
+        CREATE INDEX IF NOT EXISTS idx_request_manifest_segments_order
+            ON request_manifest_segments(manifest_id, position);
+        CREATE INDEX IF NOT EXISTS idx_agent_traces_manifest
+            ON agent_traces(manifest_id);",
+    )
+    .map_err(io::Error::other)?;
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(io::Error::other)
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> io::Result<bool> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(io::Error::other)?;
+
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(io::Error::other)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)?
+        .iter()
+        .any(|name| name == column);
+
+    Ok(exists)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::{
         env,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+    use crate::{
+        commands::agent::{primitive, workflow::NodeOp},
+        context::request::{
+            self, CachePolicy, ContextRepresentation, ContextRole, ContextSegment, RequestAssembly,
+            RequestCorrelation,
+        },
+        model::ModelPurpose,
+    };
 
     #[test]
     fn insert_run_initializes_schema_and_persists_artifacts() {
@@ -900,6 +1360,8 @@ mod tests {
                 estimated_output_tokens: 20,
                 reported_input_tokens: Some(90),
                 reported_output_tokens: Some(12),
+                billed: false,
+                manifest_id: None,
                 created_at: "2026-07-08T15:01:00+00:00",
             },
         )
@@ -913,9 +1375,214 @@ mod tests {
         assert_eq!(traces[0].purpose, "agent_planner");
         assert_eq!(traces[0].estimated_input_tokens, 100);
         assert_eq!(traces[0].reported_output_tokens, Some(12));
+        assert!(!traces[0].billed);
         assert!(traces[0].observation.contains("create_default_config_at"));
 
         fs::remove_file(db_path).expect("test db should be removed");
+    }
+
+    #[test]
+    fn migrate_adds_billed_column_to_pre_existing_agent_traces_table() {
+        let db_path = temp_db_path("agent-traces-migration");
+        let conn = Connection::open(&db_path).expect("db should open");
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+            CREATE TABLE agent_traces(
+                id text primary key,
+                task_id text not null,
+                step_index integer not null,
+                model text not null default '',
+                purpose text not null default '',
+                prompt text not null,
+                response text not null,
+                action_json text not null,
+                observation text not null,
+                estimated_input_tokens integer not null,
+                estimated_output_tokens integer not null,
+                reported_input_tokens integer,
+                reported_output_tokens integer,
+                created_at text not null
+            );",
+        )
+        .expect("pre-existing table without billed column should create");
+        drop(conn);
+
+        let task = StoredTask {
+            id: "task-1".to_string(),
+            title: "Fix failing config test".to_string(),
+            status: "open".to_string(),
+            task_json: "{}".to_string(),
+            updated_at: "2026-07-08T15:00:00+00:00".to_string(),
+        };
+        upsert_task(&db_path, &task, true).expect("task should store");
+
+        insert_agent_trace(
+            &db_path,
+            &NewAgentTrace {
+                id: "trace-1",
+                task_id: "task-1",
+                step_index: 1,
+                model: "gpt-4o-mini",
+                purpose: "agent_planner",
+                prompt: "TASK\nGoal: Fix failing config test",
+                response: r#"{"action":"read_symbol"}"#,
+                action_json: r#"{"action":"read_symbol"}"#,
+                observation: "read_symbol found create_default_config_at",
+                estimated_input_tokens: 100,
+                estimated_output_tokens: 20,
+                reported_input_tokens: Some(90),
+                reported_output_tokens: Some(12),
+                billed: true,
+                manifest_id: None,
+                created_at: "2026-07-08T15:01:00+00:00",
+            },
+        )
+        .expect("trace should store against migrated table");
+
+        let traces = agent_traces_for_task(&db_path, "task-1").expect("trace should load");
+        assert_eq!(traces.len(), 1);
+        assert!(traces[0].billed);
+        assert!(traces[0].manifest_id.is_none());
+
+        let conn = Connection::open(&db_path).expect("migrated db should open");
+        let schema_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version should read");
+        assert_eq!(schema_version, 6);
+
+        fs::remove_file(db_path).expect("test db should be removed");
+    }
+
+    #[test]
+    fn stores_finalizes_and_orders_request_manifest_segments() {
+        let db_path = temp_db_path("request-manifest");
+        store_test_task(&db_path);
+        let draft = manifest_draft();
+
+        insert_prepared_request_manifest(
+            &db_path,
+            &NewRequestManifest {
+                draft: &draft,
+                model: "gpt-test",
+                billed: true,
+            },
+        )
+        .expect("prepared manifest should store");
+        finalize_request_manifest(
+            &db_path,
+            &draft.id,
+            &RequestManifestCompletion {
+                status: ManifestStatus::Completed,
+                reported_input_tokens: Some(12),
+                reported_output_tokens: Some(3),
+                reported_cached_input_tokens: Some(4),
+                provider_request_id: Some("provider-1"),
+                latency_ms: 25,
+                error_summary: None,
+                completed_at: "2026-07-15T12:00:01Z",
+                comparison_json: None,
+            },
+        )
+        .expect("manifest should finalize");
+
+        let manifests =
+            request_manifests_for_task(&db_path, "task-1").expect("manifest should load");
+
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].status, "completed");
+        assert_eq!(manifests[0].reported_cached_input_tokens, Some(4));
+        assert_eq!(
+            manifests[0].provider_request_id.as_deref(),
+            Some("provider-1")
+        );
+        assert_eq!(manifests[0].segments.len(), 2);
+        assert_eq!(manifests[0].segments[0].position, 0);
+        assert_eq!(manifests[0].segments[1].position, 1);
+
+        fs::remove_file(db_path).expect("test db should be removed");
+    }
+
+    #[test]
+    fn manifest_and_segments_roll_back_together() {
+        let db_path = temp_db_path("request-manifest-rollback");
+        store_test_task(&db_path);
+        let mut draft = manifest_draft();
+        draft.segments[1].position = draft.segments[0].position;
+
+        let error = insert_prepared_request_manifest(
+            &db_path,
+            &NewRequestManifest {
+                draft: &draft,
+                model: "gpt-test",
+                billed: true,
+            },
+        )
+        .expect_err("duplicate positions should fail");
+        assert!(error.to_string().contains("UNIQUE"));
+        assert!(
+            request_manifests_for_task(&db_path, "task-1")
+                .expect("manifest query should work")
+                .is_empty()
+        );
+
+        fs::remove_file(db_path).expect("test db should be removed");
+    }
+
+    fn store_test_task(db_path: &Path) {
+        upsert_task(
+            db_path,
+            &StoredTask {
+                id: "task-1".to_string(),
+                title: "test".to_string(),
+                status: "open".to_string(),
+                task_json: "{}".to_string(),
+                updated_at: "2026-07-15T12:00:00Z".to_string(),
+            },
+            true,
+        )
+        .expect("task should store");
+    }
+
+    fn manifest_draft() -> RequestManifestDraft {
+        let primitive = primitive::primitive_for_node_op(&NodeOp::DirectAnswer).unwrap();
+        request::assemble(RequestAssembly {
+            primitive,
+            system_segments: vec![ContextSegment::new(
+                "system",
+                0,
+                ContextRole::System,
+                primitive::ContextCategory::Constraints,
+                ContextRepresentation::Raw,
+                "direct_answer",
+                1,
+                "system",
+                CachePolicy::Request,
+            )],
+            user_segments: vec![ContextSegment::new(
+                "prompt",
+                1,
+                ContextRole::Task,
+                primitive::ContextCategory::TaskGoal,
+                ContextRepresentation::Raw,
+                "direct_answer",
+                1,
+                "prompt",
+                CachePolicy::NoStore,
+            )],
+            tools: &[],
+            purpose: ModelPurpose::FinalReport,
+            max_output_tokens: 32,
+            reasoning_effort: Some("low".to_string()),
+            correlation: RequestCorrelation {
+                task_id: "task-1".to_string(),
+                step_index: 1,
+                node_id: Some("n1".to_string()),
+                workflow_compiler_version: Some("phase1_compat_v1".to_string()),
+            },
+            metadata: BTreeMap::new(),
+        })
+        .expect("request should assemble")
+        .manifest
     }
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {

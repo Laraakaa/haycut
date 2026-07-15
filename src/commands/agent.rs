@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, io, path::Path, sync::OnceLock};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use chrono::Utc;
 use minijinja::{Environment, context};
@@ -7,19 +11,27 @@ use uuid::Uuid;
 
 use crate::{
     cli::{AgentCommand, TaskTarget},
+    code_graph,
     commands::{read_symbol, read_window, search, task, trace},
     config::Config,
-    model::{
-        EstimatedTokenUsage, ModelProvider, ModelPurpose, ModelRequest, OpenAiProvider,
-        ToolDefinition, estimate_tool_tokens,
+    context::{
+        invocation,
+        request::{
+            self, AssembledRequest, CachePolicy, ContextRepresentation, ContextRole,
+            ContextSegment, RequestAssembly, RequestCorrelation,
+        },
     },
+    model::{ModelPurpose, OpenAiProvider, ToolDefinition},
     store::{self, NewAgentTrace, RUN_STORE_PATH},
     util::{estimate_tokens, format_count},
 };
 
+pub mod patch;
+pub mod primitive;
 pub mod workflow;
-pub use workflow::{ExecutorKind, StopReason};
+pub mod workflow_spec;
 use workflow::{Decision, NodeOp};
+pub use workflow::{ExecutorKind, StopReason};
 
 pub const DEFAULT_MAX_STEPS: usize = 8;
 const MAX_RETRIES: usize = 2;
@@ -43,8 +55,9 @@ pub fn run(command: AgentCommand) -> i32 {
         AgentCommand::Run {
             task,
             max_steps,
+            apply,
             goal,
-        } => run_loop(task, goal.join(" "), max_steps),
+        } => run_loop(task, goal.join(" "), max_steps, apply),
         AgentCommand::Step { task } => run_step(task),
         AgentCommand::Trace { task } => run_trace(task),
     }
@@ -115,7 +128,20 @@ struct StepResult {
     terminal: bool,
 }
 
-fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize) -> i32 {
+struct AgentTraceInput<'a> {
+    model: &'a str,
+    purpose: &'a str,
+    prompt: &'a str,
+    response: &'a str,
+    executor: ExecutorKind,
+    input_tokens: usize,
+    output_tokens: usize,
+    observation: &'a str,
+    billed: bool,
+    manifest_id: Option<&'a str>,
+}
+
+fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize, apply: bool) -> i32 {
     if task_target != Some(TaskTarget::Current) && goal.trim().is_empty() {
         eprintln!("Error: provide --task current or a goal");
         return 2;
@@ -140,13 +166,25 @@ fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize) -> 
             return 1;
         }
     };
+    task.apply_requested = apply;
+    if apply {
+        task.patch_previewed = false;
+    }
+    if !apply {
+        println!("Patch mode: preview only. Use --apply to permit writes.");
+    }
 
     for step in 0..max_steps {
         let mut workflow = task.workflow.clone();
         let (node_id, next) = match workflow::next_ready_node(&mut workflow, &task, MAX_RETRIES) {
             Decision::Stop(reason) => {
                 print_stop(reason);
-                return 0;
+                task.terminal_reason = Some(reason);
+                if let Err(error) = task::save_current(&task) {
+                    eprintln!("Error saving task: {error}");
+                    return 1;
+                }
+                return stop_exit_code(reason);
             }
             Decision::Ready(id, op) => (id, op),
         };
@@ -164,7 +202,7 @@ fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize) -> 
         match execute_step(&next, &mut task, step_index) {
             Ok(outcome) => {
                 task.workflow
-                    .complete(node_id, next.clone(), outcome.summary.clone());
+                    .complete(node_id, next, outcome.summary.clone());
                 record_route(&mut task, &next, &outcome);
                 println!(
                     "step {}: {} ({:?}) — {}",
@@ -178,7 +216,18 @@ fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize) -> 
                     return 1;
                 }
                 if outcome.terminal {
-                    return 0;
+                    let mut workflow = task.workflow.clone();
+                    if let Decision::Stop(reason) =
+                        workflow::next_ready_node(&mut workflow, &task, MAX_RETRIES)
+                    {
+                        print_stop(reason);
+                        task.terminal_reason = Some(reason);
+                        if let Err(error) = task::save_current(&task) {
+                            eprintln!("Error saving task: {error}");
+                            return 1;
+                        }
+                        return stop_exit_code(reason);
+                    }
                 }
             }
             Err(error) => {
@@ -189,16 +238,16 @@ fn run_loop(task_target: Option<TaskTarget>, goal: String, max_steps: usize) -> 
         }
     }
 
-    println!("Stopped after {max_steps} steps.");
-    0
+    print_stop(StopReason::MaxSteps);
+    task.terminal_reason = Some(StopReason::MaxSteps);
+    if let Err(error) = task::save_current(&task) {
+        eprintln!("Error saving task: {error}");
+        return 1;
+    }
+    stop_exit_code(StopReason::MaxSteps)
 }
 
-fn run_step(task_target: Option<TaskTarget>) -> i32 {
-    if task_target != Some(TaskTarget::Current) {
-        eprintln!("Error: v0 supports `haycut agent step --task current`");
-        return 2;
-    }
-
+fn run_step(_task_target: Option<TaskTarget>) -> i32 {
     let mut task = match task::load_current() {
         Ok(task) => task,
         Err(error) => {
@@ -210,8 +259,13 @@ fn run_step(task_target: Option<TaskTarget>) -> i32 {
     let mut workflow = task.workflow.clone();
     let (node_id, next) = match workflow::next_ready_node(&mut workflow, &task, MAX_RETRIES) {
         Decision::Stop(reason) => {
-            println!("stop: {:?}", reason);
-            return 0;
+            print_stop(reason);
+            task.terminal_reason = Some(reason);
+            if let Err(error) = task::save_current(&task) {
+                eprintln!("Error saving task: {error}");
+                return 1;
+            }
+            return stop_exit_code(reason);
         }
         Decision::Ready(id, op) => (id, op),
     };
@@ -226,7 +280,7 @@ fn run_step(task_target: Option<TaskTarget>) -> i32 {
     match execute_step(&next, &mut task, step_index) {
         Ok(outcome) => {
             task.workflow
-                .complete(node_id, next.clone(), outcome.summary.clone());
+                .complete(node_id, next, outcome.summary.clone());
             record_route(&mut task, &next, &outcome);
             println!("Selected step: {}", next.name());
             println!("Executor: {:?}", next.executor());
@@ -245,12 +299,7 @@ fn run_step(task_target: Option<TaskTarget>) -> i32 {
     }
 }
 
-fn run_trace(task_target: Option<TaskTarget>) -> i32 {
-    if task_target != Some(TaskTarget::Current) {
-        eprintln!("Error: v0 supports `haycut agent trace --task current`");
-        return 2;
-    }
-
+fn run_trace(_task_target: Option<TaskTarget>) -> i32 {
     let task = match task::load_current() {
         Ok(task) => task,
         Err(error) => {
@@ -338,6 +387,26 @@ fn execute_step(
     task: &mut task::TaskState,
     step_index: usize,
 ) -> io::Result<StepResult> {
+    let primitive = primitive::primitive_for_node_op(step).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no primitive registered for node operation {}", step.name()),
+        )
+    })?;
+    if primitive.executor != step.executor() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "primitive {}@{} uses {:?}, but {} dispatches through {:?}",
+                primitive.id,
+                primitive.version,
+                primitive.executor,
+                step.name(),
+                step.executor()
+            ),
+        ));
+    }
+
     match step {
         NodeOp::ClassifyIntent => execute_classify_intent(task, step_index),
         NodeOp::DetectProject => execute_detect_project(task),
@@ -368,10 +437,25 @@ fn print_stop(reason: StopReason) {
     }
 }
 
+fn stop_exit_code(reason: StopReason) -> i32 {
+    match reason {
+        StopReason::Verified => 0,
+        StopReason::LoopDetected
+        | StopReason::BudgetExhausted
+        | StopReason::Blocked
+        | StopReason::Failed
+        | StopReason::MaxSteps => 1,
+    }
+}
+
 fn record_route(task: &mut task::TaskState, step: &NodeOp, outcome: &StepResult) {
+    let primitive = primitive::primitive_for_node_op(step)
+        .expect("execute_step requires every node operation to have a primitive");
     task.route.push(task::RouteEntry {
         step: step.name().to_string(),
         executor: step.executor(),
+        primitive_id: Some(primitive.id.clone()),
+        primitive_version: Some(primitive.version),
         outcome: outcome.summary.clone(),
     });
 }
@@ -392,10 +476,13 @@ fn execute_classify_intent(
         ));
     };
     let model_name = weak_config.model.clone();
+    let billed = weak_config.billed;
     let weak = OpenAiProvider::new(weak_config);
 
-    let (intent, input_tokens, output_tokens) = classify_task(&weak, &task.goal)?;
+    let (intent, input_tokens, output_tokens, response_text, manifest_id) =
+        classify_task(&weak, task, step_index, &model_name, billed)?;
     task.intent = Some(intent);
+    task.workflow_spec = Some(workflow_spec::compile_compatibility_spec(task));
     task.budget.packet_tokens_used = task
         .budget
         .packet_tokens_used
@@ -406,13 +493,18 @@ fn execute_classify_intent(
     record_agent_trace(
         task,
         step_index,
-        &model_name,
-        "intent_classification",
-        &summary,
-        ExecutorKind::WeakModel,
-        input_tokens,
-        output_tokens,
-        &summary,
+        AgentTraceInput {
+            model: &model_name,
+            purpose: "intent_classification",
+            prompt: &summary,
+            response: &response_text,
+            executor: ExecutorKind::WeakModel,
+            input_tokens,
+            output_tokens,
+            observation: &summary,
+            billed,
+            manifest_id: Some(&manifest_id),
+        },
     )?;
 
     Ok(StepResult {
@@ -523,9 +615,14 @@ const MAX_CANDIDATE_DEPTH: usize = 3;
 /// Bound on how many off-site candidates a single context-selection step
 /// surfaces, keeping the listing (and the weak-gate prompt) small.
 const MAX_CANDIDATES: usize = 5;
+/// Aggregate token budget for candidate bodies rendered into the weak-model
+/// relevance prompt, on top of the existing per-body 2_000-char cap — keeps
+/// N candidates x body bounded instead of growing unbounded with N.
+const CANDIDATE_LISTING_TOKEN_BUDGET: usize = 3_000;
 
 /// A candidate off-site symbol resolved deterministically from the failure
 /// site, before the weak-model relevance gate runs.
+#[derive(Clone)]
 struct OffSiteCandidate {
     id: String,
     symbol: String,
@@ -542,12 +639,11 @@ struct OffSiteCandidate {
 /// observations — they are stored on `task.available_context` and only
 /// listed by name/path to the strong planner, which pulls a body in only if
 /// it decides it needs it. The weak model's only job here is a best-effort
-/// yes/no relevance judgment per candidate; if it is unavailable or fails,
-/// every candidate is still offered with `relevant: None` — never dropped.
-fn execute_select_context(
-    task: &mut task::TaskState,
-    step_index: usize,
-) -> io::Result<StepResult> {
+/// yes/no relevance judgment per candidate; if it is unavailable, fails, or
+/// returns no relevant ids at all (a degenerate, low-confidence result on an
+/// already small, pre-filtered candidate set), every candidate is still
+/// offered with `relevant: None` — never dropped.
+fn execute_select_context(task: &mut task::TaskState, step_index: usize) -> io::Result<StepResult> {
     let Some(failure) = task.current_failure.clone() else {
         return Ok(StepResult {
             summary: "no failure to select context for".to_string(),
@@ -555,7 +651,7 @@ fn execute_select_context(
         });
     };
 
-    let candidates = collect_off_site_candidates(&failure);
+    let candidates = collect_graph_candidates(&failure);
     if candidates.is_empty() {
         return Ok(StepResult {
             summary: "call-stack follow surfaced no off-site candidates".to_string(),
@@ -563,25 +659,34 @@ fn execute_select_context(
         });
     }
 
-    let relevant_ids = judge_candidate_relevance(task, step_index, &failure.summary, &candidates)?;
-
     let listing = candidates
         .iter()
         .map(|candidate| format!("{}@{}", candidate.symbol, candidate.path))
         .collect::<Vec<_>>()
         .join(", ");
-    for candidate in candidates {
-        let relevant = relevant_ids
-            .as_ref()
-            .map(|ids| ids.contains(&candidate.id));
+    for candidate in &candidates {
+        let file_digest = std::fs::read(&candidate.path)
+            .ok()
+            .map(|bytes| crate::context::artifact::file_content_digest(&bytes));
         task.available_context.push(task::AvailableContext {
-            id: candidate.id,
-            symbol: candidate.symbol,
-            path: candidate.path,
+            id: candidate.id.clone(),
+            symbol: candidate.symbol.clone(),
+            path: candidate.path.clone(),
             start_line: candidate.start_line,
-            body: candidate.body,
-            relevant,
+            body: candidate.body.clone(),
+            file_digest,
+            relevant: None,
         });
+    }
+
+    let (ranking_failure, ranking_candidates) =
+        compiled_ranking_inputs(task, &failure, &candidates)?;
+    let relevant_ids =
+        judge_candidate_relevance(task, step_index, &ranking_failure, &ranking_candidates)?;
+    for candidate in &mut task.available_context {
+        if candidates.iter().any(|staged| staged.id == candidate.id) {
+            candidate.relevant = relevant_ids.as_ref().map(|ids| ids.contains(&candidate.id));
+        }
     }
 
     Ok(StepResult {
@@ -590,95 +695,58 @@ fn execute_select_context(
     })
 }
 
-/// Follow the call stack from the failure site(s) deterministically. For each
-/// location, scan the surrounding window for called symbols
-/// (`task::function_call_name`) and resolve each via `read_symbol`: a
-/// same-file resolution recurses into that symbol's body (next depth); a
-/// different-file resolution is a candidate. Ambiguous (`InvalidInput`) or
-/// unresolved (`NotFound`) symbols are skipped — the planner can still reach
-/// them via `search`/`sym`.
-fn collect_off_site_candidates(failure: &task::CurrentFailure) -> Vec<OffSiteCandidate> {
+/// Build a `CodeGraph` over the workspace and traverse call edges from the
+/// failure site(s): a same-file callee recurses into that callee's own
+/// calls (as today); a cross-file callee is a candidate. Bounded by
+/// `MAX_CANDIDATE_DEPTH` and `MAX_CANDIDATES`. Falls back to no candidates —
+/// same as the previous empty-candidate path — if the graph fails to build
+/// or a failure location doesn't resolve to an enclosing symbol, rather than
+/// aborting the run.
+fn collect_graph_candidates(failure: &task::CurrentFailure) -> Vec<OffSiteCandidate> {
+    let Ok(graph) = code_graph::CodeGraph::build(Path::new(".")) else {
+        return Vec::new();
+    };
+
     let mut candidates = Vec::new();
-    let mut visited_symbols = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
 
     for location in failure.locations.iter().take(3) {
         if candidates.len() >= MAX_CANDIDATES {
             break;
         }
-        if let Some((path, line)) = parse_location(location) {
-            follow_call_stack(&path, line, 0, &mut visited_symbols, &mut candidates);
+        let Some((path, line)) = parse_location(location) else {
+            continue;
+        };
+
+        let remaining = MAX_CANDIDATES - candidates.len();
+        for found in graph.callees_from(&path, line, remaining, MAX_CANDIDATE_DEPTH) {
+            if !seen.insert((found.symbol.clone(), found.path.clone())) {
+                continue;
+            }
+            candidates.push(OffSiteCandidate {
+                id: format!("c{}", candidates.len() + 1),
+                symbol: found.symbol,
+                path: found.path,
+                start_line: found.start_line,
+                body: truncate(&found.code, 2_000),
+            });
+            if candidates.len() >= MAX_CANDIDATES {
+                break;
+            }
         }
     }
 
     candidates
 }
 
-fn follow_call_stack(
-    site_path: &str,
-    site_line: usize,
-    depth: usize,
-    visited_symbols: &mut std::collections::HashSet<String>,
-    candidates: &mut Vec<OffSiteCandidate>,
-) {
-    if depth >= MAX_CANDIDATE_DEPTH || candidates.len() >= MAX_CANDIDATES {
-        return;
-    }
-    let Ok(contents) = std::fs::read_to_string(site_path) else {
-        return;
-    };
-    let lines: Vec<&str> = contents.lines().collect();
-    if lines.is_empty() {
-        return;
-    }
-    let radius = read_window::DEFAULT_RADIUS;
-    let start = site_line.saturating_sub(radius).max(1);
-    let end = (site_line + radius).min(lines.len());
-    if start > end {
-        return;
-    }
-
-    for raw_line in &lines[start - 1..end] {
-        if candidates.len() >= MAX_CANDIDATES {
-            return;
-        }
-        let Some(symbol) = task::function_call_name(raw_line) else {
-            continue;
-        };
-        if !visited_symbols.insert(symbol.clone()) {
-            continue;
-        }
-        let Ok(found) = read_symbol::read_symbol(Path::new("."), &symbol) else {
-            continue;
-        };
-
-        if found.path != site_path {
-            candidates.push(OffSiteCandidate {
-                id: format!("c{}", candidates.len() + 1),
-                symbol,
-                path: found.path,
-                start_line: found.symbol.start_line,
-                body: truncate(&found.code, 2_000),
-            });
-        } else {
-            follow_call_stack(
-                &found.path,
-                found.symbol.start_line,
-                depth + 1,
-                visited_symbols,
-                candidates,
-            );
-        }
-    }
-}
-
 /// Ask the weak model a yes/no relevance judgment for each candidate. Returns
-/// `Some(relevant_ids)` on success, `None` on any failure/unavailability — the
-/// caller treats `None` as "unknown" for every candidate, never as "drop
-/// them".
+/// `Some(relevant_ids)` on success, `None` on any failure/unavailability or
+/// when the model returns no relevant ids at all — the caller treats `None`
+/// as "unknown" for every candidate, never as "drop them".
 fn judge_candidate_relevance(
     task: &mut task::TaskState,
     step_index: usize,
-    failure_summary: &str,
+    failure: &task::CurrentFailure,
     candidates: &[OffSiteCandidate],
 ) -> io::Result<Option<std::collections::HashSet<String>>> {
     let Some(weak_config) =
@@ -687,52 +755,116 @@ fn judge_candidate_relevance(
         return Ok(None);
     };
     let model_name = weak_config.model.clone();
+    let billed = weak_config.billed;
     let weak = OpenAiProvider::new(weak_config);
 
+    let known_ids: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect();
+
+    let mut remaining_budget = CANDIDATE_LISTING_TOKEN_BUDGET;
     let listing = candidates
         .iter()
-        .map(|candidate| format!("{}: {} @ {}", candidate.id, candidate.symbol, candidate.path))
+        .map(|candidate| {
+            let body_tokens = estimate_tokens(candidate.body.as_bytes());
+            let body = if body_tokens > remaining_budget {
+                eprintln!(
+                    "select_context: trimming candidate {} body to fit aggregate token budget",
+                    candidate.id
+                );
+                truncate(&candidate.body, remaining_budget.saturating_mul(4))
+            } else {
+                candidate.body.clone()
+            };
+            remaining_budget = remaining_budget.saturating_sub(body_tokens.min(remaining_budget));
+            format!(
+                "{}: {} @ {}\n```\n{}\n```",
+                candidate.id, candidate.symbol, candidate.path, body
+            )
+        })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
+
+    let failure_site_frame = failure
+        .locations
+        .first()
+        .and_then(|location| parse_location(location))
+        .and_then(|(path, line)| {
+            read_window::read_window(
+                PathBuf::from(&path),
+                line,
+                read_window::DEFAULT_RADIUS,
+                false,
+            )
+            .ok()
+        })
+        .map(|window| {
+            let body = window
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Failure site (where the failure surfaced / where the call originates — \
+                 NOT an edit candidate, context only): {}\n```\n{body}\n```",
+                window.path.display()
+            )
+        })
+        .unwrap_or_default();
+
+    let observed_detail = failure
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or(&failure.summary);
+
     let prompt = format!(
-        "A test is failing. For each candidate off-site symbol below, judge whether its \
-         definition is relevant to fixing the failure at its source (not just referenced \
-         in passing). Return the ids of the relevant ones.\n\n\
-         Failure: {failure_summary}\n\nCandidates:\n{listing}"
+        "A test is failing. The observed assertion diff below (expected vs actual) is ground \
+         truth about the bug's behavior. Treat test names, symbol names, and comments on any \
+         candidate as unverified labels, not evidence — decide from the code's actual logic \
+         and the observed diff which candidate's definition produces the wrong value. Every \
+         candidate below was reached by deterministically following the call stack from the \
+         failure site, so each is already known to be on the path — the question is not \
+         whether it's reachable, but whether its own definition must be inspected or edited to \
+         fix the bug at its source. Prefer the candidate that owns the business logic over one \
+         that merely forwards a value along; the failure-site frame below is context showing \
+         where the failure was observed, not an edit target. Return the ids of the candidates \
+         whose definition is relevant.\n\n\
+         Observed failure:\n```\n{observed_detail}\n```\n\n{failure_site_frame}\nCandidates:\n{listing}"
     );
     let tools = relevance_tools();
-    let input_estimate = estimate_tokens(prompt.as_bytes()) + estimate_tool_tokens(&tools);
-    let request = ModelRequest {
-        purpose: ModelPurpose::ContextRanking,
-        system: None,
-        prompt: prompt.clone(),
-        estimated_tokens: EstimatedTokenUsage {
-            input: input_estimate,
-            output: CLASSIFY_MAX_OUTPUT_TOKENS,
-        },
-        max_output_tokens: Some(CLASSIFY_MAX_OUTPUT_TOKENS),
-        reasoning_effort: reasoning_effort_for(ModelPurpose::ContextRanking).map(str::to_string),
-        metadata: BTreeMap::new(),
-    };
+    let assembled = assemble_model_request(
+        task,
+        step_index,
+        NodeOp::SelectContext,
+        ModelPurpose::ContextRanking,
+        None,
+        &prompt,
+        &tools,
+        CLASSIFY_MAX_OUTPUT_TOKENS,
+    )?;
+    let input_estimate = assembled.request.estimated_tokens.input;
 
     // Best-effort gate: a weak model that fails to emit the tool call (common
     // for small local models) must degrade to "unknown relevance", never
     // abort the run.
-    let Ok((_tool, args, response)) = weak.complete_with_tools(request, &tools) else {
+    let Ok(invocation) = invocation::invoke_with_tools(
+        Path::new(RUN_STORE_PATH),
+        &weak,
+        assembled,
+        &tools,
+        &model_name,
+        billed,
+        None,
+    ) else {
         return Ok(None);
     };
+    let manifest_id = invocation.manifest_id;
+    let (_tool, args, response) = invocation.value;
 
-    let relevant_ids: std::collections::HashSet<String> = args
-        .get("relevant_ids")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let relevant_ids = extract_relevant_ids(&args, &known_ids);
 
     let input = response.reported_tokens.input.unwrap_or(input_estimate);
     let output = response
@@ -744,36 +876,75 @@ fn judge_candidate_relevance(
         .packet_tokens_used
         .saturating_add(input)
         .saturating_add(output);
+    let purpose = ModelPurpose::ContextRanking.to_string();
+    let observation = format!(
+        "relevant: {}",
+        relevant_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
     record_agent_trace(
         task,
         step_index,
-        &model_name,
-        &ModelPurpose::ContextRanking.to_string(),
-        &prompt,
-        ExecutorKind::WeakModel,
-        input,
-        output,
-        &format!("relevant: {}", relevant_ids.iter().cloned().collect::<Vec<_>>().join(", ")),
+        AgentTraceInput {
+            model: &model_name,
+            purpose: &purpose,
+            prompt: &prompt,
+            response: &response.text,
+            executor: ExecutorKind::WeakModel,
+            input_tokens: input,
+            output_tokens: output,
+            observation: &observation,
+            billed,
+            manifest_id: Some(&manifest_id),
+        },
     )?;
 
+    // An empty result from a small, already deterministically pre-filtered
+    // candidate set is a low-confidence, degenerate outcome — not
+    // meaningfully different from the model failing outright. Degrade to
+    // "unknown" for every candidate rather than a confident "not relevant".
+    if relevant_ids.is_empty() {
+        return Ok(None);
+    }
+
     Ok(Some(relevant_ids))
+}
+
+/// Tolerantly extract known candidate ids from a `judge_relevance` tool call.
+/// Models occasionally emit ids under a different key than `relevant_ids`, or
+/// echo back the full `"c1: symbol @ path"` label instead of the bare id.
+/// Try likely keys in order, then normalize each returned string to its
+/// leading `cN` token and keep it only if it names a real candidate.
+fn extract_relevant_ids(
+    args: &serde_json::Value,
+    known_ids: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    for key in ["relevant_ids", "candidates", "ids", "relevant"] {
+        let Some(items) = args.get(key).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let ids: std::collections::HashSet<String> = items
+            .iter()
+            .filter_map(|value| value.as_str())
+            .filter_map(|raw| {
+                let token = raw
+                    .split(|c: char| c == ':' || c.is_whitespace())
+                    .next()
+                    .unwrap_or(raw)
+                    .trim();
+                known_ids.contains(token).then(|| token.to_string())
+            })
+            .collect();
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    std::collections::HashSet::new()
 }
 
 /// Tool schema for the weak-model relevance gate: ids only, no code, no
 /// enumeration of symbols (retrieval is deterministic).
 fn relevance_tools() -> Vec<ToolDefinition> {
-    vec![ToolDefinition {
-        name: "judge_relevance",
-        description: "Record the ids of candidates whose definition is relevant to fixing the failure at its source.",
-        parameters: serde_json::json!({
-            "type": "object",
-            "required": ["relevant_ids"],
-            "additionalProperties": false,
-            "properties": {
-                "relevant_ids": { "type": "array", "items": { "type": "string" } }
-            }
-        }),
-    }]
+    primitive::context_ranker_profile().materialize(primitive::ToolProfileCapabilities::default())
 }
 
 /// Parse a failure location into `(path, line)`. Diagnostic extraction emits
@@ -811,15 +982,33 @@ fn execute_plan_context(task: &mut task::TaskState, step_index: usize) -> io::Re
         ));
     };
     let model_name = strong_config.model.clone();
+    let billed = strong_config.billed;
     let strong = OpenAiProvider::new(strong_config);
 
     let prompt = planner_prompt(task);
     let tools = planner_tools(task);
-    let request = model_request(task, ModelPurpose::AgentPlanner, &prompt, &tools);
-    let estimated = request.estimated_tokens;
-    let (tool_name, args_value, response) = strong
-        .complete_with_tools(request, &tools)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let assembled = assemble_model_request(
+        task,
+        step_index,
+        NodeOp::PlanContext,
+        ModelPurpose::AgentPlanner,
+        Some(PLANNER_SYSTEM_PROMPT),
+        &prompt,
+        &tools,
+        max_output_tokens_for(ModelPurpose::AgentPlanner),
+    )?;
+    let estimated = assembled.request.estimated_tokens;
+    let invocation = invocation::invoke_with_tools(
+        Path::new(RUN_STORE_PATH),
+        &strong,
+        assembled,
+        &tools,
+        &model_name,
+        billed,
+        None,
+    )?;
+    let manifest_id = invocation.manifest_id;
+    let (tool_name, args_value, response) = invocation.value;
     let action = action_from_tool_call(&tool_name, args_value)?;
     validate_action(&action, task)?;
 
@@ -850,6 +1039,8 @@ fn execute_plan_context(task: &mut task::TaskState, step_index: usize) -> io::Re
             estimated_output_tokens: estimated.output as i64,
             reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
             reported_output_tokens: response.reported_tokens.output.map(|value| value as i64),
+            billed,
+            manifest_id: Some(&manifest_id),
             created_at: &Utc::now().to_rfc3339(),
         },
     )?;
@@ -947,14 +1138,33 @@ fn execute_plan_patch(task: &mut task::TaskState, step_index: usize) -> io::Resu
         ));
     };
     let model_name = strong_config.model.clone();
+    let billed = strong_config.billed;
     let strong = OpenAiProvider::new(strong_config);
 
     let prompt = patch_plan_prompt(task);
-    let request = model_request(task, ModelPurpose::PatchGeneration, &prompt, &edit_tools());
-    let estimated = request.estimated_tokens;
-    let (tool_name, args_value, response) = strong
-        .complete_with_tools(request, &edit_tools())
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let tools = edit_tools();
+    let assembled = assemble_model_request(
+        task,
+        step_index,
+        NodeOp::PlanPatch,
+        ModelPurpose::PatchGeneration,
+        None,
+        &prompt,
+        &tools,
+        max_output_tokens_for(ModelPurpose::PatchGeneration),
+    )?;
+    let estimated = assembled.request.estimated_tokens;
+    let invocation = invocation::invoke_with_tools(
+        Path::new(RUN_STORE_PATH),
+        &strong,
+        assembled,
+        &tools,
+        &model_name,
+        billed,
+        None,
+    )?;
+    let manifest_id = invocation.manifest_id;
+    let (tool_name, args_value, response) = invocation.value;
     let edits = patch_edits_from_tool_call(&tool_name, args_value)?;
     let patch_text = render_patch_edits(&edits);
     task.patch_edits = Some(edits);
@@ -980,6 +1190,8 @@ fn execute_plan_patch(task: &mut task::TaskState, step_index: usize) -> io::Resu
             estimated_output_tokens: estimated.output as i64,
             reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
             reported_output_tokens: response.reported_tokens.output.map(|value| value as i64),
+            billed,
+            manifest_id: Some(&manifest_id),
             created_at: &Utc::now().to_rfc3339(),
         },
     )?;
@@ -995,31 +1207,7 @@ fn execute_plan_patch(task: &mut task::TaskState, step_index: usize) -> io::Resu
 /// generation cheap — no hunk headers, no unchanged context lines, no
 /// verification/summary boilerplate.
 fn edit_tools() -> Vec<ToolDefinition> {
-    vec![ToolDefinition {
-        name: "propose_edits",
-        description: "Minimal exact string edits that fix the failure. Each `find` must appear verbatim, and uniquely, in `path`.",
-        parameters: serde_json::json!({
-            "type": "object",
-            "required": ["edits"],
-            "additionalProperties": false,
-            "properties": {
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "required": ["path", "find", "replace"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "path":    { "type": "string" },
-                            "find":    { "type": "string" },
-                            "replace": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        }),
-    }]
+    primitive::patch_editor_profile().materialize(primitive::ToolProfileCapabilities::default())
 }
 
 /// Map the `propose_edits` tool call back to structured `PatchEdit`s.
@@ -1102,10 +1290,17 @@ fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
     }
 
     let summary = match task.patch_edits.as_deref() {
-        Some(edits) if !edits.is_empty() => apply_patch_edits(edits),
+        Some(edits) if !edits.is_empty() && task.apply_requested => {
+            patch::apply_edits(&patch::project_root()?, edits)?
+        }
+        Some(edits) if !edits.is_empty() => {
+            let preview = patch::preview_edits(&patch::project_root()?, edits)?;
+            format!("preview only; rerun with --apply to write:\n{preview}")
+        }
         _ => "no edits to apply".to_string(),
     };
-    task.patch_applied = true;
+    task.patch_applied = task.apply_requested && !summary.starts_with("no edits");
+    task.patch_previewed = !task.apply_requested && !summary.starts_with("no edits");
     Ok(StepResult {
         summary,
         terminal: false,
@@ -1156,50 +1351,6 @@ fn patch_scope_violation(task: &task::TaskState) -> Option<String> {
     }
 }
 
-/// Apply structured find/replace edits to the working tree, in order. Each
-/// edit's `find` text must occur in the target file. Returns a concise summary
-/// for the route log; failures are reported but do not abort the step so the
-/// final verification can catch them and drive a retry.
-fn apply_patch_edits(edits: &[task::PatchEdit]) -> String {
-    let mut applied = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-
-    for edit in edits {
-        if edit.find.is_empty() {
-            failures.push(format!("{}: empty find", edit.path));
-            continue;
-        }
-        let path = Path::new(&edit.path);
-        let content = match std::fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(error) => {
-                failures.push(format!("{}: {error}", edit.path));
-                continue;
-            }
-        };
-        if !content.contains(&edit.find) {
-            failures.push(format!("{}: find text not present", edit.path));
-            continue;
-        }
-        let updated = content.replace(&edit.find, &edit.replace);
-        if let Err(error) = std::fs::write(path, updated) {
-            failures.push(format!("{}: {error}", edit.path));
-            continue;
-        }
-        applied += 1;
-    }
-
-    if failures.is_empty() {
-        format!("applied {applied} edit(s)")
-    } else {
-        format!(
-            "applied {applied} edit(s); {} failed: {}",
-            failures.len(),
-            failures.join("; ")
-        )
-    }
-}
-
 fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<StepResult> {
     let Some(plan) = task.verification.clone() else {
         return Ok(StepResult {
@@ -1225,7 +1376,10 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
 }
 
 fn execute_retry_fix(task: &mut task::TaskState) -> io::Result<StepResult> {
-    task.last_failure_signature = task.current_failure.as_ref().map(workflow::failure_signature);
+    task.last_failure_signature = task
+        .current_failure
+        .as_ref()
+        .map(workflow::failure_signature);
     task.retry_count += 1;
     task.patch_text = None;
     task.patch_edits = None;
@@ -1258,6 +1412,7 @@ fn execute_direct_answer(task: &mut task::TaskState, step_index: usize) -> io::R
         ));
     };
     let model_name = strong_config.model.clone();
+    let billed = strong_config.billed;
     let strong = OpenAiProvider::new(strong_config);
 
     let prompt = format!(
@@ -1269,11 +1424,27 @@ fn execute_direct_answer(task: &mut task::TaskState, step_index: usize) -> io::R
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let request = model_request(task, ModelPurpose::FinalReport, &prompt, &[]);
-    let estimated = request.estimated_tokens;
-    let response = strong
-        .complete(request)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let assembled = assemble_model_request(
+        task,
+        step_index,
+        NodeOp::DirectAnswer,
+        ModelPurpose::FinalReport,
+        None,
+        &prompt,
+        &[],
+        max_output_tokens_for(ModelPurpose::FinalReport),
+    )?;
+    let estimated = assembled.request.estimated_tokens;
+    let invocation = invocation::invoke_plain(
+        Path::new(RUN_STORE_PATH),
+        &strong,
+        assembled,
+        &model_name,
+        billed,
+        None,
+    )?;
+    let manifest_id = invocation.manifest_id;
+    let response = invocation.value;
 
     let cost = estimated.input + response.reported_tokens.output.unwrap_or(estimated.output);
     task.budget.packet_tokens_used = task.budget.packet_tokens_used.saturating_add(cost);
@@ -1295,6 +1466,8 @@ fn execute_direct_answer(task: &mut task::TaskState, step_index: usize) -> io::R
             estimated_output_tokens: estimated.output as i64,
             reported_input_tokens: response.reported_tokens.input.map(|value| value as i64),
             reported_output_tokens: response.reported_tokens.output.map(|value| value as i64),
+            billed,
+            manifest_id: Some(&manifest_id),
             created_at: &Utc::now().to_rfc3339(),
         },
     )?;
@@ -1325,13 +1498,7 @@ fn execute_report(task: &mut task::TaskState) -> io::Result<StepResult> {
 fn record_agent_trace(
     task: &task::TaskState,
     step_index: usize,
-    model: &str,
-    purpose: &str,
-    prompt: &str,
-    executor: ExecutorKind,
-    input_tokens: usize,
-    output_tokens: usize,
-    observation: &str,
+    input: AgentTraceInput<'_>,
 ) -> io::Result<()> {
     store::insert_agent_trace(
         Path::new(RUN_STORE_PATH),
@@ -1339,23 +1506,26 @@ fn record_agent_trace(
             id: &trace_id(),
             task_id: &task.id,
             step_index: step_index as i64,
-            model,
-            purpose,
-            prompt,
-            response: &format!("{:?}", executor),
+            model: input.model,
+            purpose: input.purpose,
+            prompt: input.prompt,
+            response: input.response,
             // Key the action on its purpose, not just the executor tier: two
             // distinct weak-model steps (e.g. intent classification and context
             // selection) must not read as the same action to duplicate-action
             // detection.
             action_json: &format!(
-                "{{\"step\":\"{}\",\"purpose\":\"{purpose}\"}}",
-                executor.name()
+                "{{\"step\":\"{}\",\"purpose\":\"{}\"}}",
+                input.executor.name(),
+                input.purpose,
             ),
-            observation,
-            estimated_input_tokens: input_tokens as i64,
-            estimated_output_tokens: output_tokens as i64,
-            reported_input_tokens: Some(input_tokens as i64),
-            reported_output_tokens: Some(output_tokens as i64),
+            observation: input.observation,
+            estimated_input_tokens: input.input_tokens as i64,
+            estimated_output_tokens: input.output_tokens as i64,
+            reported_input_tokens: Some(input.input_tokens as i64),
+            reported_output_tokens: Some(input.output_tokens as i64),
+            billed: input.billed,
+            manifest_id: input.manifest_id,
             created_at: &Utc::now().to_rfc3339(),
         },
     )
@@ -1372,28 +1542,37 @@ const CLASSIFY_MAX_OUTPUT_TOKENS: usize = 64;
 
 fn classify_task(
     provider: &OpenAiProvider,
-    goal: &str,
-) -> io::Result<(task::TaskIntent, usize, usize)> {
+    task: &task::TaskState,
+    step_index: usize,
+    model_name: &str,
+    billed: bool,
+) -> io::Result<(task::TaskIntent, usize, usize, String, String)> {
+    let goal = compiled_task_goal(task)?.unwrap_or_else(|| task.goal.clone());
     let prompt = format!("Classify task intent.\nTask: {goal}");
     let tools = classifier_tools();
-    let input_estimate = estimate_tokens(prompt.as_bytes()) + estimate_tool_tokens(&tools);
-    let request = ModelRequest {
-        purpose: ModelPurpose::IntentClassification,
-        system: None,
-        prompt,
-        estimated_tokens: EstimatedTokenUsage {
-            input: input_estimate,
-            output: CLASSIFY_MAX_OUTPUT_TOKENS,
-        },
-        max_output_tokens: Some(CLASSIFY_MAX_OUTPUT_TOKENS),
-        reasoning_effort: reasoning_effort_for(ModelPurpose::IntentClassification)
-            .map(str::to_string),
-        metadata: BTreeMap::new(),
-    };
+    let assembled = assemble_model_request(
+        task,
+        step_index,
+        NodeOp::ClassifyIntent,
+        ModelPurpose::IntentClassification,
+        None,
+        &prompt,
+        &tools,
+        CLASSIFY_MAX_OUTPUT_TOKENS,
+    )?;
+    let input_estimate = assembled.request.estimated_tokens.input;
 
-    let (_tool, args, response) = provider
-        .complete_with_tools(request, &tools)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let invocation = invocation::invoke_with_tools(
+        Path::new(RUN_STORE_PATH),
+        provider,
+        assembled,
+        &tools,
+        model_name,
+        billed,
+        None,
+    )?;
+    let manifest_id = invocation.manifest_id;
+    let (_tool, args, response) = invocation.value;
 
     let intent = parse_intent(args.get("intent").and_then(|value| value.as_str()));
     let input = response.reported_tokens.input.unwrap_or(input_estimate);
@@ -1401,7 +1580,122 @@ fn classify_task(
         .reported_tokens
         .output
         .unwrap_or(CLASSIFY_MAX_OUTPUT_TOKENS);
-    Ok((intent, input, output))
+    Ok((intent, input, output, response.text, manifest_id))
+}
+
+fn compiled_task_goal(task: &task::TaskState) -> io::Result<Option<String>> {
+    let Some(compiled) = compiled_context_for(task, NodeOp::ClassifyIntent)? else {
+        return Ok(None);
+    };
+    compiled_task_goal_value(compiled).map(Some)
+}
+
+fn compiled_task_goal_value(
+    compiled: crate::context::compiler::CompiledContext,
+) -> io::Result<String> {
+    compiled
+        .selected_artifacts
+        .into_iter()
+        .find(|artifact| artifact.category == primitive::ContextCategory::TaskGoal)
+        .map(|artifact| artifact.content)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compiled classify_intent context is missing task_goal",
+            )
+        })
+}
+
+fn compiled_ranking_inputs(
+    task: &task::TaskState,
+    legacy_failure: &task::CurrentFailure,
+    legacy_candidates: &[OffSiteCandidate],
+) -> io::Result<(task::CurrentFailure, Vec<OffSiteCandidate>)> {
+    let Some(compiled) = compiled_context_for(task, NodeOp::SelectContext)? else {
+        return Ok((legacy_failure.clone(), legacy_candidates.to_vec()));
+    };
+    compiled_ranking_values(compiled)
+}
+
+fn compiled_ranking_values(
+    compiled: crate::context::compiler::CompiledContext,
+) -> io::Result<(task::CurrentFailure, Vec<OffSiteCandidate>)> {
+    let failure = compiled
+        .selected_artifacts
+        .iter()
+        .find(|artifact| artifact.category == primitive::ContextCategory::CurrentFailure)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compiled select_context context is missing current_failure",
+            )
+        })
+        .and_then(|artifact| serde_json::from_str(&artifact.content).map_err(io::Error::other))?;
+    let mut candidates = compiled
+        .selected_artifacts
+        .into_iter()
+        .filter(|artifact| artifact.category == primitive::ContextCategory::CodeGraphCandidate)
+        .map(|artifact| {
+            let value = |key: &str| {
+                artifact.provenance.get(key).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("compiled code-graph candidate is missing {key} provenance"),
+                    )
+                })
+            };
+            Ok(OffSiteCandidate {
+                id: value("candidate_id")?,
+                symbol: value("symbol")?,
+                path: value("path")?,
+                start_line: value("start_line")?.parse().map_err(io::Error::other)?,
+                body: artifact.content,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok((failure, candidates))
+}
+
+fn compiled_context_for(
+    task: &task::TaskState,
+    op: NodeOp,
+) -> io::Result<Option<crate::context::compiler::CompiledContext>> {
+    let context_config = Config::load_from_current_dir()
+        .map(|config| config.context)
+        .unwrap_or_default();
+    let primitive = primitive::primitive_for_node_op(&op)
+        .expect("compiled context requires a registered primitive");
+    compiled_context_for_config(task, primitive, Path::new("."), &context_config)
+}
+
+fn compiled_context_for_config(
+    task: &task::TaskState,
+    primitive: &primitive::PrimitiveSpec,
+    repository_root: &Path,
+    context_config: &crate::config::ContextConfig,
+) -> io::Result<Option<crate::context::compiler::CompiledContext>> {
+    if !context_config.compiled_for(primitive.id.as_str()) {
+        return Ok(None);
+    }
+    let compiled = crate::context::compiler::compile(
+        task,
+        primitive,
+        repository_root,
+        task.budget
+            .hard_tokens
+            .saturating_sub(task.budget.packet_tokens_used),
+    )?;
+    if !compiled.unresolved_requirements.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "compiled {} context has unresolved requirements: {:?}",
+                primitive.id, compiled.unresolved_requirements
+            ),
+        ));
+    }
+    Ok(Some(compiled))
 }
 
 fn parse_intent(label: Option<&str>) -> task::TaskIntent {
@@ -1416,139 +1710,14 @@ fn parse_intent(label: Option<&str>) -> task::TaskIntent {
 }
 
 fn classifier_tools() -> Vec<ToolDefinition> {
-    vec![ToolDefinition {
-        name: "classify",
-        description: "Record the best-fitting intent.",
-        parameters: serde_json::json!({
-            "type": "object",
-            "required": ["intent"],
-            "additionalProperties": false,
-            "properties": {
-                "intent": {
-                    "type": "string",
-                    "enum": [
-                        "debug_failure",
-                        "implement_feature",
-                        "refactor",
-                        "answer_question"
-                    ]
-                }
-            }
-        }),
-    }]
+    primitive::intent_classifier_profile()
+        .materialize(primitive::ToolProfileCapabilities::default())
 }
 
 fn planner_tools(task: &task::TaskState) -> Vec<ToolDefinition> {
-    // Tool names are kept short to minimise schema token cost.
-    // Each tool only carries the args it actually needs.
-    let mut tools = vec![
-        ToolDefinition {
-            name: "search",
-            description: "Exact-string search across the repo; use to locate symbols, call sites or error text.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["query"],
-                "additionalProperties": false,
-                "properties": {
-                    "query":  { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "sym",
-            description: "Read one parsed symbol (name or path::name) with its body; prefer when the symbol is known.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["symbol"],
-                "additionalProperties": false,
-                "properties": {
-                    "symbol": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "win",
-            description: "Read a small line window around a file:line; use when no symbol name is known.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["file", "line"],
-                "additionalProperties": false,
-                "properties": {
-                    "file":   { "type": "string" },
-                    "line":   { "type": "integer" },
-                    "radius": { "type": "integer" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "trace",
-            description: "Run a command and capture gated output; use to reproduce failures and verify fixes.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["command"],
-                "additionalProperties": false,
-                "properties": {
-                    "command": { "type": "string" },
-                    "args":    { "type": "array", "items": { "type": "string" } }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "plan",
-            description: "Enough context exists to write the patch; reason is the concise patch plan.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["reason"],
-                "additionalProperties": false,
-                "properties": {
-                    "reason": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "finish",
-            description: "Task complete and verified; reason is the outcome summary.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["reason"],
-                "additionalProperties": false,
-                "properties": {
-                    "reason": { "type": "string" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "ask",
-            description: "Ask the user one question, only when no tool or the repo can answer it.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["question"],
-                "additionalProperties": false,
-                "properties": {
-                    "question": { "type": "string" }
-                }
-            }),
-        },
-    ];
-
-    // Only offered when there is something to pull — an empty listing would
-    // otherwise pay for an always-unusable tool schema on every step.
-    if !task.available_context.is_empty() {
-        tools.push(ToolDefinition {
-            name: "pull",
-            description: "Load the body of an available off-site symbol into context.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "required": ["id"],
-                "additionalProperties": false,
-                "properties": {
-                    "id": { "type": "string" }
-                }
-            }),
-        });
-    }
-
-    tools
+    primitive::context_planner_profile().materialize(primitive::ToolProfileCapabilities {
+        pull_available_context: !task.available_context.is_empty(),
+    })
 }
 
 /// Map a tool-call result back to the internal `PlannerAction` representation.
@@ -1710,42 +1879,142 @@ fn reasoning_effort_for(purpose: ModelPurpose) -> Option<&'static str> {
     }
 }
 
-/// Build a `ModelRequest`. `tools` should be the same schema slice passed to
-/// `complete_with_tools` for this call (or `&[]` for plain `complete` calls)
-/// so the local input-token estimate includes the function schema JSON the
-/// provider bills against the prompt — otherwise tool-calling requests
-/// under-count their estimated input tokens by the schema's size.
-fn model_request(
+#[allow(clippy::too_many_arguments)]
+fn assemble_model_request(
     task: &task::TaskState,
+    step_index: usize,
+    node_op: NodeOp,
     purpose: ModelPurpose,
+    system: Option<&str>,
     prompt: &str,
     tools: &[ToolDefinition],
-) -> ModelRequest {
-    let mut metadata = BTreeMap::new();
+    max_output_tokens: usize,
+) -> io::Result<AssembledRequest> {
+    let primitive = primitive::primitive_for_node_op(&node_op).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no primitive registered for {}", node_op.name()),
+        )
+    })?;
+    let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("task_id".to_string(), task.id.clone());
-
-    let system = match purpose {
-        ModelPurpose::AgentPlanner => Some(PLANNER_SYSTEM_PROMPT.to_string()),
-        _ => None,
+    let producer_id = primitive.id.as_str();
+    let producer_version = primitive.version.get();
+    let system_segments = system
+        .map(|content| {
+            vec![ContextSegment::new(
+                "system",
+                0,
+                ContextRole::System,
+                primitive::ContextCategory::Constraints,
+                ContextRepresentation::Raw,
+                producer_id,
+                producer_version,
+                content,
+                CachePolicy::Request,
+            )]
+        })
+        .unwrap_or_default();
+    let user_segments = vec![ContextSegment::new(
+        "prompt",
+        system_segments.len(),
+        ContextRole::Task,
+        primitive::ContextCategory::TaskGoal,
+        ContextRepresentation::Generated,
+        producer_id,
+        producer_version,
+        prompt,
+        CachePolicy::NoStore,
+    )];
+    let correlation = RequestCorrelation {
+        task_id: task.id.clone(),
+        step_index,
+        node_id: task
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.status == workflow::NodeStatus::Running)
+            .map(|node| node.id.clone()),
+        workflow_compiler_version: task
+            .workflow_spec
+            .as_ref()
+            .map(|spec| spec.compiler_version.clone()),
     };
-    let system_tokens = system
-        .as_ref()
-        .map(|s| estimate_tokens(s.as_bytes()))
-        .unwrap_or(0);
-    let max_output = max_output_tokens_for(purpose);
-
-    ModelRequest {
+    let mut assembled = request::assemble(RequestAssembly {
+        primitive,
+        system_segments,
+        user_segments,
+        tools,
         purpose,
-        system,
-        prompt: prompt.to_string(),
-        estimated_tokens: EstimatedTokenUsage {
-            input: system_tokens + estimate_tool_tokens(tools) + estimate_tokens(prompt.as_bytes()),
-            output: max_output,
-        },
-        max_output_tokens: Some(max_output),
+        max_output_tokens,
         reasoning_effort: reasoning_effort_for(purpose).map(str::to_string),
+        correlation,
         metadata,
+    })
+    .map_err(io::Error::other)?;
+
+    let context_config = Config::load_from_current_dir()
+        .map(|config| config.context)
+        .unwrap_or_default();
+    attach_context_comparison(
+        task,
+        primitive,
+        Path::new("."),
+        &context_config,
+        &mut assembled,
+    )?;
+
+    Ok(assembled)
+}
+
+fn attach_context_comparison(
+    task: &task::TaskState,
+    primitive: &primitive::PrimitiveSpec,
+    repository_root: &Path,
+    context_config: &crate::config::ContextConfig,
+    assembled: &mut AssembledRequest,
+) -> io::Result<()> {
+    if context_config.compiler_mode != crate::config::CompilerMode::Off {
+        let started = std::time::Instant::now();
+        let required_categories: Vec<_> = primitive
+            .context_requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.kind == crate::context::artifact::RequirementKind::Required
+            })
+            .map(|requirement| requirement.category)
+            .collect();
+        let mut comparison = match crate::context::compiler::compile(
+            task,
+            primitive,
+            repository_root,
+            task.budget
+                .hard_tokens
+                .saturating_sub(task.budget.packet_tokens_used),
+        ) {
+            Ok(compiled) => crate::context::comparison::compare(
+                &required_categories,
+                &assembled.manifest.segments,
+                &compiled,
+                started.elapsed(),
+            ),
+            Err(error) => crate::context::comparison::compiler_error(
+                &required_categories,
+                &assembled.manifest.segments,
+                started.elapsed(),
+                &error.to_string(),
+            ),
+        };
+        if context_config.compiled_for(primitive.id.as_str())
+            && matches!(primitive.id.as_str(), "classify_intent" | "select_context")
+            && comparison.verdict == crate::context::comparison::ComparisonVerdict::Pass
+        {
+            comparison.authoritative = true;
+        }
+        assembled.manifest.comparison_json =
+            Some(serde_json::to_string(&comparison).map_err(io::Error::other)?);
     }
+    Ok(())
 }
 
 fn patch_plan_prompt(task: &task::TaskState) -> String {
@@ -1759,8 +2028,8 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
     // fails, find the cause") that the instruction sentence already implies;
     // `current_failure` carries the concrete signal instead. Keep the goal for
     // every other intent, where it's the only description of what to do.
-    let goal_is_redundant = task.current_failure.is_some()
-        && task.intent == Some(task::TaskIntent::DebugFailure);
+    let goal_is_redundant =
+        task.current_failure.is_some() && task.intent == Some(task::TaskIntent::DebugFailure);
     if !goal_is_redundant {
         prompt.push_str(&format!("Goal: {}\n", task.goal));
     }
@@ -1778,7 +2047,10 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
     if !observations.is_empty() {
         prompt.push_str("\nKnown context:\n");
         for observation in observations {
-            prompt.push_str(&format!("- {}\n", compact_observation(&observation.summary)));
+            prompt.push_str(&format!(
+                "- {}\n",
+                compact_observation(&observation.summary)
+            ));
         }
     }
     prompt
@@ -1790,9 +2062,7 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
 fn compact_observation(summary: &str) -> String {
     summary
         .lines()
-        .filter(|line| {
-            !line.starts_with("Estimated tokens:") && !line.starts_with("Lines: ")
-        })
+        .filter(|line| !line.starts_with("Estimated tokens:") && !line.starts_with("Lines: "))
         .map(|line| {
             let trimmed = line.trim_start();
             match trimmed.split_once(" | ") {
@@ -2070,7 +2340,14 @@ fn execute_search(query: &str) -> io::Result<String> {
 }
 
 fn execute_read_symbol(symbol: &str) -> io::Result<String> {
-    let item = read_symbol::read_symbol(Path::new("."), symbol)?;
+    let root = patch::project_root()?;
+    let target = if let Some((path, name)) = symbol.rsplit_once("::") {
+        let (_, relative_path) = patch::resolve_existing_path(&root, path)?;
+        format!("{}::{name}", relative_path.to_string_lossy())
+    } else {
+        symbol.to_string()
+    };
+    let item = read_symbol::read_symbol(&root, &target)?;
     Ok(format!(
         "read_symbol `{}` -> {} lines {}-{} ({} tokens)\n{}",
         symbol,
@@ -2083,7 +2360,9 @@ fn execute_read_symbol(symbol: &str) -> io::Result<String> {
 }
 
 fn execute_read_window(file: &str, line: usize, radius: usize) -> io::Result<String> {
-    let window = read_window::read_window(file.into(), line, radius, false)?;
+    let root = patch::project_root()?;
+    let (path, _) = patch::resolve_existing_path(&root, file)?;
+    let window = read_window::read_window(path, line, radius, false)?;
     Ok(truncate(&window.render(), 2_000))
 }
 
@@ -2183,6 +2462,7 @@ mod tests {
                 kind: "test_failure".to_string(),
                 summary: "config test failed".to_string(),
                 locations: vec!["src/config.rs:213:9".to_string()],
+                detail: None,
             }),
             closed_at: None,
             project: Some(task::ProjectCard {
@@ -2195,11 +2475,142 @@ mod tests {
             patch_text: None,
             patch_edits: None,
             patch_applied: false,
+            patch_previewed: false,
+            apply_requested: false,
+            terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,
             available_context: Vec::new(),
+            workflow_spec: None,
             workflow: workflow::Workflow::new(),
         }
+    }
+
+    #[test]
+    fn shadow_and_cutover_never_change_provider_visible_request() {
+        let task = task_fixture();
+        let tools = classifier_tools();
+        let mut assembled = assemble_model_request(
+            &task,
+            1,
+            NodeOp::ClassifyIntent,
+            ModelPurpose::IntentClassification,
+            None,
+            "Classify task intent.\nTask: Fix failing config test",
+            &tools,
+            CLASSIFY_MAX_OUTPUT_TOKENS,
+        )
+        .unwrap();
+        assembled.manifest.comparison_json = None;
+        let legacy_request = assembled.request.clone();
+        let primitive = primitive::primitive_for_node_op(&NodeOp::ClassifyIntent).unwrap();
+
+        attach_context_comparison(
+            &task,
+            primitive,
+            Path::new("."),
+            &crate::config::ContextConfig {
+                compiler_mode: crate::config::CompilerMode::Shadow,
+                compiled_primitives: Vec::new(),
+            },
+            &mut assembled,
+        )
+        .unwrap();
+        assert_eq!(assembled.request, legacy_request);
+        let shadow: crate::context::comparison::ContextCompilationComparison =
+            serde_json::from_str(assembled.manifest.comparison_json.as_deref().unwrap()).unwrap();
+        assert!(!shadow.authoritative);
+
+        assembled.manifest.comparison_json = None;
+        attach_context_comparison(
+            &task,
+            primitive,
+            Path::new("."),
+            &crate::config::ContextConfig {
+                compiler_mode: crate::config::CompilerMode::On,
+                compiled_primitives: vec!["classify_intent".to_string()],
+            },
+            &mut assembled,
+        )
+        .unwrap();
+        assert_eq!(assembled.request, legacy_request);
+        let cutover: crate::context::comparison::ContextCompilationComparison =
+            serde_json::from_str(assembled.manifest.comparison_json.as_deref().unwrap()).unwrap();
+        assert!(cutover.authoritative);
+
+        let on_config = crate::config::ContextConfig {
+            compiler_mode: crate::config::CompilerMode::On,
+            compiled_primitives: vec!["classify_intent".to_string(), "select_context".to_string()],
+        };
+        let compiled = compiled_context_for_config(&task, primitive, Path::new("."), &on_config)
+            .unwrap()
+            .unwrap();
+        let compiled_goal = compiled_task_goal_value(compiled).unwrap();
+        let compiled_request = assemble_model_request(
+            &task,
+            1,
+            NodeOp::ClassifyIntent,
+            ModelPurpose::IntentClassification,
+            None,
+            &format!("Classify task intent.\nTask: {compiled_goal}"),
+            &tools,
+            CLASSIFY_MAX_OUTPUT_TOKENS,
+        )
+        .unwrap();
+        assert_eq!(compiled_request.request, legacy_request);
+
+        let mut ranking_task = task.clone();
+        let candidate_body = "fn load_config() -> bool { true }".to_string();
+        let candidate = OffSiteCandidate {
+            id: "c1".to_string(),
+            symbol: "load_config".to_string(),
+            path: "Cargo.toml".to_string(),
+            start_line: 1,
+            body: candidate_body.clone(),
+        };
+        ranking_task.available_context.push(task::AvailableContext {
+            id: candidate.id.clone(),
+            symbol: candidate.symbol.clone(),
+            path: candidate.path.clone(),
+            start_line: candidate.start_line,
+            body: candidate.body.clone(),
+            file_digest: Some(crate::context::artifact::file_content_digest(
+                &std::fs::read("Cargo.toml").unwrap(),
+            )),
+            relevant: None,
+        });
+        let ranking_primitive = primitive::primitive_for_node_op(&NodeOp::SelectContext).unwrap();
+        let compiled = compiled_context_for_config(
+            &ranking_task,
+            ranking_primitive,
+            Path::new("."),
+            &on_config,
+        )
+        .unwrap()
+        .unwrap();
+        let (compiled_failure, compiled_candidates) = compiled_ranking_values(compiled).unwrap();
+        assert_eq!(
+            serde_json::to_value(compiled_failure).unwrap(),
+            serde_json::to_value(ranking_task.current_failure.as_ref().unwrap()).unwrap()
+        );
+        assert_eq!(compiled_candidates.len(), 1);
+        assert_eq!(compiled_candidates[0].id, candidate.id);
+        assert_eq!(compiled_candidates[0].symbol, candidate.symbol);
+        assert_eq!(compiled_candidates[0].path, candidate.path);
+        assert_eq!(compiled_candidates[0].start_line, candidate.start_line);
+        assert_eq!(compiled_candidates[0].body, candidate.body);
+
+        assembled.manifest.comparison_json = None;
+        attach_context_comparison(
+            &task,
+            primitive,
+            Path::new("."),
+            &crate::config::ContextConfig::default(),
+            &mut assembled,
+        )
+        .unwrap();
+        assert_eq!(assembled.request, legacy_request);
+        assert!(assembled.manifest.comparison_json.is_none());
     }
 
     #[test]
@@ -2364,6 +2775,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_exit_codes_distinguish_verified_from_incomplete_work() {
+        assert_eq!(stop_exit_code(StopReason::Verified), 0);
+        for reason in [
+            StopReason::Blocked,
+            StopReason::Failed,
+            StopReason::LoopDetected,
+            StopReason::BudgetExhausted,
+            StopReason::MaxSteps,
+        ] {
+            assert_ne!(stop_exit_code(reason), 0, "{reason:?}");
+        }
+    }
+
+    #[test]
     fn parse_location_handles_line_and_column_forms() {
         assert_eq!(
             parse_location("src/cart.rs:12"),
@@ -2375,6 +2800,28 @@ mod tests {
         );
         assert_eq!(parse_location("src/cart.rs"), None);
         assert_eq!(parse_location(":12"), None);
+    }
+
+    #[test]
+    fn extract_relevant_ids_normalizes_labeled_entries() {
+        let known: std::collections::HashSet<String> = ["c1".to_string()].into_iter().collect();
+        let args = serde_json::json!({
+            "candidates": ["c1: apply_bulk_discount @ src/pricing.rs"]
+        });
+
+        let ids = extract_relevant_ids(&args, &known);
+
+        assert_eq!(ids, known);
+    }
+
+    #[test]
+    fn extract_relevant_ids_drops_unknown_ids() {
+        let known: std::collections::HashSet<String> = ["c1".to_string()].into_iter().collect();
+        let args = serde_json::json!({ "relevant_ids": ["c9", "bogus"] });
+
+        let ids = extract_relevant_ids(&args, &known);
+
+        assert!(ids.is_empty());
     }
 
     #[test]
@@ -2409,28 +2856,6 @@ mod tests {
         assert!(error.to_string().contains("read_symbol.symbol"));
     }
 
-    #[test]
-    fn apply_patch_edits_replaces_text_in_file() {
-        let dir = std::env::temp_dir().join(format!("haycut-patch-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("lib.rs");
-        std::fs::write(&file, "assert_eq!(sum(2, 2), 5);").unwrap();
-
-        let edits = vec![task::PatchEdit {
-            path: file.to_str().unwrap().to_string(),
-            find: "assert_eq!(sum(2, 2), 5)".to_string(),
-            replace: "assert_eq!(sum(2, 2), 4)".to_string(),
-        }];
-
-        let summary = apply_patch_edits(&edits);
-        assert!(summary.contains("applied 1 edit(s)"), "summary: {summary}");
-
-        let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content, "assert_eq!(sum(2, 2), 4);");
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     fn available_context_fixture() -> task::AvailableContext {
         task::AvailableContext {
             id: "c1".to_string(),
@@ -2438,6 +2863,7 @@ mod tests {
             path: "src/pricing.rs".to_string(),
             start_line: 2,
             body: "pub fn apply_bulk_discount() {}".to_string(),
+            file_digest: None,
             relevant: None,
         }
     }
@@ -2481,7 +2907,11 @@ mod tests {
         let result = execute_pull_context(&mut task, "missing").unwrap();
 
         assert!(result.summary.contains("no available context"));
-        assert!(task.observations.iter().all(|o| o.source != PULLED_CONTEXT_SOURCE));
+        assert!(
+            task.observations
+                .iter()
+                .all(|o| o.source != PULLED_CONTEXT_SOURCE)
+        );
     }
 
     #[test]
@@ -2527,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_off_site_candidates_follows_call_stack_across_files() {
+    fn collect_graph_candidates_follows_call_stack_across_files() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("evals/cases/split_context_off_by_one_rs/repo");
         let original_dir = std::env::current_dir().unwrap();
@@ -2537,8 +2967,9 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "ten_units_qualifies_for_bulk_discount failed".to_string(),
             locations: vec!["src/cart.rs:4".to_string()],
+            detail: None,
         };
-        let candidates = collect_off_site_candidates(&failure);
+        let candidates = collect_graph_candidates(&failure);
 
         std::env::set_current_dir(original_dir).unwrap();
 
@@ -2547,7 +2978,10 @@ mod tests {
                 .iter()
                 .any(|c| c.symbol == "apply_bulk_discount" && c.path.ends_with("pricing.rs")),
             "expected apply_bulk_discount@pricing.rs among {:?}",
-            candidates.iter().map(|c| (&c.symbol, &c.path)).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| (&c.symbol, &c.path))
+                .collect::<Vec<_>>()
         );
     }
 }

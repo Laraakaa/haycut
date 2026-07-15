@@ -1,6 +1,6 @@
 ---
 source: src/commands/packet.rs
-assertion_line: 844
+assertion_line: 838
 expression: rendered
 ---
 EVIDENCE PACKET
@@ -9,7 +9,9 @@ Command:  cargo test commands::packet::tests::renders_packet  exit code: 101
 Likely failure:  test_failure: Test commands::packet::tests::renders_packet failed
 Diagnostics:
   - test failure: test commands::packet::tests::renders_packet failed
-  - panic: assertion `left == right` failed (src/commands/packet.rs:612:9)
+  - panic: assertion `left == right` failed
+left: "packet source"
+right: "useful source excerpt" (src/commands/packet.rs:612:9)
 Files mentioned:
   src/commands/packet.rs:612:9
 Suggested context:

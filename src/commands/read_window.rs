@@ -1,11 +1,25 @@
 use std::{fs, io, path::PathBuf};
 
-use crate::util::estimate_tokens;
+use crate::{project_path, util::estimate_tokens};
 
 pub const DEFAULT_RADIUS: usize = 20;
 const MAX_WINDOW_LINES: usize = 400;
 
 pub fn run(path: PathBuf, line: usize, radius: usize, force: bool) -> i32 {
+    let root = match project_path::canonical_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("Error resolving project root: {error}");
+            return 1;
+        }
+    };
+    let path = match project_path::resolve_existing(&root, &path.to_string_lossy()) {
+        Ok(path) => path.absolute,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 2;
+        }
+    };
     match read_window(path, line, radius, force) {
         Ok(window) => {
             print!("{}", window.render());

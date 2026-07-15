@@ -1,9 +1,12 @@
 use crate::config;
 
-pub fn run(force: bool) {
+pub fn run(force: bool) -> i32 {
     match config::create_default_config(force) {
         Ok(()) => println!("Created haycut.toml"),
-        Err(error) => eprintln!("Error: {error}"),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 1;
+        }
     }
 
     match config::UserConfig::create_if_missing() {
@@ -13,6 +16,11 @@ pub fn run(force: bool) {
                 println!("User config already exists: {}", path.display());
             }
         }
-        Err(error) => eprintln!("Warning: could not create user config: {error}"),
+        Err(error) => {
+            eprintln!("Error creating user config: {error}");
+            return 1;
+        }
     }
+
+    0
 }

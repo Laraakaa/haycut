@@ -191,12 +191,22 @@ fn test_failure_diagnostics(text: &str, source: &str) -> Vec<Diagnostic> {
         }
 
         if let Some((test_name, location)) = parse_panic(trimmed, source) {
-            let message = lines
+            let base_message = lines
                 .get(index + 1)
                 .map(|next| next.trim())
                 .filter(|next| !next.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| "panicked".to_string());
+            let message = if is_assertion_message(&base_message) {
+                let diff = collect_assertion_diff(&lines, index + 2);
+                if diff.is_empty() {
+                    base_message
+                } else {
+                    format!("{base_message}\n{}", diff.join("\n"))
+                }
+            } else {
+                base_message
+            };
 
             diagnostics.push(Diagnostic {
                 kind: DiagnosticKind::Panic,
@@ -241,6 +251,36 @@ fn parse_panic(line: &str, source: &str) -> Option<(Option<String>, Option<FileR
     let location = parse_path_line_col(after_panic, source, "panic location");
 
     Some((test_name, location))
+}
+
+/// True if `message` looks like a Rust assertion failure (as opposed to a
+/// bare `panicked` or custom `panic!(...)` message).
+fn is_assertion_message(message: &str) -> bool {
+    message.starts_with("assertion")
+}
+
+/// Collect the indented `left:` / `right:` (or `expected:` / `actual:`)
+/// detail lines that follow an assertion failure message, starting at
+/// `start_index`. Stops at the first blank or non-detail line.
+fn collect_assertion_diff(lines: &[&str], start_index: usize) -> Vec<String> {
+    let mut detail = Vec::new();
+
+    for line in lines.iter().skip(start_index) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let is_detail = trimmed.starts_with("left:")
+            || trimmed.starts_with("right:")
+            || trimmed.starts_with("expected:")
+            || trimmed.starts_with("actual:");
+        if !is_detail {
+            break;
+        }
+        detail.push(trimmed.to_string());
+    }
+
+    detail
 }
 
 // ── generic fallback layer ────────────────────────────────────────────────────
@@ -667,6 +707,26 @@ mod tests {
         assert_eq!(panic.line, Some(612));
         assert_eq!(panic.column, Some(9));
         assert_eq!(panic.message, "assertion `left == right` failed");
+    }
+
+    #[test]
+    fn extracts_assertion_diff_into_panic_message() {
+        let text = "test commands::pricing::tests::ten_units_qualifies_for_bulk_discount ... FAILED\n\
+             thread 'commands::pricing::tests::ten_units_qualifies_for_bulk_discount' panicked at src/cart.rs:42:9:\n\
+             assertion `left == right` failed\n\
+             \x20 left: 1000\n\
+             \x20 right: 900\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace";
+        let diagnostics = extract_diagnostics("", text, 101);
+
+        let panic = diagnostics
+            .iter()
+            .find(|d| d.kind == DiagnosticKind::Panic)
+            .expect("panic diagnostic");
+        assert_eq!(
+            panic.message,
+            "assertion `left == right` failed\nleft: 1000\nright: 900"
+        );
     }
 
     #[test]

@@ -71,6 +71,15 @@ pub struct TaskState {
     /// Whether the planned patch has been (stub) applied.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub patch_applied: bool,
+    /// Whether the current plan was shown without mutation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub patch_previewed: bool,
+    /// Mutation must be explicitly authorized by `agent run --apply`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub apply_requested: bool,
+    /// Final agent outcome, recorded when the workflow reaches a terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<crate::commands::agent::StopReason>,
     /// Number of retry-fix loops performed.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retry_count: usize,
@@ -83,6 +92,9 @@ pub struct TaskState {
     /// tool call away.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_context: Vec<AvailableContext>,
+    /// Versioned, serializable description of the compatibility workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_spec: Option<crate::commands::agent::workflow_spec::WorkflowSpec>,
     /// Self-writing DAG of nodes driving the agent state machine.
     #[serde(default)]
     pub workflow: crate::commands::agent::workflow::Workflow,
@@ -98,6 +110,8 @@ pub struct AvailableContext {
     pub path: String,
     pub start_line: usize,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_digest: Option<String>,
     #[serde(default)]
     pub relevant: Option<bool>,
 }
@@ -138,6 +152,10 @@ pub struct PatchEdit {
 pub struct RouteEntry {
     pub step: String,
     pub executor: crate::commands::agent::ExecutorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitive_id: Option<crate::commands::agent::primitive::PrimitiveId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primitive_version: Option<crate::commands::agent::primitive::PrimitiveVersion>,
     pub outcome: String,
 }
 
@@ -214,6 +232,8 @@ pub struct CurrentFailure {
     pub kind: String,
     pub summary: String,
     pub locations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 pub fn attach_current_run(
@@ -254,6 +274,10 @@ pub fn attach_current_run(
             kind: observation.kind.clone(),
             summary: observation.summary.clone(),
             locations: observation.locations.clone(),
+            detail: evidence
+                .primary_diagnostic
+                .as_ref()
+                .map(|primary| primary.message.clone()),
         });
         let observation_id = observation.id.clone();
         let new_hypotheses = hypotheses_for_observation(evidence, &observation);
@@ -307,7 +331,7 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
     let config =
         Config::load_from_current_dir().map_err(|error| io::Error::other(error.to_string()))?;
 
-    let task = TaskState {
+    let mut task = TaskState {
         schema_version: 1,
         id: task_id(),
         title: title.clone(),
@@ -336,11 +360,17 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         patch_text: None,
         patch_edits: None,
         patch_applied: false,
+        patch_previewed: false,
+        apply_requested: false,
+        terminal_reason: None,
         retry_count: 0,
         last_failure_signature: None,
         available_context: Vec::new(),
+        workflow_spec: None,
         workflow: crate::commands::agent::workflow::Workflow::new(),
     };
+    task.workflow_spec =
+        Some(crate::commands::agent::workflow_spec::compile_compatibility_spec(&task));
 
     save_current(&task)?;
     Ok(task)

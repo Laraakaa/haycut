@@ -25,6 +25,11 @@ fn load_largest_files(db_path: &Path, limit: usize) -> io::Result<Vec<FileInvent
 }
 
 fn print_files(files: &[FileInventoryEntry]) {
+    if files.is_empty() {
+        println!("No indexed files. Run `haycut index` to build the file inventory.");
+        return;
+    }
+
     println!("{:<32}  {:>7}  {:>11}", "Path", "Lines", "Est. tokens");
 
     for file in files {

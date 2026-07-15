@@ -7,6 +7,7 @@ use std::{
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
+    project_path,
     symbols::{Symbol, SymbolLanguage, parse_symbols},
     util::estimate_tokens,
 };
@@ -58,8 +59,17 @@ pub fn run(target: String) -> i32 {
 }
 
 pub fn read_symbol(root: &Path, target: &str) -> io::Result<SymbolMatch> {
-    let target = parse_target(target);
-    let matches = find_symbol_matches(root, &target)?;
+    let root = fs::canonicalize(root)?;
+    let mut target = parse_target(target);
+    if let Some(path) = target.path.as_deref() {
+        target.path = Some(
+            project_path::resolve_existing(&root, path)?
+                .relative
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let matches = find_symbol_matches(&root, &target)?;
 
     match matches.len() {
         0 => Err(io::Error::new(
@@ -109,7 +119,7 @@ fn find_symbol_matches(root: &Path, target: &SymbolTarget) -> io::Result<Vec<Sym
     Ok(matches)
 }
 
-fn symbol_files(root: &Path) -> Vec<(PathBuf, SymbolLanguage)> {
+pub(crate) fn symbol_files(root: &Path) -> Vec<(PathBuf, SymbolLanguage)> {
     let skipped_directories = skipped_directories();
     let mut walker = WalkBuilder::new(root);
     walker.hidden(false);
@@ -198,7 +208,7 @@ fn skipped_directories() -> HashSet<&'static str> {
     DEFAULT_SKIPPED_DIRECTORIES.iter().copied().collect()
 }
 
-fn normalize_path(path: &Path) -> String {
+pub(crate) fn normalize_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()

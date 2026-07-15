@@ -5,3 +5,6 @@
 .headroom
 /evals/results/
 evals/cases/*/repo/Cargo.lock
+.claude
+
+CLAUDE.local.md

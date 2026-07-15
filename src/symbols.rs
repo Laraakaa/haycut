@@ -180,6 +180,118 @@ fn python_symbol_from_node(node: Node<'_>, source: &str) -> Option<Symbol> {
     })
 }
 
+/// Extract callee names within `[start_byte, end_byte)` of `source`, in
+/// source order with duplicates removed. Walks `call_expression`/`call`
+/// nodes (and method-call/scoped-call variants) for all languages; for Rust,
+/// also scans `macro_invocation` token trees for `identifier(` pairs, since
+/// tree-sitter-rust parses macro arguments as opaque tokens and a pure
+/// `call_expression` walk would miss a call site like
+/// `assert_eq!(total_for(10, 100), 900)`.
+pub fn parse_calls(
+    source: &str,
+    language: SymbolLanguage,
+    start_byte: usize,
+    end_byte: usize,
+) -> io::Result<Vec<String>> {
+    let (ts_language, language_name) = match language {
+        SymbolLanguage::Python => (tree_sitter_python::LANGUAGE.into(), "Python"),
+        SymbolLanguage::Rust => (tree_sitter_rust::LANGUAGE.into(), "Rust"),
+        SymbolLanguage::Tsx => (tree_sitter_typescript::LANGUAGE_TSX.into(), "TSX"),
+        SymbolLanguage::TypeScript => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "TypeScript",
+        ),
+    };
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&ts_language)
+        .map_err(io::Error::other)?;
+    let tree = parser.parse(source, None).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse {language_name} source"),
+        )
+    })?;
+
+    let Some(node) = tree
+        .root_node()
+        .descendant_for_byte_range(start_byte, end_byte)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut calls = Vec::new();
+    collect_calls(node, source, language, &mut calls);
+
+    let mut seen = std::collections::HashSet::new();
+    calls.retain(|name| seen.insert(name.clone()));
+
+    Ok(calls)
+}
+
+fn collect_calls(node: Node<'_>, source: &str, language: SymbolLanguage, calls: &mut Vec<String>) {
+    if language == SymbolLanguage::Rust && node.kind() == "macro_invocation" {
+        collect_macro_token_calls(node, source, calls);
+    }
+
+    if let Some(name) = call_name_for_node(node, source) {
+        calls.push(name);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, source, language, calls);
+    }
+}
+
+fn call_name_for_node(node: Node<'_>, source: &str) -> Option<String> {
+    let function = match node.kind() {
+        "call_expression" | "call" => node.child_by_field_name("function")?,
+        _ => return None,
+    };
+
+    call_name_from_function_node(function, source)
+}
+
+fn call_name_from_function_node(node: Node<'_>, source: &str) -> Option<String> {
+    let named = match node.kind() {
+        "identifier" => node,
+        "field_expression" => node.child_by_field_name("field")?,
+        "scoped_identifier" => node.child_by_field_name("name")?,
+        "member_expression" => node.child_by_field_name("property")?,
+        "attribute" => node.child_by_field_name("attribute")?,
+        _ => return None,
+    };
+
+    named.utf8_text(source.as_bytes()).ok().map(str::to_string)
+}
+
+/// Scan a `macro_invocation`'s token tree for `identifier` nodes immediately
+/// followed by a `token_tree` sibling starting with `(` — the shape
+/// `total_for(10, 100)` takes when tree-sitter-rust parses macro arguments as
+/// opaque tokens rather than a real `call_expression`.
+fn collect_macro_token_calls(node: Node<'_>, source: &str, calls: &mut Vec<String>) {
+    if node.kind() == "token_tree" {
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        for pair in children.windows(2) {
+            let [identifier, next] = pair else { continue };
+            if identifier.kind() != "identifier" || next.kind() != "token_tree" {
+                continue;
+            }
+            if let Ok(name) = identifier.utf8_text(source.as_bytes()) {
+                calls.push(name.to_string());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_macro_token_calls(child, source, calls);
+    }
+}
+
 fn named_symbol(node: Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("name")
         .and_then(|name| name.utf8_text(source.as_bytes()).ok())
@@ -404,5 +516,64 @@ def build_session():
             Some(SymbolLanguage::Python)
         );
         assert_eq!(SymbolLanguage::from_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn parse_calls_finds_direct_method_and_scoped_rust_calls() {
+        let source = r#"fn run() {
+    helper();
+    self.method_call();
+    module::scoped_call();
+}
+"#;
+
+        let calls = parse_calls(source, SymbolLanguage::Rust, 0, source.len())
+            .expect("Rust calls should parse");
+
+        assert!(calls.contains(&"helper".to_string()));
+        assert!(calls.contains(&"method_call".to_string()));
+        assert!(calls.contains(&"scoped_call".to_string()));
+    }
+
+    #[test]
+    fn parse_calls_finds_calls_inside_assert_macro() {
+        let source = r#"fn ten_units_qualifies_for_bulk_discount() {
+    assert_eq!(total_for(10, 100), 900);
+}
+"#;
+
+        let calls = parse_calls(source, SymbolLanguage::Rust, 0, source.len())
+            .expect("Rust calls should parse");
+
+        assert!(
+            calls.contains(&"total_for".to_string()),
+            "expected macro-token fallback to find `total_for`, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn parse_calls_finds_typescript_calls() {
+        let source = r#"function run() {
+    helper();
+    obj.method();
+}
+"#;
+
+        let calls = parse_calls(source, SymbolLanguage::TypeScript, 0, source.len())
+            .expect("TypeScript calls should parse");
+
+        assert!(calls.contains(&"helper".to_string()));
+        assert!(calls.contains(&"method".to_string()));
+    }
+
+    #[test]
+    fn parse_calls_finds_python_calls() {
+        let source = "def run():\n    helper()\n    obj.method()\n";
+
+        let calls = parse_calls(source, SymbolLanguage::Python, 0, source.len())
+            .expect("Python calls should parse");
+
+        assert!(calls.contains(&"helper".to_string()));
+        assert!(calls.contains(&"method".to_string()));
     }
 }
