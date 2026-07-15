@@ -10,6 +10,8 @@ pub struct Config {
     pub token: TokenConfig,
     pub trace: TraceConfig,
     #[serde(default)]
+    pub context: ContextConfig,
+    #[serde(default)]
     pub model: Option<ModelConfig>,
     /// Optional explicit cheap model for deterministic weak-model steps.
     /// Falls back to `model`.
@@ -19,6 +21,33 @@ pub struct Config {
     /// Falls back to `model`.
     #[serde(default)]
     pub strong_model: Option<ModelConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompilerMode {
+    #[default]
+    Off,
+    Shadow,
+    On,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ContextConfig {
+    #[serde(default)]
+    pub compiler_mode: CompilerMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compiled_primitives: Vec<String>,
+}
+
+impl ContextConfig {
+    pub fn compiled_for(&self, primitive_id: &str) -> bool {
+        self.compiler_mode == CompilerMode::On
+            && self
+                .compiled_primitives
+                .iter()
+                .any(|configured| configured == primitive_id)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,6 +68,17 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     /// Per-request timeout in seconds.
     pub timeout_secs: u64,
+    /// Whether calls to this model cost money (hosted API, codex/chatgpt
+    /// subscription, github copilot) as opposed to a local, unbilled
+    /// endpoint (e.g. Ollama). Drives the billed/non-billed token
+    /// breakdown in the dashboard. Defaults to `true` so unclassified
+    /// models are assumed to cost money rather than silently undercounted.
+    #[serde(default = "default_billed")]
+    pub billed: bool,
+}
+
+fn default_billed() -> bool {
+    true
 }
 
 impl Default for ModelConfig {
@@ -49,6 +89,7 @@ impl Default for ModelConfig {
             api_key_env_var: Some("OPENAI_API_KEY".to_string()),
             api_key: None,
             timeout_secs: 60,
+            billed: true,
         }
     }
 }
@@ -76,6 +117,7 @@ impl Default for Config {
                 max_output_bytes: 1_000_000,
                 store_full_output: true,
             },
+            context: ContextConfig::default(),
             model: None,
             weak_model: None,
             strong_model: None,
@@ -124,12 +166,18 @@ impl UserConfig {
          # set, api_key takes precedence. A direct value is less secure but\n\
          # convenient for local-only keys (e.g. a local LLM proxy).\n\
          #\n\
+         # `billed` marks whether calls to this model cost money (hosted\n\
+         # API, codex/chatgpt subscription, github copilot) vs a free local\n\
+         # endpoint (e.g. Ollama). It drives the billed/non-billed token\n\
+         # breakdown in the dashboard. Defaults to true if omitted.\n\
+         #\n\
          # [model]\n\
          # base_url = \"https://api.openai.com/v1\"\n\
          # model = \"gpt-4o-mini\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
          # # api_key = \"sk-...\"\n\
          # timeout_secs = 60\n\
+         # billed = true\n\
          #\n\
          # Optional explicit cheap model for weak-model steps.\n\
          # Falls back to [model].\n\
@@ -140,6 +188,7 @@ impl UserConfig {
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
          # # api_key = \"sk-...\"\n\
          # timeout_secs = 60\n\
+         # billed = true\n\
          #\n\
          # weak_model can also point at a local, OpenAI-compatible endpoint\n\
          # such as Ollama. No API key is required for local endpoints.\n\
@@ -148,6 +197,7 @@ impl UserConfig {
          # base_url = \"http://localhost:11434/v1\"\n\
          # model = \"qwen2.5:7b-instruct\"\n\
          # timeout_secs = 60\n\
+         # billed = false\n\
          #\n\
          # Optional explicit capable model for planning/patch generation.\n\
          # Falls back to [model].\n\
@@ -157,7 +207,8 @@ impl UserConfig {
          # model = \"gpt-4o\"\n\
          # api_key_env_var = \"OPENAI_API_KEY\"\n\
          # # api_key = \"sk-...\"\n\
-         # timeout_secs = 120\n"
+         # timeout_secs = 120\n\
+         # billed = true\n"
             .to_string()
     }
 
@@ -333,6 +384,7 @@ mod tests {
         assert_eq!(config.token.hard_budget, 80_000);
         assert_eq!(config.trace.max_output_bytes, 1_000_000);
         assert!(config.trace.store_full_output);
+        assert_eq!(config.context.compiler_mode, CompilerMode::Off);
     }
 
     #[test]
@@ -344,6 +396,7 @@ mod tests {
         assert_eq!(config.token.hard_budget, 80_000);
         assert_eq!(config.trace.max_output_bytes, 1_000_000);
         assert!(config.trace.store_full_output);
+        assert_eq!(config.context.compiler_mode, CompilerMode::Off);
     }
 
     #[test]
@@ -381,8 +434,33 @@ store_full_output = false
         assert_eq!(config.token.hard_budget, 20);
         assert_eq!(config.trace.max_output_bytes, 30);
         assert!(!config.trace.store_full_output);
+        assert_eq!(config.context.compiler_mode, CompilerMode::Off);
 
         remove_if_exists(&path);
+    }
+
+    #[test]
+    fn context_compiler_mode_and_primitive_rollout_load() {
+        let config: Config = toml::from_str(
+            r#"
+[token]
+soft_budget = 10
+hard_budget = 20
+
+[trace]
+max_output_bytes = 30
+store_full_output = false
+
+[context]
+compiler_mode = "on"
+compiled_primitives = ["classify_intent", "select_context"]
+"#,
+        )
+        .expect("context config should deserialize");
+
+        assert_eq!(config.context.compiler_mode, CompilerMode::On);
+        assert!(config.context.compiled_for("classify_intent"));
+        assert!(!config.context.compiled_for("plan_patch"));
     }
 
     #[test]

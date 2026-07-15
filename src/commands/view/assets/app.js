@@ -341,15 +341,8 @@ function renderContext(detail) {
     : '<tr><td colspan="4" class="empty-note">No captured runs.</td></tr>';
 }
 
-function renderModelUsage(usage) {
-  const container = document.getElementById("model-usage");
-  if (!usage || usage.length === 0) {
-    container.innerHTML = '<div class="empty-note">No model usage recorded yet.</div>';
-    return;
-  }
-  container.innerHTML = usage
-    .map(
-      (row) => `
+function renderUsageRow(row) {
+  return `
       <div class="usage-row">
         <div>
           <div class="usage-model">${escapeHtml(row.model)}</div>
@@ -362,9 +355,35 @@ function renderModelUsage(usage) {
         <div class="usage-tokens">
           ${row.input_estimation_ratio != null ? row.input_estimation_ratio.toFixed(2) + "x" : "\u2014"}
         </div>
-      </div>`
-    )
-    .join("");
+      </div>`;
+}
+
+function renderUsageGroup(label, rows) {
+  if (rows.length === 0) return "";
+  const total = rows.reduce(
+    (sum, row) => sum + row.reported_input_tokens + row.reported_output_tokens,
+    0
+  );
+  return `
+      <div class="usage-group">
+        <div class="usage-group-heading">
+          <span>${label}</span>
+          <span class="usage-group-total">${total.toLocaleString()} tokens</span>
+        </div>
+        ${rows.map(renderUsageRow).join("")}
+      </div>`;
+}
+
+function renderModelUsage(usage) {
+  const container = document.getElementById("model-usage");
+  if (!usage || usage.length === 0) {
+    container.innerHTML = '<div class="empty-note">No model usage recorded yet.</div>';
+    return;
+  }
+  const billed = usage.filter((row) => row.billed);
+  const nonBilled = usage.filter((row) => !row.billed);
+  container.innerHTML =
+    renderUsageGroup("Billed", billed) + renderUsageGroup("Non-billed", nonBilled);
 }
 
 function onTabClick(event) {

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     commands::task::{RouteEntry, TaskBudget, TaskState},
-    store::{self, RUN_STORE_PATH, RunSummary, StoredAgentTrace},
+    store::{
+        self, RUN_STORE_PATH, RunSummary, StoredAgentTrace, StoredRequestManifest,
+        StoredRequestManifestSegment,
+    },
 };
 
 // ---------------------------------------------------------------------
@@ -112,6 +115,7 @@ pub fn run_agent_in_workspace(case: &EvalCase, repo_dir: &Path) -> io::Result<Ru
         .args([
             "agent",
             "run",
+            "--apply",
             "--max-steps",
             &case.max_steps.to_string(),
             &case.goal,
@@ -148,6 +152,7 @@ pub struct EvalEvidence {
     pub task: TaskState,
     pub traces: Vec<StoredAgentTrace>,
     pub runs: Vec<RunSummary>,
+    pub manifests: Vec<StoredRequestManifest>,
 }
 
 pub fn collect_evidence(workspace: &Path) -> io::Result<EvalEvidence> {
@@ -156,8 +161,14 @@ pub fn collect_evidence(workspace: &Path) -> io::Result<EvalEvidence> {
     let task: TaskState = serde_json::from_str(&stored_task.task_json)?;
     let traces = store::agent_traces_for_task(&db_path, &stored_task.id)?;
     let runs = store::recent_runs(&db_path, 100)?;
+    let manifests = store::request_manifests_for_task(&db_path, &stored_task.id)?;
 
-    Ok(EvalEvidence { task, traces, runs })
+    Ok(EvalEvidence {
+        task,
+        traces,
+        runs,
+        manifests,
+    })
 }
 
 pub fn copy_workspace_db(workspace: &Path, dest: &Path) -> io::Result<()> {
@@ -263,18 +274,17 @@ pub fn check_wasteful_actions(checks: &CheckConfig, traces: &[StoredAgentTrace])
             ));
         }
 
-        if !checks.relevant_paths.is_empty() {
-            if let Some(file) = &action.file {
-                if !checks.relevant_paths.iter().any(|path| path == file) {
-                    if verdict != Verdict::Fail {
-                        verdict = Verdict::Warn;
-                    }
-                    reasons.push(format!(
-                        "step {} read {file}, outside relevant paths",
-                        trace.step_index
-                    ));
-                }
+        if !checks.relevant_paths.is_empty()
+            && let Some(file) = &action.file
+            && !checks.relevant_paths.iter().any(|path| path == file)
+        {
+            if verdict != Verdict::Fail {
+                verdict = Verdict::Warn;
             }
+            reasons.push(format!(
+                "step {} read {file}, outside relevant paths",
+                trace.step_index
+            ));
         }
 
         let _ = (&action.command, &action.args);
@@ -330,7 +340,60 @@ pub fn evaluate(case: &EvalCase, evidence: &EvalEvidence) -> Vec<CheckResult> {
         check_token_budget(&case.checks, &evidence.task.budget),
         check_wasteful_actions(&case.checks, &evidence.traces),
         check_outcome_markers(&case.checks, &evidence.task),
+        check_request_manifests(evidence),
     ]
+}
+
+fn check_request_manifests(evidence: &EvalEvidence) -> CheckResult {
+    let missing: Vec<_> = evidence
+        .traces
+        .iter()
+        .filter(|trace| {
+            trace.manifest_id.as_ref().is_none_or(|manifest_id| {
+                !evidence.manifests.iter().any(|manifest| {
+                    manifest.id == *manifest_id
+                        && matches!(
+                            manifest.status.as_str(),
+                            "completed" | "provider_failed" | "recording_failed"
+                        )
+                })
+            })
+        })
+        .map(|trace| format!("step {} {}", trace.step_index, trace.purpose))
+        .collect();
+    let incomplete: Vec<_> = evidence
+        .manifests
+        .iter()
+        .filter(|manifest| manifest.status == "prepared")
+        .map(|manifest| manifest.id.clone())
+        .collect();
+
+    if missing.is_empty() && incomplete.is_empty() {
+        CheckResult {
+            name: "request_manifests".to_string(),
+            verdict: Verdict::Pass,
+            reasons: vec![format!(
+                "{} model attempts have explicit outcomes",
+                evidence.manifests.len()
+            )],
+        }
+    } else {
+        let mut reasons = Vec::new();
+        if !missing.is_empty() {
+            reasons.push(format!("traces missing manifests: {}", missing.join(", ")));
+        }
+        if !incomplete.is_empty() {
+            reasons.push(format!(
+                "prepared manifests remain: {}",
+                incomplete.join(", ")
+            ));
+        }
+        CheckResult {
+            name: "request_manifests".to_string(),
+            verdict: Verdict::Fail,
+            reasons,
+        }
+    }
 }
 
 pub fn overall_verdict(results: &[CheckResult]) -> Verdict {
@@ -352,6 +415,7 @@ struct StepReport {
     step_index: i64,
     model: String,
     purpose: String,
+    billed: bool,
     prompt: String,
     response: String,
     action_json: String,
@@ -372,6 +436,7 @@ struct StepReport {
 struct ModelUsageReport {
     model: String,
     purpose: String,
+    billed: bool,
     calls: usize,
     estimated_input_tokens: i64,
     estimated_output_tokens: i64,
@@ -427,6 +492,65 @@ struct TokenSummary {
 }
 
 #[derive(Serialize)]
+struct RequestSummary {
+    request_count: usize,
+    prepared_count: usize,
+    completed_count: usize,
+    failed_count: usize,
+    segment_count: usize,
+    estimated_input_tokens: i64,
+    estimated_output_tokens: i64,
+    reported_input_tokens: i64,
+    reported_output_tokens: i64,
+    reported_cached_input_tokens: i64,
+    fresh_input_tokens: i64,
+    cache_ratio: Option<f64>,
+    latency_total_ms: i64,
+    latency_p50_ms: Option<i64>,
+    latency_p95_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct RequestReport {
+    id: String,
+    step_index: i64,
+    node_id: Option<String>,
+    primitive_id: String,
+    primitive_version: i64,
+    phase: String,
+    model: String,
+    purpose: String,
+    request_digest: String,
+    status: String,
+    estimated_input_tokens: i64,
+    estimated_output_tokens: i64,
+    reported_input_tokens: Option<i64>,
+    reported_output_tokens: Option<i64>,
+    reported_cached_input_tokens: Option<i64>,
+    provider_request_id: Option<String>,
+    latency_ms: Option<i64>,
+    billed: bool,
+    error_summary: Option<String>,
+    comparison: Option<serde_json::Value>,
+    segments: Vec<RequestSegmentReport>,
+}
+
+#[derive(Serialize)]
+struct RequestSegmentReport {
+    id: String,
+    position: i64,
+    role: String,
+    category: String,
+    representation: String,
+    producer_id: String,
+    producer_version: i64,
+    content_digest: String,
+    byte_size: i64,
+    estimated_tokens: i64,
+    cache_policy: String,
+}
+
+#[derive(Serialize)]
 pub struct EvalReport {
     schema_version: u8,
     case: String,
@@ -438,11 +562,14 @@ pub struct EvalReport {
     max_steps: usize,
     route: Vec<RouteEntry>,
     workflow: crate::commands::agent::workflow::Workflow,
+    terminal_reason: Option<crate::commands::agent::StopReason>,
     budget: BudgetReport,
     token_summary: TokenSummary,
     runs: Vec<RunReport>,
     steps: Vec<StepReport>,
     model_usage: Vec<ModelUsageReport>,
+    request_summary: RequestSummary,
+    requests: Vec<RequestReport>,
     patch_text: Option<String>,
     checks: Vec<CheckResult>,
     overall: Verdict,
@@ -458,7 +585,7 @@ pub fn build_report(
     let overall = overall_verdict(&checks);
 
     EvalReport {
-        schema_version: 1,
+        schema_version: 2,
         case: case.name.clone(),
         started_at: started_at.to_rfc3339(),
         finished_at: Utc::now().to_rfc3339(),
@@ -468,6 +595,7 @@ pub fn build_report(
         max_steps: case.max_steps,
         route: evidence.task.route.clone(),
         workflow: evidence.task.workflow.clone(),
+        terminal_reason: evidence.task.terminal_reason,
         budget: BudgetReport {
             packet_tokens_used: evidence.task.budget.packet_tokens_used,
             soft_tokens: evidence.task.budget.soft_tokens,
@@ -493,6 +621,7 @@ pub fn build_report(
                 step_index: trace.step_index,
                 model: trace.model.clone(),
                 purpose: trace.purpose.clone(),
+                billed: trace.billed,
                 prompt: excerpt(&trace.prompt, 2000),
                 response: excerpt(&trace.response, 2000),
                 action_json: trace.action_json.clone(),
@@ -511,9 +640,129 @@ pub fn build_report(
             })
             .collect(),
         model_usage: model_usage_report(&evidence.traces),
+        request_summary: request_summary(&evidence.manifests),
+        requests: evidence.manifests.iter().map(request_report).collect(),
         patch_text: evidence.task.patch_text.clone(),
         checks,
         overall,
+    }
+}
+
+fn request_summary(manifests: &[StoredRequestManifest]) -> RequestSummary {
+    let reported_input_tokens: i64 = manifests
+        .iter()
+        .filter_map(|manifest| manifest.reported_input_tokens)
+        .sum();
+    let reported_cached_input_tokens: i64 = manifests
+        .iter()
+        .filter_map(|manifest| manifest.reported_cached_input_tokens)
+        .sum();
+    let mut latencies: Vec<_> = manifests
+        .iter()
+        .filter_map(|manifest| manifest.latency_ms)
+        .collect();
+    latencies.sort_unstable();
+
+    RequestSummary {
+        request_count: manifests.len(),
+        prepared_count: manifests
+            .iter()
+            .filter(|manifest| manifest.status == "prepared")
+            .count(),
+        completed_count: manifests
+            .iter()
+            .filter(|manifest| manifest.status == "completed")
+            .count(),
+        failed_count: manifests
+            .iter()
+            .filter(|manifest| {
+                matches!(
+                    manifest.status.as_str(),
+                    "provider_failed" | "recording_failed"
+                )
+            })
+            .count(),
+        segment_count: manifests
+            .iter()
+            .map(|manifest| manifest.segments.len())
+            .sum(),
+        estimated_input_tokens: manifests
+            .iter()
+            .map(|manifest| manifest.estimated_input_tokens)
+            .sum(),
+        estimated_output_tokens: manifests
+            .iter()
+            .map(|manifest| manifest.estimated_output_tokens)
+            .sum(),
+        reported_input_tokens,
+        reported_output_tokens: manifests
+            .iter()
+            .filter_map(|manifest| manifest.reported_output_tokens)
+            .sum(),
+        reported_cached_input_tokens,
+        fresh_input_tokens: reported_input_tokens.saturating_sub(reported_cached_input_tokens),
+        cache_ratio: (reported_input_tokens > 0)
+            .then_some(reported_cached_input_tokens as f64 / reported_input_tokens as f64),
+        latency_total_ms: latencies.iter().sum(),
+        latency_p50_ms: percentile(&latencies, 50),
+        latency_p95_ms: percentile(&latencies, 95),
+    }
+}
+
+fn percentile(sorted: &[i64], percentile: usize) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = ((sorted.len() - 1) * percentile).div_ceil(100);
+    sorted.get(index).copied()
+}
+
+fn request_report(manifest: &StoredRequestManifest) -> RequestReport {
+    RequestReport {
+        id: manifest.id.clone(),
+        step_index: manifest.step_index,
+        node_id: manifest.node_id.clone(),
+        primitive_id: manifest.primitive_id.clone(),
+        primitive_version: manifest.primitive_version,
+        phase: manifest.phase.clone(),
+        model: manifest.model.clone(),
+        purpose: manifest.purpose.clone(),
+        request_digest: manifest.request_digest.clone(),
+        status: manifest.status.clone(),
+        estimated_input_tokens: manifest.estimated_input_tokens,
+        estimated_output_tokens: manifest.estimated_output_tokens,
+        reported_input_tokens: manifest.reported_input_tokens,
+        reported_output_tokens: manifest.reported_output_tokens,
+        reported_cached_input_tokens: manifest.reported_cached_input_tokens,
+        provider_request_id: manifest.provider_request_id.clone(),
+        latency_ms: manifest.latency_ms,
+        billed: manifest.billed,
+        error_summary: manifest.error_summary.clone(),
+        comparison: manifest
+            .comparison_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        segments: manifest
+            .segments
+            .iter()
+            .map(request_segment_report)
+            .collect(),
+    }
+}
+
+fn request_segment_report(segment: &StoredRequestManifestSegment) -> RequestSegmentReport {
+    RequestSegmentReport {
+        id: segment.segment_id.clone(),
+        position: segment.position,
+        role: segment.role.clone(),
+        category: segment.category.clone(),
+        representation: segment.representation.clone(),
+        producer_id: segment.producer_id.clone(),
+        producer_version: segment.producer_version,
+        content_digest: segment.content_digest.clone(),
+        byte_size: segment.byte_size,
+        estimated_tokens: segment.estimated_tokens,
+        cache_policy: segment.cache_policy.clone(),
     }
 }
 
@@ -570,6 +819,7 @@ fn model_usage_report(traces: &[StoredAgentTrace]) -> Vec<ModelUsageReport> {
                 usage.push(ModelUsageReport {
                     model: trace.model.clone(),
                     purpose: trace.purpose.clone(),
+                    billed: trace.billed,
                     calls: 0,
                     estimated_input_tokens: 0,
                     estimated_output_tokens: 0,
@@ -806,9 +1056,13 @@ mod tests {
             patch_text: None,
             patch_edits: None,
             patch_applied: false,
+            patch_previewed: false,
+            apply_requested: false,
+            terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,
             available_context: Vec::new(),
+            workflow_spec: None,
             workflow: crate::commands::agent::workflow::Workflow::new(),
         }
     }
@@ -853,6 +1107,8 @@ mod tests {
             estimated_output_tokens: 0,
             reported_input_tokens: None,
             reported_output_tokens: None,
+            billed: true,
+            manifest_id: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
         }
     }

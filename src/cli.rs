@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::commands;
@@ -55,12 +55,8 @@ pub enum Commands {
         limit: usize,
     },
 
-    /// Show context reduction information for captured runs
+    /// Show context reduction information for the latest captured run
     Report {
-        /// Report on the most recent run (default behaviour)
-        #[arg(long)]
-        last: bool,
-
         /// Emit a machine-readable JSON report
         #[arg(long)]
         json: bool,
@@ -222,6 +218,10 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = commands::agent::DEFAULT_MAX_STEPS)]
         max_steps: usize,
 
+        /// Apply planned edits. Without this flag, the agent previews changes only.
+        #[arg(long, visible_alias = "yes")]
+        apply: bool,
+
         /// Task goal when not using --task current
         #[arg(num_args = 0.., allow_hyphen_values = true)]
         goal: Vec<String>,
@@ -250,10 +250,7 @@ pub fn run() -> i32 {
 impl Cli {
     pub fn execute(self) -> i32 {
         match self.command {
-            Some(Commands::Init { force }) => {
-                commands::init::run(force);
-                0
-            }
+            Some(Commands::Init { force }) => commands::init::run(force),
             Some(Commands::Files { limit }) => commands::files::run(limit),
             Some(Commands::Index { max_file_size }) => commands::index::run(max_file_size),
             Some(Commands::Trace {
@@ -263,14 +260,10 @@ impl Cli {
             }) => commands::trace::run(command, compactor, task),
             Some(Commands::Runs { limit }) => commands::runs::run(limit),
             Some(Commands::Report {
-                last,
                 json,
                 markdown,
                 symbols,
-            }) => {
-                let _ = last;
-                commands::report::run(json, markdown, symbols)
-            }
+            }) => commands::report::run(json, markdown, symbols),
             Some(Commands::Packet { budget, force }) => commands::packet::run(budget, force),
             Some(Commands::ReadSymbol { target }) => commands::read_symbol::run(target),
             Some(Commands::ReadWindow {
@@ -292,7 +285,15 @@ impl Cli {
             },
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             Some(Commands::View { port, results_dir }) => commands::view::run(port, results_dir),
-            None => 0,
+            None => {
+                let mut command = Self::command();
+                if let Err(error) = command.print_help() {
+                    eprintln!("Error printing help: {error}");
+                    return 1;
+                }
+                println!();
+                2
+            }
         }
     }
 }

@@ -1,16 +1,10 @@
-use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
-    fs,
-    hash::{Hash, Hasher},
-    io,
-    path::Path,
-    time::UNIX_EPOCH,
-};
+use std::{collections::HashSet, fs, io, path::Path, time::UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
+    context::artifact::file_content_digest,
     store::{self, FileInventoryEntry, RUN_STORE_PATH},
     util::estimate_tokens,
 };
@@ -174,10 +168,7 @@ fn modified_at(metadata: &fs::Metadata) -> Option<String> {
 }
 
 fn content_hash(contents: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    contents.hash(&mut hasher);
-
-    format!("{:016x}", hasher.finish())
+    file_content_digest(contents)
 }
 
 fn to_i64<T>(value: T, label: &str) -> io::Result<i64>

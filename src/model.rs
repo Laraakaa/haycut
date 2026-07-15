@@ -659,6 +659,7 @@ mod tests {
             api_key_env_var: None,
             api_key: None,
             timeout_secs: 60,
+            billed: false,
         });
         assert_eq!(provider.api_key().unwrap(), None);
     }
@@ -671,8 +672,12 @@ mod tests {
             api_key_env_var: Some("HAYCUT_TEST_UNSET_ENV_VAR".to_string()),
             api_key: Some("explicit-key".to_string()),
             timeout_secs: 60,
+            billed: true,
         });
-        assert_eq!(provider.api_key().unwrap(), Some("explicit-key".to_string()));
+        assert_eq!(
+            provider.api_key().unwrap(),
+            Some("explicit-key".to_string())
+        );
     }
 
     #[test]

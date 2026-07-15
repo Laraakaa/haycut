@@ -1,6 +1,6 @@
 ---
 source: src/evidence.rs
-assertion_line: 490
+assertion_line: 489
 expression: evidence
 ---
 {
@@ -17,7 +17,7 @@ expression: evidence
   },
   "primary_diagnostic": {
     "source": "stderr",
-    "message": "assertion `left == right` failed",
+    "message": "assertion `left == right` failed\nleft: \"packet source\"\nright: \"useful source excerpt\"",
     "file": "src/commands/packet.rs",
     "line": 612,
     "column": 9
@@ -31,7 +31,7 @@ expression: evidence
     {
       "kind": "panic",
       "severity": "error",
-      "message": "assertion `left == right` failed",
+      "message": "assertion `left == right` failed\nleft: \"packet source\"\nright: \"useful source excerpt\"",
       "file": "src/commands/packet.rs",
       "line": 612,
       "column": 9

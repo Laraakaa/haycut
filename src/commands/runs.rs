@@ -22,6 +22,11 @@ fn load_runs(db_path: &Path, limit: usize) -> io::Result<Vec<RunSummary>> {
 }
 
 fn print_runs(runs: &[RunSummary]) {
+    if runs.is_empty() {
+        println!("No captured runs. Run `haycut trace -- <command>` to capture one.");
+        return;
+    }
+
     println!(
         "{:<28}  {:<28}  {:>4}  {:>8}  {:>10}  {:>9}",
         "ID", "Command", "Exit", "Raw tok", "Packet tok", "Reduction"
