@@ -571,6 +571,7 @@ mod tests {
             messages: Vec::new(),
             explicit_verify_commands: Vec::new(),
             inspected_digests: Default::default(),
+            verification_results: Vec::new(),
         }
     }
 

@@ -131,7 +131,10 @@ function renderDetail(detail) {
   renderStatCards(detail);
   renderWorkflowGraph(detail.workflow, primitiveIndex(detail));
   renderChecks(detail.checks);
+  renderVerification(detail.verification_results);
   renderPatch(detail.patch_text);
+  renderPatchEdits(detail.patch_edits);
+  renderSession(detail);
   renderCalls(detail.steps);
   renderContext(detail);
   renderModelUsage(detail.model_usage);
@@ -274,6 +277,121 @@ function renderPatch(patchText) {
   }
   block.classList.remove("hidden");
   document.getElementById("patch-text").textContent = patchText;
+}
+
+// Structured per-check outcomes from `verification_results` (Phase 10):
+// required/optional + scope tags alongside the pass/fail badge, following
+// the same row shape as renderChecks().
+function renderVerification(results) {
+  const block = document.getElementById("verification-block");
+  const list = document.getElementById("verification-list");
+  if (!results || results.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+  block.classList.remove("hidden");
+  list.innerHTML = results
+    .map((result) => {
+      const command = [result.command.program, ...(result.command.args || [])].join(" ");
+      const verdict = result.passed ? "pass" : "fail";
+      return `
+      <div class="check-row">
+        <span class="badge ${badgeClass(verdict)}">${escapeHtml(verdict)}</span>
+        <div>
+          <div>${escapeHtml(command)}</div>
+          <div class="check-reasons">
+            <span class="status-tag">${result.required ? "required" : "optional"}</span>
+            <span class="status-tag">${escapeHtml(result.scope.replace(/_/g, " "))}</span>
+            exit ${escapeHtml(String(result.exit_code))}
+          </div>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+// One row per structured file operation from `patch_edits` (Phase 8:
+// Replace/Create/Delete/Rename), alongside the free-text `patch_text`.
+function renderPatchEdits(edits) {
+  const block = document.getElementById("patch-edits-block");
+  const list = document.getElementById("patch-edits-list");
+  if (!edits || edits.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+  block.classList.remove("hidden");
+  list.innerHTML = edits
+    .map((edit) => {
+      let detail = "";
+      switch (edit.kind) {
+        case "replace":
+          detail = escapeHtml(edit.path);
+          break;
+        case "create":
+          detail = `${escapeHtml(edit.path)}${edit.overwrite ? " (overwrite)" : ""}`;
+          break;
+        case "delete":
+          detail = escapeHtml(edit.path);
+          break;
+        case "rename":
+          detail = `${escapeHtml(edit.from)} &rarr; ${escapeHtml(edit.to)}`;
+          break;
+        default:
+          detail = "";
+      }
+      return `
+      <div class="check-row">
+        <span class="badge badge-open">${escapeHtml(edit.kind)}</span>
+        <div>${detail}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+// Interactive-session state (`agent session` / `AgentEngine`): a banner
+// when the task is blocked on a question or a patch approval, plus the
+// durable user/agent message transcript. Hidden entirely when a task has
+// none of this (eval runs, or a task that never used the interactive
+// session).
+function renderSession(detail) {
+  const block = document.getElementById("session-block");
+  const pending = document.getElementById("session-pending");
+  const messages = document.getElementById("session-messages");
+
+  const hasPending = Boolean(detail.pending_interaction || detail.pending_approval);
+  const hasMessages = Boolean(detail.messages && detail.messages.length);
+
+  if (!hasPending && !hasMessages) {
+    block.classList.add("hidden");
+    return;
+  }
+  block.classList.remove("hidden");
+
+  if (detail.pending_interaction) {
+    pending.innerHTML = `
+      <div class="session-banner">
+        <span class="badge badge-open">waiting for reply</span>
+        <span>${escapeHtml(detail.pending_interaction.question)}</span>
+      </div>`;
+  } else if (detail.pending_approval) {
+    pending.innerHTML = `
+      <div class="session-banner approval">
+        <span class="badge badge-warn">waiting for approval</span>
+        <span>${escapeHtml(detail.pending_approval.summary)}</span>
+      </div>`;
+  } else {
+    pending.innerHTML = "";
+  }
+
+  messages.innerHTML = (detail.messages || [])
+    .map(
+      (message) => `
+      <div class="message-row">
+        <span class="message-role">${escapeHtml(message.role)}</span>
+        <span class="message-content">${escapeHtml(message.content)}</span>
+      </div>`
+    )
+    .join("");
 }
 
 function renderCalls(steps) {

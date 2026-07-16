@@ -1534,6 +1534,7 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
 
     let mut required_failures = Vec::new();
     let mut lines = Vec::with_capacity(plan.checks.len());
+    let mut results = Vec::with_capacity(plan.checks.len());
 
     for check in &plan.checks {
         let exit_code = trace::run(check.command.as_vec(), None, Some(TaskTarget::Current));
@@ -1549,7 +1550,20 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
         if !passed && check.required {
             required_failures.push(check.command.display());
         }
+        results.push(task::VerificationCheckResult {
+            command: check.command.clone(),
+            required: check.required,
+            scope: check.scope,
+            exit_code,
+            passed,
+        });
     }
+
+    // Set after the loop: `*task = task::load_current()?;` above reloads the
+    // task from disk on every iteration (to see evidence `trace::run`
+    // persisted), which would otherwise wipe an in-progress result list set
+    // mid-loop.
+    task.verification_results = results;
 
     let overall = if required_failures.is_empty() { "pass" } else { "fail" };
     let summary = format!("final verification ({overall}): {}", lines.join("; "));
@@ -2680,6 +2694,7 @@ mod tests {
             messages: Vec::new(),
             explicit_verify_commands: Vec::new(),
             inspected_digests: Default::default(),
+            verification_results: Vec::new(),
         }
     }
 

@@ -129,6 +129,13 @@ pub struct TaskState {
     /// refused as a recoverable conflict if it doesn't.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub inspected_digests: std::collections::HashMap<String, crate::commands::agent::patch::FileDigest>,
+    /// Structured, per-check outcomes from the most recent
+    /// `RunFinalVerification` step: one entry per `VerificationCheck` in
+    /// `verification.checks`, in order, so callers (eval harness, dashboard)
+    /// can distinguish a failing required check from a failing optional one
+    /// without re-parsing the free-text summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_results: Vec<VerificationCheckResult>,
 }
 
 /// A candidate off-site symbol surfaced by deterministic call-stack follow.
@@ -237,6 +244,19 @@ impl VerificationPlan {
             .or_else(|| self.checks.first())
             .map(|check| &check.command)
     }
+}
+
+/// The outcome of running one `VerificationCheck` during
+/// `RunFinalVerification`: what ran, whether it was required, and whether it
+/// passed. Persisted on `TaskState` so the eval harness and dashboard can
+/// report structured pass/fail per check instead of re-parsing free text.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerificationCheckResult {
+    pub command: VerificationCommand,
+    pub required: bool,
+    pub scope: VerificationScope,
+    pub exit_code: i32,
+    pub passed: bool,
 }
 
 /// One structured, machine-appliable file operation. `Replace` keeps exact,
@@ -524,6 +544,7 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
             })
             .unwrap_or_default(),
         inspected_digests: Default::default(),
+        verification_results: Vec::new(),
     };
     task.workflow_spec =
         Some(crate::commands::agent::workflow_spec::compile_compatibility_spec(&task));

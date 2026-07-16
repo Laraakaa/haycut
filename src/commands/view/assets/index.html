@@ -47,6 +47,11 @@
           </div>
         </section>
 
+        <section id="session-block" class="session-block hidden">
+          <div id="session-pending"></div>
+          <div id="session-messages" class="session-messages"></div>
+        </section>
+
         <nav class="tabs" id="tabs">
           <button class="tab active" data-tab="overview">Overview</button>
           <button class="tab" data-tab="calls">LLM Calls</button>
@@ -64,11 +69,20 @@
             <h2 class="panel-heading">Checks</h2>
             <div id="checks-list" class="checks-list"></div>
           </div>
+          <div id="verification-block" class="hidden">
+            <h2 class="panel-heading">Verification</h2>
+            <div id="verification-list" class="checks-list"></div>
+          </div>
           <div id="patch-block" class="patch-block hidden">
             <h2 class="panel-heading">Patch</h2>
             <pre id="patch-text" class="code-block"></pre>
           </div>
+          <div id="patch-edits-block" class="hidden">
+            <h2 class="panel-heading">Patch edits</h2>
+            <div id="patch-edits-list" class="checks-list"></div>
+          </div>
         </section>
+
 
         <section class="tab-panel" id="panel-calls">
           <div id="calls-list" class="calls-list"></div>

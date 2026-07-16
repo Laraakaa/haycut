@@ -291,6 +291,24 @@ pub struct RunDetail {
     pub checks: Vec<CheckResult>,
     pub overall: Option<Verdict>,
     pub patch_text: Option<String>,
+    /// Structured per-check outcomes from the task's most recent
+    /// `RunFinalVerification` step (empty until verification has run).
+    pub verification_results: Vec<crate::commands::task::VerificationCheckResult>,
+    /// Structured file operations proposed by the current patch plan
+    /// (Replace/Create/Delete/Rename), alongside the human-readable
+    /// `patch_text` summary above.
+    pub patch_edits: Vec<crate::commands::task::PatchEdit>,
+    /// Question the interactive session is blocked on, awaiting a user
+    /// reply (see `agent::engine`). `None` for eval runs and tasks that
+    /// aren't currently blocked on a question.
+    pub pending_interaction: Option<crate::commands::agent::engine::PendingInteraction>,
+    /// Proposed mutation awaiting explicit user approval or rejection in an
+    /// interactive session. `None` for eval runs and unblocked tasks.
+    pub pending_approval: Option<crate::commands::agent::engine::ApprovalRequest>,
+    /// Durable transcript of user/agent messages exchanged in an
+    /// interactive session (questions, replies, rejections, steering
+    /// instructions). Empty for eval runs.
+    pub messages: Vec<crate::commands::agent::engine::TaskMessage>,
     pub available_context: Vec<AvailableContextView>,
     pub workflow_spec: Option<WorkflowSpecView>,
     pub manifests: Vec<RequestManifestView>,
@@ -331,6 +349,8 @@ pub struct EvalReportFile {
     #[serde(default)]
     pub patch_text: Option<String>,
     #[serde(default)]
+    pub verification_results: Vec<crate::commands::task::VerificationCheckResult>,
+    #[serde(default)]
     pub checks: Vec<CheckResult>,
     pub overall: Verdict,
 }
@@ -356,6 +376,11 @@ impl EvalReportFile {
             checks: self.checks,
             overall: Some(self.overall),
             patch_text: self.patch_text,
+            verification_results: self.verification_results,
+            patch_edits: Vec::new(),
+            pending_interaction: None,
+            pending_approval: None,
+            messages: Vec::new(),
             available_context: Vec::new(),
             workflow_spec: None,
             manifests: Vec::new(),
@@ -476,6 +501,11 @@ pub fn task_to_detail(
         checks: Vec::new(),
         overall: None,
         patch_text: task.patch_text.clone(),
+        verification_results: task.verification_results.clone(),
+        patch_edits: task.patch_edits.clone().unwrap_or_default(),
+        pending_interaction: task.pending_interaction.clone(),
+        pending_approval: task.pending_approval.clone(),
+        messages: task.messages.clone(),
         available_context,
         workflow_spec: task.workflow_spec.as_ref().map(WorkflowSpecView::from),
         manifests: manifests.into_iter().map(RequestManifestView::from).collect(),
