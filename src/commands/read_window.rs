@@ -1,6 +1,6 @@
 use std::{fs, io, path::PathBuf};
 
-use crate::{project_path, util::estimate_tokens};
+use crate::{code_context::{CodeContext, render_code_context}, project_path, util::estimate_tokens};
 
 pub const DEFAULT_RADIUS: usize = 20;
 const MAX_WINDOW_LINES: usize = 400;
@@ -53,18 +53,19 @@ pub struct NumberedLine {
 
 impl FileWindow {
     pub fn render(&self) -> String {
-        let mut output = String::new();
-
-        output.push_str(&format!("File: {}\n", self.path.display()));
-        output.push_str(&format!("Lines: {}-{}\n", self.start_line, self.end_line));
-        output.push_str(&format!("Estimated tokens: {}\n", self.token_estimate));
-        output.push_str("<code>\n");
-        for line in &self.lines {
-            output.push_str(&format!("{:>5} | {}\n", line.number, line.text));
-        }
-        output.push_str("</code>\n");
-
-        output
+        let source = self
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        render_code_context(CodeContext {
+            symbol: Some("window"),
+            path: Some(&self.path.to_string_lossy()),
+            start_line: Some(self.start_line),
+            source: &source,
+            semantic_label: None,
+        })
     }
 }
 
@@ -155,10 +156,10 @@ mod tests {
         assert_eq!(window.end_line, 137);
         assert_eq!(window.lines.len(), 41);
         assert!(window.token_estimate > 0);
-        assert!(rendered.contains("Lines: 97-137"));
-        assert!(rendered.contains("Estimated tokens:"));
-        assert!(rendered.contains("   97 | line 97"));
-        assert!(rendered.contains("  137 | line 137"));
+        assert!(rendered.contains("window@"));
+        assert!(rendered.contains(":97\n```text\n"));
+        assert!(rendered.contains("line 97"));
+        assert!(rendered.contains("line 137"));
 
         fs::remove_file(path).expect("test file should be removed");
     }

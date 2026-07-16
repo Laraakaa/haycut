@@ -2,6 +2,7 @@ use std::{io, path::Path};
 
 use crate::{
     budget::{BudgetStatus, BudgetUsage},
+    code_context::{render_code_context, CodeContext},
     commands::{
         read_symbol::{self, SymbolMatch},
         run_context::RunContext,
@@ -319,21 +320,17 @@ fn human_report(report: &Report, token_config: &TokenConfig) -> String {
     if !report.symbols.is_empty() {
         output.push_str("\nSymbols\n");
         for symbol in &report.symbols {
+            output.push_str(&render_code_context(CodeContext {
+                symbol: Some(&symbol.symbol.name),
+                path: Some(&symbol.path),
+                start_line: Some(symbol.symbol.start_line),
+                source: &symbol.code,
+                semantic_label: None,
+            }));
             output.push_str(&format!(
-                "  {}::{} lines {}-{} ({} tokens)\n",
-                symbol.path,
-                symbol.symbol.name,
-                symbol.symbol.start_line,
-                symbol.symbol.end_line,
+                "estimated tokens: {}\n",
                 format_count(symbol.estimated_tokens)
             ));
-            output.push_str("  <code>\n");
-            for line in symbol.code.lines() {
-                output.push_str("  ");
-                output.push_str(line);
-                output.push('\n');
-            }
-            output.push_str("  </code>\n");
         }
     }
 
@@ -685,7 +682,7 @@ mod tests {
 
         let rendered = human_report(&report, &token_config());
 
-        assert!(rendered.contains("src/auth/session.rs::validate_session lines 88-90"));
+        assert!(rendered.contains("validate_session@src/auth/session.rs:88\n```rust\n"));
         assert!(rendered.contains("fn validate_session() -> bool"));
         // Symbol tokens fold into packet spend: 50 + 12 = 62.
         assert!(rendered.contains("  packet: 62"));

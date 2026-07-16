@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     cli::{AgentCommand, TaskTarget},
     code_graph,
+    code_context::{CodeContext, render_code_context},
     commands::{read_symbol, read_window, search, task, trace},
     config::Config,
     context::{
@@ -23,7 +24,7 @@ use crate::{
     },
     model::{ModelPurpose, OpenAiProvider, ToolDefinition},
     store::{self, NewAgentTrace, RUN_STORE_PATH},
-    util::{estimate_tokens, format_count},
+    util::estimate_tokens,
 };
 
 pub mod command_policy;
@@ -803,18 +804,17 @@ fn failure_path_observation(
             continue;
         }
 
-        let mut summary = format!(
-            "Diagnostic failure path (not an edit target); selected helper: {}@{}\n",
-            target.symbol, target.path
-        );
-        for frame in frames.iter().take(frames.len() - 1) {
-            summary.push_str(&format!(
-                "\n{}@{}:{}\n```rust\n{}\n```\n",
-                frame.symbol,
-                frame.path,
-                frame.start_line,
-                truncate(&frame.code, 1_500)
-            ));
+        let mut summary = String::new();
+        for (index, frame) in frames.iter().take(frames.len() - 1).enumerate() {
+            let start_line = if index == 0 { line } else { frame.start_line };
+            summary.push_str(&render_code_context(CodeContext {
+                symbol: Some(&frame.symbol),
+                path: Some(&frame.path),
+                start_line: Some(start_line),
+                source: &truncate(&frame.code, 1_500),
+                semantic_label: (index == 0)
+                    .then_some("Diagnostic failure path (not an edit target)"),
+            }));
         }
 
         return Some(task::Observation {
@@ -1305,10 +1305,13 @@ fn execute_pull_context(task: &mut task::TaskState, id: &str) -> io::Result<Step
     let candidate = task.available_context.remove(index);
 
     let location = format!("{}:{}", candidate.path, candidate.start_line);
-    let summary = format!(
-        "{} (defined in {}):\n{}",
-        candidate.symbol, location, candidate.body
-    );
+    let summary = render_code_context(CodeContext {
+        symbol: Some(&candidate.symbol),
+        path: Some(&candidate.path),
+        start_line: Some(candidate.start_line),
+        source: &candidate.body,
+        semantic_label: None,
+    });
     task.observations.push(task::Observation {
         id: format!("obs{}", task.observations.len() + 1),
         source: PULLED_CONTEXT_SOURCE.to_string(),
@@ -2387,9 +2390,9 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
         .filter(|observation| observation.source == FAILURE_PATH_SOURCE)
         .collect();
     if !failure_paths.is_empty() {
-        prompt.push_str("\nDiagnostic failure path (not an edit target):\n");
+        prompt.push('\n');
         for observation in failure_paths {
-            prompt.push_str(&format!("{}\n", compact_observation(&observation.summary)));
+            prompt.push_str(&observation.summary);
         }
     }
     let observations: Vec<_> = observations
@@ -2399,31 +2402,17 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
     if !observations.is_empty() {
         prompt.push_str("\nKnown context:\n");
         for observation in observations {
-            prompt.push_str(&format!(
-                "- {}\n",
-                compact_observation(&observation.summary)
-            ));
+            let is_code_context = observation.summary.lines().nth(1).is_some_and(|line| {
+                line.starts_with("```")
+            });
+            if is_code_context {
+                prompt.push_str(&observation.summary);
+            } else {
+                prompt.push_str(&format!("- {}\n", observation.summary));
+            }
         }
     }
     prompt
-}
-
-/// Strip diagnostic scaffolding (line-number gutters, token/line metadata)
-/// from a `FileWindow::render` string embedded in an observation summary.
-/// `propose_edits` matches code verbatim, so gutters only add noise.
-fn compact_observation(summary: &str) -> String {
-    summary
-        .lines()
-        .filter(|line| !line.starts_with("Estimated tokens:") && !line.starts_with("Lines: "))
-        .map(|line| {
-            let trimmed = line.trim_start();
-            match trimmed.split_once(" | ") {
-                Some((gutter, code)) if gutter.trim().parse::<usize>().is_ok() => code,
-                _ => line,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Convert a planner action into the typed `AgentAction` threaded through the
@@ -2691,15 +2680,13 @@ fn execute_read_symbol(task: &mut task::TaskState, symbol: &str) -> io::Result<S
     };
     let item = read_symbol::read_symbol(&root, &target)?;
     record_inspected_digest(task, &root, Path::new(&item.path));
-    Ok(format!(
-        "read_symbol `{}` -> {} lines {}-{} ({} tokens)\n{}",
-        symbol,
-        item.path,
-        item.symbol.start_line,
-        item.symbol.end_line,
-        format_count(item.estimated_tokens),
-        truncate(&item.code, 1_500)
-    ))
+    Ok(render_code_context(CodeContext {
+        symbol: Some(&item.symbol.name),
+        path: Some(&item.path),
+        start_line: Some(item.symbol.start_line),
+        source: &truncate(&item.code, 1_500),
+        semantic_label: None,
+    }))
 }
 
 fn execute_read_window(
@@ -3044,8 +3031,16 @@ mod tests {
         std::env::set_current_dir(original_dir).unwrap();
 
         assert!(prompt.contains("assert_eq!(total_for(10, 100), 900)"));
+        assert_eq!(
+            prompt
+                .matches("Diagnostic failure path (not an edit target):")
+                .count(),
+            1
+        );
+        assert!(prompt.contains("ten_units_qualifies_for_bulk_discount@src/cart.rs:13\n```rust\n"));
+        assert!(prompt.contains("total_for@src/cart.rs:3\n```rust\n"));
         assert!(prompt.contains("apply_bulk_discount(quantity, unit_price_cents)"));
-        assert!(prompt.contains("pub fn apply_bulk_discount"));
+        assert!(prompt.contains("apply_bulk_discount@src/pricing.rs:1\n```rust\n"));
         assert!(prompt.contains("left: 1000"));
         assert!(!prompt.contains("describe_order"));
         assert!(!prompt.contains("unrelated_test"));
@@ -3065,19 +3060,6 @@ mod tests {
         assert!(prompt.contains("Current failure:"));
         assert!(prompt.contains("fn helper() {}"));
         assert!(!prompt.contains("Diagnostic failure path"));
-    }
-
-    #[test]
-    fn compact_observation_strips_gutter_and_diagnostic_metadata() {
-        let raw = "File: src/lib.rs\nLines: 1-2\nEstimated tokens: 12\n<code>\n    1 | fn foo() {}\n    2 | fn bar() {}\n</code>\n";
-
-        let compacted = compact_observation(raw);
-
-        assert!(!compacted.contains("Lines:"));
-        assert!(!compacted.contains("Estimated tokens:"));
-        assert!(!compacted.contains("1 | fn foo"));
-        assert!(compacted.contains("fn foo() {}"));
-        assert!(compacted.contains("fn bar() {}"));
     }
 
     #[test]

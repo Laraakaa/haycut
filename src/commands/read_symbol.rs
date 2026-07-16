@@ -7,6 +7,7 @@ use std::{
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
+    code_context::{render_code_context, CodeContext},
     project_path,
     symbols::{Symbol, SymbolLanguage, parse_symbols},
     util::estimate_tokens,
@@ -172,20 +173,22 @@ fn duplicate_symbol_message(name: &str, matches: &[SymbolMatch]) -> String {
 }
 
 fn print_symbol(symbol: &SymbolMatch) {
-    println!("Symbol: {}", symbol.symbol.name);
-    println!("File: {}", symbol.path);
-    println!(
-        "Lines: {}-{}",
-        symbol.symbol.start_line, symbol.symbol.end_line
-    );
-    println!("Estimated tokens: {}", symbol.estimated_tokens);
     if symbol.estimated_tokens > HUGE_SYMBOL_TOKEN_WARNING {
         println!(
             "Warning: symbol is large; printing more than {} estimated tokens",
             HUGE_SYMBOL_TOKEN_WARNING
         );
     }
-    println!("<code>{}</code>", symbol.code);
+    print!(
+        "{}",
+        render_code_context(CodeContext {
+            symbol: Some(&symbol.symbol.name),
+            path: Some(&symbol.path),
+            start_line: Some(symbol.symbol.start_line),
+            source: &symbol.code,
+            semantic_label: None,
+        })
+    );
 }
 
 fn should_descend(entry: &DirEntry, skipped_directories: &HashSet<&'static str>) -> bool {

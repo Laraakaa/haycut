@@ -1,6 +1,7 @@
 mod budget;
 mod cli;
 mod code_graph;
+mod code_context;
 mod commands;
 mod compactor;
 mod config;
