@@ -114,16 +114,24 @@ fn parse_command(line: &str, task: &TaskState) -> ReplInput {
         "continue" => ReplInput::Command(ControlCommand::Continue),
         "step" => ReplInput::Command(ControlCommand::Step),
         "approve" => ReplInput::Command(ControlCommand::Approve),
-        "reject" => ReplInput::Command(ControlCommand::Reject { reason: rest.to_string() }),
-        "steer" => ReplInput::Command(ControlCommand::Steer { message: rest.to_string() }),
-        "context" => ReplInput::Command(ControlCommand::AddContext { target: parse_context_target(rest) }),
-        "verify" => ReplInput::Command(ControlCommand::Verify { command: parse_verify_command(rest) }),
+        "reject" => ReplInput::Command(ControlCommand::Reject {
+            reason: rest.to_string(),
+        }),
+        "steer" => ReplInput::Command(ControlCommand::Steer {
+            message: rest.to_string(),
+        }),
+        "context" => ReplInput::Command(ControlCommand::AddContext {
+            target: parse_context_target(rest),
+        }),
+        "verify" => ReplInput::Command(ControlCommand::Verify {
+            command: parse_verify_command(rest),
+        }),
         "status" => ReplInput::Status,
         "trace" => ReplInput::Trace,
         "stop" => ReplInput::Command(ControlCommand::Stop),
-        _ if task.pending_interaction.is_some() => {
-            ReplInput::Command(ControlCommand::Reply { message: line.to_string() })
-        }
+        _ if task.pending_interaction.is_some() => ReplInput::Command(ControlCommand::Reply {
+            message: line.to_string(),
+        }),
         _ => ReplInput::Unknown(line.to_string()),
     }
 }
@@ -135,7 +143,10 @@ fn parse_context_target(input: &str) -> ContextTarget {
     if let Some((path, line)) = input.rsplit_once(':')
         && let Ok(line) = line.parse::<usize>()
     {
-        return ContextTarget::Window { path: PathBuf::from(path), line };
+        return ContextTarget::Window {
+            path: PathBuf::from(path),
+            line,
+        };
     }
     ContextTarget::Search(input.to_string())
 }
@@ -147,7 +158,11 @@ fn parse_verify_command(input: &str) -> VerificationCommand {
     })
 }
 
-fn drive(engine: &mut AgentEngine, task: &mut TaskState, command: ControlCommand) -> io::Result<()> {
+fn drive(
+    engine: &mut AgentEngine,
+    task: &mut TaskState,
+    command: ControlCommand,
+) -> io::Result<()> {
     let events = engine.advance(task, command)?;
     for event in &events {
         print_event(event);
@@ -158,7 +173,9 @@ fn drive(engine: &mut AgentEngine, task: &mut TaskState, command: ControlCommand
 fn print_event(event: &AgentEvent) {
     match event {
         AgentEvent::Progress(summary) => println!("[agent] {summary}"),
-        AgentEvent::ActionProposed(action) => println!("[agent] wants to {}", describe_action(action)),
+        AgentEvent::ActionProposed(action) => {
+            println!("[agent] wants to {}", describe_action(action))
+        }
         AgentEvent::ApprovalRequired(request) => {
             println!("[agent] proposes changes:\n{}", request.summary);
         }
@@ -188,7 +205,9 @@ fn print_status(task: &TaskState) {
     println!("Goal  {}", task.goal);
     println!(
         "Intent  {}",
-        task.intent.map(|intent| format!("{intent:?}")).unwrap_or_else(|| "unknown".to_string())
+        task.intent
+            .map(|intent| format!("{intent:?}"))
+            .unwrap_or_else(|| "unknown".to_string())
     );
     println!(
         "Current failure  {}",
@@ -199,7 +218,11 @@ fn print_status(task: &TaskState) {
     );
     println!(
         "Constraints  {}",
-        if task.constraints.is_empty() { "none".to_string() } else { task.constraints.join("; ") }
+        if task.constraints.is_empty() {
+            "none".to_string()
+        } else {
+            task.constraints.join("; ")
+        }
     );
     println!(
         "Pending interaction  {}",
@@ -226,8 +249,21 @@ fn print_trace(task: &TaskState) {
         println!("(no steps recorded)");
         return;
     }
-    for entry in task.route.iter().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
-        println!("  {}({}) -> {}", entry.step, entry.executor.name(), entry.outcome);
+    for entry in task
+        .route
+        .iter()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!(
+            "  {}({}) -> {}",
+            entry.step,
+            entry.executor.name(),
+            entry.outcome
+        );
     }
 }
 
@@ -245,7 +281,12 @@ mod tests {
             goal: "test goal".to_string(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
-            budget: TaskBudget { soft_tokens: 40_000, hard_tokens: 80_000, packet_tokens_used: 0, raw_tokens_avoided: 0 },
+            budget: TaskBudget {
+                soft_tokens: 40_000,
+                hard_tokens: 80_000,
+                packet_tokens_used: 0,
+                raw_tokens_avoided: 0,
+            },
             runs: Vec::new(),
             observations: Vec::new(),
             hypotheses: Vec::new(),
@@ -336,6 +377,9 @@ mod tests {
     #[test]
     fn unrecognized_word_without_pending_question_is_unknown() {
         let task = empty_task();
-        assert!(matches!(parse_command("frobnicate", &task), ReplInput::Unknown(_)));
+        assert!(matches!(
+            parse_command("frobnicate", &task),
+            ReplInput::Unknown(_)
+        ));
     }
 }

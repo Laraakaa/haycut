@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::{
     cli::{AgentCommand, TaskTarget},
-    code_graph,
     code_context::{CodeContext, render_code_context},
+    code_graph,
     commands::{read_symbol, read_window, search, task, trace},
     config::Config,
     context::{
@@ -138,13 +138,28 @@ pub struct ActionArgs {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AgentAction {
-    Search { query: String },
-    ReadSymbol { target: String },
-    ReadWindow { path: PathBuf, line: usize, radius: usize },
-    RunCommand { program: String, args: Vec<String> },
-    PullContext { id: String },
+    Search {
+        query: String,
+    },
+    ReadSymbol {
+        target: String,
+    },
+    ReadWindow {
+        path: PathBuf,
+        line: usize,
+        radius: usize,
+    },
+    RunCommand {
+        program: String,
+        args: Vec<String>,
+    },
+    PullContext {
+        id: String,
+    },
     PlanPatch,
-    AskUser { question: String },
+    AskUser {
+        question: String,
+    },
     Finish,
 }
 
@@ -630,7 +645,10 @@ fn execute_resolve_verification(task: &mut task::TaskState) -> io::Result<StepRe
 }
 
 fn execute_run_baseline(task: &mut task::TaskState) -> io::Result<StepResult> {
-    let Some(command) = task.verification.as_ref().and_then(|plan| plan.primary_command().cloned())
+    let Some(command) = task
+        .verification
+        .as_ref()
+        .and_then(|plan| plan.primary_command().cloned())
     else {
         return Ok(StepResult {
             summary: "no verification plan".to_string(),
@@ -764,9 +782,8 @@ fn execute_select_context(task: &mut task::TaskState, step_index: usize) -> io::
     let eager_summary = maybe_eager_load_context(task);
 
     Ok(StepResult {
-        summary: eager_summary.unwrap_or_else(|| {
-            format!("surfaced available off-site context: {listing}")
-        }),
+        summary: eager_summary
+            .unwrap_or_else(|| format!("surfaced available off-site context: {listing}")),
         terminal: false,
     })
 }
@@ -1459,7 +1476,10 @@ fn patch_edit_from_json(edit: &serde_json::Value) -> io::Result<task::PatchEdit>
             })
     };
     // Default to `replace` so the flat legacy shape (no `kind`) still maps.
-    let kind = edit.get("kind").and_then(|v| v.as_str()).unwrap_or("replace");
+    let kind = edit
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("replace");
 
     Ok(match kind {
         "replace" => task::PatchEdit::Replace {
@@ -1474,7 +1494,10 @@ fn patch_edit_from_json(edit: &serde_json::Value) -> io::Result<task::PatchEdit>
         "create" => task::PatchEdit::Create {
             path: str_field("path"),
             content: str_field("content"),
-            overwrite: edit.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false),
+            overwrite: edit
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
         "delete" => task::PatchEdit::Delete {
             path: str_field("path"),
@@ -1504,10 +1527,17 @@ fn render_patch_edits(edits: &[task::PatchEdit]) -> String {
     edits
         .iter()
         .map(|edit| match edit {
-            task::PatchEdit::Replace { path, find, replace, .. } => {
+            task::PatchEdit::Replace {
+                path,
+                find,
+                replace,
+                ..
+            } => {
                 format!("replace {path}: \"{find}\" -> \"{replace}\"")
             }
-            task::PatchEdit::Create { path, overwrite, .. } => {
+            task::PatchEdit::Create {
+                path, overwrite, ..
+            } => {
                 if *overwrite {
                     format!("create {path} (overwrite)")
                 } else {
@@ -1555,7 +1585,9 @@ fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
         }
         Some(edits) if !edits.is_empty() => {
             match patch::preview_edits(&root, edits, &task.inspected_digests) {
-                Ok(preview) => Ok(format!("preview only; rerun with --apply to write:\n{preview}")),
+                Ok(preview) => Ok(format!(
+                    "preview only; rerun with --apply to write:\n{preview}"
+                )),
                 Err(error) if patch::is_conflict(&error) => Err(error),
                 Err(error) => return Err(error),
             }
@@ -1666,7 +1698,11 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
         *task = task::load_current()?;
 
         let passed = exit_code == 0;
-        let label = if check.required { "required" } else { "optional" };
+        let label = if check.required {
+            "required"
+        } else {
+            "optional"
+        };
         lines.push(format!(
             "{label} `{}` exited {exit_code} ({})",
             check.command.display(),
@@ -1690,7 +1726,11 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
     // mid-loop.
     task.verification_results = results;
 
-    let overall = if required_failures.is_empty() { "pass" } else { "fail" };
+    let overall = if required_failures.is_empty() {
+        "pass"
+    } else {
+        "fail"
+    };
     let summary = format!("final verification ({overall}): {}", lines.join("; "));
 
     Ok(StepResult {
@@ -2402,9 +2442,11 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
     if !observations.is_empty() {
         prompt.push_str("\nKnown context:\n");
         for observation in observations {
-            let is_code_context = observation.summary.lines().nth(1).is_some_and(|line| {
-                line.starts_with("```")
-            });
+            let is_code_context = observation
+                .summary
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("```"));
             if is_code_context {
                 prompt.push_str(&observation.summary);
             } else {
@@ -2455,7 +2497,11 @@ fn agent_action_from_planner_action(action: &PlannerAction) -> AgentAction {
 /// publishing, credential access) are denied outright. Denials and
 /// approval-required commands are never executed — they come back as a
 /// planner-visible observation describing why, not a hard error.
-fn execute_run_command(task: &task::TaskState, program: &str, args: &[String]) -> io::Result<String> {
+fn execute_run_command(
+    task: &task::TaskState,
+    program: &str,
+    args: &[String],
+) -> io::Result<String> {
     let risk = command_policy::classify(program, args);
     let command_display = format!("{program} {}", args.join(" "));
 
@@ -2481,7 +2527,10 @@ fn execute_run_command(task: &task::TaskState, program: &str, args: &[String]) -
         command_policy::RiskTier::High => unreachable!("high risk denied above"),
     };
     let timeout_note = if outcome.timed_out {
-        format!(" [timed out after {}ms, process killed]", timeout.as_millis())
+        format!(
+            " [timed out after {}ms, process killed]",
+            timeout.as_millis()
+        )
     } else {
         String::new()
     };
@@ -3008,9 +3057,7 @@ mod tests {
             kind: "test_failure".to_string(),
             summary: "ten_units_qualifies_for_bulk_discount failed".to_string(),
             locations: vec!["src/cart.rs:13".to_string()],
-            detail: Some(
-                "assertion `left == right` failed\n  left: 1000\n right: 900".to_string(),
-            ),
+            detail: Some("assertion `left == right` failed\n  left: 1000\n right: 900".to_string()),
         });
         task.available_context = vec![task::AvailableContext {
             id: "c1".to_string(),
@@ -3052,9 +3099,7 @@ mod tests {
         task.current_failure.as_mut().unwrap().locations = vec!["unknown".to_string()];
         task.available_context = vec![context_candidate("c1", Some(true), "fn helper() {}")];
 
-        assert!(
-            failure_path_observation(task.current_failure.as_ref().unwrap(), &task).is_none()
-        );
+        assert!(failure_path_observation(task.current_failure.as_ref().unwrap(), &task).is_none());
         execute_pull_context(&mut task, "c1").unwrap();
         let prompt = patch_plan_prompt(&task);
         assert!(prompt.contains("Current failure:"));

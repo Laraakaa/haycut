@@ -15,7 +15,9 @@ use std::{
 };
 
 /// How risky a `(program, args)` pair is judged to be.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskTier {
     Low,
@@ -70,7 +72,9 @@ fn is_high_risk(program: &str, args: &[&str]) -> bool {
     let joined = args.join(" ");
 
     match program {
-        "rm" => args.iter().any(|arg| *arg == "-rf" || *arg == "-fr" || *arg == "-r" || *arg == "-f"),
+        "rm" => args
+            .iter()
+            .any(|arg| *arg == "-rf" || *arg == "-fr" || *arg == "-r" || *arg == "-f"),
         "git" => {
             let subcommand = args.first().copied().unwrap_or("");
             matches!(subcommand, "push") && args.iter().any(|arg| arg.contains("force"))
@@ -78,11 +82,16 @@ fn is_high_risk(program: &str, args: &[&str]) -> bool {
                 || subcommand == "clean" && args.iter().any(|arg| arg.starts_with("-f"))
                 || subcommand == "branch" && args.iter().any(|arg| *arg == "-D" || *arg == "-d")
         }
-        "curl" | "wget" => args.iter().any(|arg| *arg == "-X" || *arg == "--upload-file")
-            || joined.contains("--data")
-            || joined.contains("POST")
-            || joined.contains("PUT"),
-        "cat" | "printenv" | "env" | "less" | "more" => args.iter().any(|arg| looks_like_secret_path(arg)),
+        "curl" | "wget" => {
+            args.iter()
+                .any(|arg| *arg == "-X" || *arg == "--upload-file")
+                || joined.contains("--data")
+                || joined.contains("POST")
+                || joined.contains("PUT")
+        }
+        "cat" | "printenv" | "env" | "less" | "more" => {
+            args.iter().any(|arg| looks_like_secret_path(arg))
+        }
         "chmod" | "chown" => true,
         "dd" | "mkfs" | "shutdown" | "reboot" => true,
         "npm" | "pnpm" | "yarn" => args.first().copied() == Some("publish"),
@@ -106,13 +115,23 @@ fn is_low_risk(program: &str, args: &[&str]) -> bool {
     match program {
         "cargo" => matches!(
             args.first().copied(),
-            Some("test") | Some("build") | Some("check") | Some("fmt") | Some("clippy") | Some("doc")
+            Some("test")
+                | Some("build")
+                | Some("check")
+                | Some("fmt")
+                | Some("clippy")
+                | Some("doc")
         ),
-        "go" => matches!(args.first().copied(), Some("test") | Some("build") | Some("vet") | Some("fmt")),
-        "npm" | "pnpm" | "yarn" | "bun" => matches!(
+        "go" => matches!(
             args.first().copied(),
-            Some("test") | Some("run") | Some("build") | Some("lint")
-        ) && !args.contains(&"publish"),
+            Some("test") | Some("build") | Some("vet") | Some("fmt")
+        ),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            matches!(
+                args.first().copied(),
+                Some("test") | Some("run") | Some("build") | Some("lint")
+            ) && !args.contains(&"publish")
+        }
         "pytest" | "uv" | "poetry" | "pipenv" => true,
         "make" => true,
         "git" => {
@@ -129,12 +148,23 @@ fn is_low_risk(program: &str, args: &[&str]) -> bool {
 fn is_medium_risk(program: &str, args: &[&str]) -> bool {
     let subcommand = args.first().copied().unwrap_or("");
     match program {
-        "npm" | "pnpm" | "yarn" | "bun" => matches!(subcommand, "install" | "add" | "remove" | "update"),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            matches!(subcommand, "install" | "add" | "remove" | "update")
+        }
         "pip" | "pip3" => matches!(subcommand, "install" | "uninstall"),
         "cargo" => matches!(subcommand, "add" | "remove" | "update" | "install"),
         "git" => matches!(
             subcommand,
-            "commit" | "add" | "checkout" | "merge" | "rebase" | "push" | "reset" | "restore" | "tag" | "stash"
+            "commit"
+                | "add"
+                | "checkout"
+                | "merge"
+                | "rebase"
+                | "push"
+                | "reset"
+                | "restore"
+                | "tag"
+                | "stash"
         ),
         "alembic" | "flyway" | "sqlx" => true,
         _ => false,
@@ -223,7 +253,10 @@ mod tests {
         assert_eq!(classify("cargo", &args(&["test"])), RiskTier::Low);
         assert_eq!(classify("cargo", &args(&["build"])), RiskTier::Low);
         assert_eq!(classify("cargo", &args(&["fmt", "--check"])), RiskTier::Low);
-        assert_eq!(classify("git", &args(&["status", "--porcelain"])), RiskTier::Low);
+        assert_eq!(
+            classify("git", &args(&["status", "--porcelain"])),
+            RiskTier::Low
+        );
         assert_eq!(classify("git", &args(&["log", "-1"])), RiskTier::Low);
         assert_eq!(classify("git", &args(&["diff"])), RiskTier::Low);
     }
@@ -231,10 +264,22 @@ mod tests {
     #[test]
     fn medium_risk_commands() {
         assert_eq!(classify("npm", &args(&["install"])), RiskTier::Medium);
-        assert_eq!(classify("pip", &args(&["install", "requests"])), RiskTier::Medium);
-        assert_eq!(classify("cargo", &args(&["add", "serde"])), RiskTier::Medium);
-        assert_eq!(classify("git", &args(&["commit", "-m", "x"])), RiskTier::Medium);
-        assert_eq!(classify("alembic", &args(&["upgrade", "head"])), RiskTier::Medium);
+        assert_eq!(
+            classify("pip", &args(&["install", "requests"])),
+            RiskTier::Medium
+        );
+        assert_eq!(
+            classify("cargo", &args(&["add", "serde"])),
+            RiskTier::Medium
+        );
+        assert_eq!(
+            classify("git", &args(&["commit", "-m", "x"])),
+            RiskTier::Medium
+        );
+        assert_eq!(
+            classify("alembic", &args(&["upgrade", "head"])),
+            RiskTier::Medium
+        );
     }
 
     #[test]
@@ -244,12 +289,18 @@ mod tests {
         assert_eq!(classify("git", &args(&["reset", "--hard"])), RiskTier::High);
         assert_eq!(classify("cat", &args(&["~/.ssh/id_rsa"])), RiskTier::High);
         assert_eq!(classify("cargo", &args(&["publish"])), RiskTier::High);
-        assert_eq!(classify("chmod", &args(&["777", "/etc/passwd"])), RiskTier::High);
+        assert_eq!(
+            classify("chmod", &args(&["777", "/etc/passwd"])),
+            RiskTier::High
+        );
     }
 
     #[test]
     fn unknown_commands_default_to_medium_not_auto_run() {
-        assert_eq!(classify("some-custom-tool", &args(&["--do-thing"])), RiskTier::Medium);
+        assert_eq!(
+            classify("some-custom-tool", &args(&["--do-thing"])),
+            RiskTier::Medium
+        );
     }
 
     #[test]

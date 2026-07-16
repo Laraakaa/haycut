@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     budget::BudgetUsage,
-    code_context::{render_code_context, CodeContext},
+    code_context::{CodeContext, render_code_context},
     commands::{run_context::RunContext, trace::RunManifest},
     compactor::{CompactPacket, OutputSource},
     config::{Config, TokenConfig},
@@ -699,11 +699,7 @@ mod tests {
         assert!(rendered.contains("Files mentioned:"));
         assert!(rendered.contains("  tests/auth/session_test.rs:5:5"));
         assert!(rendered.contains("Suggested context:"));
-        assert!(
-            rendered.contains(
-                "window@tests/auth/session_test.rs:3\n```rust\n"
-            )
-        );
+        assert!(rendered.contains("window@tests/auth/session_test.rs:3\n```rust\n"));
         assert!(rendered.contains("reason: Primary test failure location"));
         assert!(rendered.contains("assert!(validate_session(session).is_err());"));
         assert!(rendered.contains("packet tokens:"));

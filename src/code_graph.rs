@@ -487,7 +487,8 @@ mod tests {
             path.iter()
                 .map(|node| node.symbol.as_str())
                 .collect::<Vec<_>>(),
-            vec!["test_total", "total_for", "apply_bulk_discount"]);
+            vec!["test_total", "total_for", "apply_bulk_discount"]
+        );
         assert!(path[0].code.contains("assert_eq!(total_for(10, 100), 900)"));
         assert!(
             path[1]

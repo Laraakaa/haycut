@@ -25,7 +25,9 @@ pub struct FileDigest(pub String);
 /// `Create`-style edits can distinguish "not there yet" from "changed".
 pub fn digest_file(path: &Path) -> io::Result<Option<FileDigest>> {
     match fs::read(path) {
-        Ok(content) => Ok(Some(FileDigest(blake3::hash(&content).to_hex().to_string()))),
+        Ok(content) => Ok(Some(FileDigest(
+            blake3::hash(&content).to_hex().to_string(),
+        ))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -90,7 +92,12 @@ pub fn apply_edits(
 
 fn describe_planned_op(op: &PlannedOp) -> String {
     match op {
-        PlannedOp::Write { relative_path, original, updated, .. } => {
+        PlannedOp::Write {
+            relative_path,
+            original,
+            updated,
+            ..
+        } => {
             let original = original.as_deref().unwrap_or("");
             format!(
                 "{}\n- {}\n+ {}",
@@ -102,7 +109,11 @@ fn describe_planned_op(op: &PlannedOp) -> String {
         PlannedOp::Delete { relative_path, .. } => {
             format!("{}\n- (file deleted)", relative_path.display())
         }
-        PlannedOp::Rename { relative_from, relative_to, .. } => {
+        PlannedOp::Rename {
+            relative_from,
+            relative_to,
+            ..
+        } => {
             format!(
                 "{} -> {}\n(renamed, contents unchanged)",
                 relative_from.display(),
@@ -145,7 +156,13 @@ fn plan_edits(
     let mut anchors = HashSet::new();
 
     for edit in edits {
-        let PatchEdit::Replace { path, find, expected_digest, .. } = edit else {
+        let PatchEdit::Replace {
+            path,
+            find,
+            expected_digest,
+            ..
+        } = edit
+        else {
             continue;
         };
         if path.trim().is_empty() {
@@ -170,9 +187,10 @@ fn plan_edits(
         }
 
         let content = fs::read_to_string(&resolved)?;
-        let entry = replace_originals
-            .entry(resolved)
-            .or_insert((relative_path, content, digest_checked));
+        let entry =
+            replace_originals
+                .entry(resolved)
+                .or_insert((relative_path, content, digest_checked));
         entry.2 = entry.2 || digest_checked;
     }
 
@@ -181,7 +199,13 @@ fn plan_edits(
     for (path, (relative_path, original, digest_checked)) in &replace_originals {
         let mut updated = original.clone();
         for edit in edits {
-            let PatchEdit::Replace { path: edit_path, find, replace, .. } = edit else {
+            let PatchEdit::Replace {
+                path: edit_path,
+                find,
+                replace,
+                ..
+            } = edit
+            else {
                 continue;
             };
             match resolve_existing_path(&root, edit_path) {
@@ -216,7 +240,11 @@ fn plan_edits(
     for edit in edits {
         match edit {
             PatchEdit::Replace { .. } => {} // handled above
-            PatchEdit::Create { path, content, overwrite } => {
+            PatchEdit::Create {
+                path,
+                content,
+                overwrite,
+            } => {
                 if path.trim().is_empty() {
                     return Err(invalid_input("edit path is required"));
                 }
@@ -228,7 +256,8 @@ fn plan_edits(
                     )));
                 }
                 if resolved.exists() {
-                    let inspected_digest = inspected.get(&relative_path.to_string_lossy().to_string());
+                    let inspected_digest =
+                        inspected.get(&relative_path.to_string_lossy().to_string());
                     reject_dirty_git_target(&root, &relative_path, inspected_digest)?;
                 }
                 planned.push(PlannedOp::Write {
@@ -238,7 +267,10 @@ fn plan_edits(
                     updated: content.clone(),
                 });
             }
-            PatchEdit::Delete { path, expected_digest } => {
+            PatchEdit::Delete {
+                path,
+                expected_digest,
+            } => {
                 if path.trim().is_empty() {
                     return Err(invalid_input("edit path is required"));
                 }
@@ -251,7 +283,11 @@ fn plan_edits(
                     original,
                 });
             }
-            PatchEdit::Rename { from, to, expected_digest } => {
+            PatchEdit::Rename {
+                from,
+                to,
+                expected_digest,
+            } => {
                 if from.trim().is_empty() || to.trim().is_empty() {
                     return Err(invalid_input("rename requires both `from` and `to` paths"));
                 }
@@ -361,7 +397,9 @@ pub fn is_conflict(error: &io::Error) -> bool {
 fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(
         ".{}.haycut-{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("patch"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("patch"),
         Uuid::new_v4().simple()
     ))
 }
@@ -409,10 +447,18 @@ fn write_transaction(ops: &[PlannedOp]) -> io::Result<()> {
 fn rollback(committed: &[&PlannedOp]) {
     for op in committed.iter().rev() {
         match op {
-            PlannedOp::Write { path, original: Some(original), .. } => {
+            PlannedOp::Write {
+                path,
+                original: Some(original),
+                ..
+            } => {
                 let _ = fs::write(path, original);
             }
-            PlannedOp::Write { path, original: None, .. } => {
+            PlannedOp::Write {
+                path,
+                original: None,
+                ..
+            } => {
                 let _ = fs::remove_file(path);
             }
             PlannedOp::Delete { path, original, .. } => {
@@ -515,7 +561,12 @@ mod tests {
         let root = temp_root("unique");
         fs::write(root.join("lib.rs"), "let value = 1;").unwrap();
 
-        apply_edits(&root, &[edit("lib.rs", "value = 1", "value = 2")], &no_digests()).unwrap();
+        apply_edits(
+            &root,
+            &[edit("lib.rs", "value = 1", "value = 2")],
+            &no_digests(),
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(root.join("lib.rs")).unwrap(),
@@ -678,9 +729,16 @@ mod tests {
         )
         .expect_err("file changed after inspection must be rejected");
 
-        assert!(error.to_string().contains("changed after the agent inspected it"));
+        assert!(
+            error
+                .to_string()
+                .contains("changed after the agent inspected it")
+        );
         assert!(is_conflict(&error));
-        assert_eq!(fs::read_to_string(&file).unwrap(), "yet another user change");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "yet another user change"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -699,7 +757,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fs::read_to_string(root.join("new.rs")).unwrap(), "fn main() {}");
+        assert_eq!(
+            fs::read_to_string(root.join("new.rs")).unwrap(),
+            "fn main() {}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -753,7 +814,10 @@ mod tests {
 
         apply_edits(
             &root,
-            &[PatchEdit::Delete { path: "gone.rs".to_string(), expected_digest: digest }],
+            &[PatchEdit::Delete {
+                path: "gone.rs".to_string(),
+                expected_digest: digest,
+            }],
             &no_digests(),
         )
         .unwrap();
@@ -772,7 +836,10 @@ mod tests {
 
         let error = apply_edits(
             &root,
-            &[PatchEdit::Delete { path: "changed.rs".to_string(), expected_digest: stale_digest }],
+            &[PatchEdit::Delete {
+                path: "changed.rs".to_string(),
+                expected_digest: stale_digest,
+            }],
             &no_digests(),
         )
         .expect_err("stale digest must be rejected");
