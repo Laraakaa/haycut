@@ -491,6 +491,7 @@ struct SidebarCache {
     width: usize,
     collapsed_revision: usize,
     rows: Vec<RenderedRow>,
+    logical_hit_regions: Vec<HitRegion>,
     hit_regions: Vec<HitRegion>,
 }
 
@@ -933,6 +934,14 @@ fn model_meter(events: &[UiEvent]) -> ModelMeterSnapshot {
     }
 }
 
+fn model_meter_with_live(events: &[UiEvent], pending: Option<&InFlightTurn>) -> ModelMeterSnapshot {
+    let mut meter = model_meter(events);
+    if let (Some(call), Some(turn)) = (meter.active.as_mut(), pending) {
+        call.output = UsageValue::Estimated(turn.live_output);
+    }
+    meter
+}
+
 fn format_usage(value: UsageValue) -> String {
     let (prefix, number) = match value {
         UsageValue::Unknown => return "—".into(),
@@ -991,6 +1000,7 @@ impl DemoDriver {
 
 struct InFlightTurn {
     animation_frame: usize,
+    live_output: usize,
 }
 
 struct App {
@@ -1064,27 +1074,31 @@ impl App {
             && self.context_open
             && self.context_area.contains((mouse.column, mouse.row).into())
         {
-            if let Some(HitTarget::ToggleDetails { item_id }) =
-                hit_test(&self.context_cache.hit_regions, mouse.column, mouse.row)
-            {
-                if item_id == "context-close" {
-                    self.context_open = false;
-                    self.context_focus = false;
-                    return true;
-                }
-                if let Some(section) = item_id.strip_prefix("section:") {
-                    if !self.collapsed_sections.insert(section.to_string()) {
-                        self.collapsed_sections.remove(section);
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if let Some(HitTarget::ToggleDetails { item_id }) =
+                    hit_test(&self.context_cache.hit_regions, mouse.column, mouse.row)
+                {
+                    if item_id == "context-close" {
+                        self.context_open = false;
+                        self.context_focus = false;
+                        return true;
                     }
-                    self.collapsed_revision += 1;
-                    return true;
+                    if let Some(section) = item_id.strip_prefix("section:") {
+                        if !self.collapsed_sections.insert(section.to_string()) {
+                            self.collapsed_sections.remove(section);
+                        }
+                        self.collapsed_revision += 1;
+                        return true;
+                    }
                 }
+                self.context_focus = true;
+                return false;
             }
-            self.context_focus = true;
             if matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             ) {
+                self.context_focus = true;
                 self.context_viewport.scroll_by(
                     if mouse.kind == MouseEventKind::ScrollUp {
                         -3
@@ -1099,6 +1113,7 @@ impl App {
         }
         if let Event::Mouse(mouse) = event {
             if self.layout == LayoutMode::Chat
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 && let Some(HitTarget::ToggleDetails { item_id }) =
                     hit_test(&self.tab_regions, mouse.column, mouse.row)
             {
@@ -1141,8 +1156,9 @@ impl App {
                         .scroll_by(delta, self.workflow_cache.rows.len());
                     return true;
                 }
-                if let Some(HitTarget::ToggleDetails { item_id }) =
-                    hit_test(&self.workflow_cache.hit_regions, mouse.column, mouse.row)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(HitTarget::ToggleDetails { item_id }) =
+                        hit_test(&self.workflow_cache.hit_regions, mouse.column, mouse.row)
                 {
                     self.selected_node = self.workflow.as_ref().and_then(|workflow| {
                         workflow
@@ -1208,12 +1224,20 @@ impl App {
         .max(1) as isize;
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let delta = match key.code {
-                KeyCode::Left | KeyCode::Right => {
-                    self.active_tab = if self.active_tab == ActiveTab::Chat {
-                        ActiveTab::Workflow
-                    } else {
-                        ActiveTab::Chat
-                    };
+                KeyCode::Char('1')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    self.active_tab = ActiveTab::Chat;
+                    return true;
+                }
+                KeyCode::Char('2')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    self.active_tab = ActiveTab::Workflow;
                     return true;
                 }
                 KeyCode::Up => Some(-1),
@@ -1277,20 +1301,16 @@ impl App {
                 return true;
             }
         }
-        if key.code == KeyCode::Char('1')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-        {
-            return self.advance_demo();
-        }
         if key.code == KeyCode::Enter
             && !key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            return self.submit();
+            return if self.layout == LayoutMode::Chat && self.editor.text().trim().is_empty() {
+                self.advance_demo()
+            } else {
+                self.submit()
+            };
         }
         self.editor.handle_event(Event::Key(key))
     }
@@ -1351,7 +1371,10 @@ impl App {
                         });
                     }
                 }
-                self.pending = Some(InFlightTurn { animation_frame: 0 });
+                self.pending = Some(InFlightTurn {
+                    animation_frame: 0,
+                    live_output: 0,
+                });
             }
             DemoEvent::NodeCompleted(id, outcome) => {
                 self.append_event(UiEvent::NodeCompleted {
@@ -1582,42 +1605,14 @@ impl App {
             return false;
         };
         turn.animation_frame = (turn.animation_frame + 1) % SPINNER.len();
-        let animation_frame = turn.animation_frame;
-        let active = model_meter(&self.events).active;
-        if let Some(call) = active {
-            let output = match call.output {
-                UsageValue::Estimated(value)
-                | UsageValue::Reported(value)
-                | UsageValue::LowerBound(value) => value + 8,
-                UsageValue::Unknown => 8,
-            };
-            self.append_event(UiEvent::ModelStream(ModelStreamEvent::UsageUpdate {
-                id: call.id,
-                input: call.input,
-                output: UsageValue::Estimated(output),
-                cached_input: call.cached_input,
-            }));
-            if call.purpose.starts_with("writing report") {
-                let chunks = [
-                    "- Added incremental workflow-tree rendering\n",
-                    "- Added running, success, and failure states\n",
-                    "- Recovered from verification failure\n",
-                    "- 185 tests passed",
-                ];
-                if let Some(chunk) = chunks.get(animation_frame.saturating_sub(1)) {
-                    self.append_event(UiEvent::AssistantDelta {
-                        id: self.events.len(),
-                        text: (*chunk).into(),
-                    });
-                }
-            }
-        }
+        turn.live_output += 8;
         true
     }
 
     fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
         self.terminal_width = area.width;
         let prompt = prompt_rect_for(area, self.editor.desired_content_rows(area));
+        let meter = model_meter_with_live(&self.events, self.pending.as_ref());
         match self.layout {
             LayoutMode::Landing => {
                 let landing_height = prompt.y.saturating_sub(area.y + 1);
@@ -1674,6 +1669,7 @@ impl App {
                         &mut self.cache,
                         &mut self.viewport,
                         self.pending.as_ref(),
+                        &meter,
                         frame,
                     );
                 } else {
@@ -1702,12 +1698,7 @@ impl App {
                 }
             }
         }
-        self.editor.render(
-            prompt,
-            &model_meter(&self.events),
-            self.pending.as_ref().map_or(0, |turn| turn.animation_frame),
-            frame,
-        );
+        self.editor.render(prompt, frame);
     }
 }
 
@@ -1772,6 +1763,119 @@ fn timeline_lines(
     lines
 }
 
+fn dependency_ancestors(projection: &WorkflowProjection, id: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut current = Some(id.to_string());
+    while let Some(id) = current {
+        ancestors.push(id.clone());
+        current = projection
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .and_then(|node| node.dependencies.first())
+            .cloned();
+    }
+    ancestors
+}
+
+fn workflow_display_parent(
+    projection: &WorkflowProjection,
+    node: &ProjectedNode,
+) -> Option<String> {
+    match node.dependencies.as_slice() {
+        [] => None,
+        [parent] => Some(parent.clone()),
+        dependencies => dependency_ancestors(projection, &dependencies[0])
+            .into_iter()
+            .find(|candidate| {
+                dependencies[1..].iter().all(|dependency| {
+                    dependency_ancestors(projection, dependency).contains(candidate)
+                })
+            }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_workflow_children(
+    projection: &WorkflowProjection,
+    visible: &[&ProjectedNode],
+    parent: Option<&str>,
+    prefix: &str,
+    compact: bool,
+    animation_frame: usize,
+    connector_style: Style,
+    running_style: Style,
+    success_style: Style,
+    failure_style: Style,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let children: Vec<_> = visible
+        .iter()
+        .copied()
+        .filter(|node| workflow_display_parent(projection, node).as_deref() == parent)
+        .collect();
+    for (index, node) in children.iter().enumerate() {
+        let last = index + 1 == children.len();
+        let branch = if last { "└─ " } else { "├─ " };
+        let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+        let (symbol, style) = match node.status {
+            NodeStatus::Running => (SPINNER[animation_frame % SPINNER.len()], running_style),
+            NodeStatus::Done => ("✓", success_style),
+            NodeStatus::Failed => ("✗", failure_style),
+            _ => ("·", connector_style),
+        };
+        let merge = if node.dependencies.len() > 1 {
+            "  2 inputs"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{branch}"), connector_style),
+            Span::styled(
+                format!(
+                    "{symbol} {} [{}]{}",
+                    node.label,
+                    node.executor.name(),
+                    merge
+                ),
+                style,
+            ),
+        ]));
+        if let Some(outcome) = node.outcome.as_deref().filter(|_| !compact) {
+            lines.extend(
+                wrap_text(
+                    outcome,
+                    width
+                        .saturating_sub(display_width(&child_prefix) + 2)
+                        .max(1),
+                )
+                .into_iter()
+                .map(|text| {
+                    Line::from(vec![
+                        Span::styled(format!("{child_prefix}· "), connector_style),
+                        Span::styled(text, style),
+                    ])
+                }),
+            );
+        }
+        render_workflow_children(
+            projection,
+            visible,
+            Some(&node.id),
+            &child_prefix,
+            compact,
+            animation_frame,
+            connector_style,
+            running_style,
+            success_style,
+            failure_style,
+            width,
+            lines,
+        );
+    }
+}
+
 fn workflow_block_lines(
     workflow: &WorkflowInstance,
     width: usize,
@@ -1786,10 +1890,7 @@ fn workflow_block_lines(
         .add_modifier(Modifier::DIM);
     let failure_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let connector_style = Style::default().fg(Color::DarkGray);
-    let mut lines = vec![Line::from(vec![
-        Span::styled("│ ", connector_style),
-        Span::styled("Workflow", heading_style),
-    ])];
+    let mut lines = vec![Line::from(Span::styled("Workflow", heading_style))];
     let projection = workflow_projection(&workflow.workflow);
     let visible: Vec<_> = projection
         .nodes
@@ -1797,65 +1898,20 @@ fn workflow_block_lines(
         .filter(|node| node.status != NodeStatus::Pending)
         .collect();
     let compact = width < 42;
-    for (index, node) in visible.iter().enumerate() {
-        let depth = node
-            .dependencies
-            .first()
-            .and_then(|parent| {
-                projection
-                    .nodes
-                    .iter()
-                    .position(|candidate| candidate.id == *parent)
-            })
-            .map_or(0, |parent| {
-                projection.nodes[..parent]
-                    .iter()
-                    .filter(|n| n.status != NodeStatus::Pending)
-                    .count()
-                    .min(3)
-            });
-        let indent = "  ".repeat(depth);
-        let branch = if index + 1 == visible.len() {
-            "└─"
-        } else {
-            "├─"
-        };
-        let (symbol, style) = match node.status {
-            NodeStatus::Running => (SPINNER[animation_frame % SPINNER.len()], running_style),
-            NodeStatus::Done => ("✓", success_style),
-            NodeStatus::Failed => ("✗", failure_style),
-            _ => ("·", connector_style),
-        };
-        let merge = if node.dependencies.len() > 1 {
-            "  2 inputs"
-        } else {
-            ""
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("│ {indent}{branch} "), connector_style),
-            Span::styled(
-                format!(
-                    "{symbol} {} [{}]{}",
-                    node.label,
-                    node.executor.name(),
-                    merge
-                ),
-                style,
-            ),
-        ]));
-        if let Some(outcome) = node.outcome.as_deref().filter(|_| !compact) {
-            lines.extend(
-                wrap_text(outcome, width.saturating_sub(depth * 2 + 8).max(1))
-                    .into_iter()
-                    .map(|text| {
-                        Line::from(vec![
-                            Span::styled(format!("│ {indent}   "), connector_style),
-                            Span::styled(text, style),
-                        ])
-                    }),
-            );
-        }
-    }
+    render_workflow_children(
+        &projection,
+        &visible,
+        None,
+        "",
+        compact,
+        animation_frame,
+        connector_style,
+        running_style,
+        success_style,
+        failure_style,
+        width,
+        &mut lines,
+    );
     lines
 }
 
@@ -1903,6 +1959,7 @@ fn render_chat(
     cache: &mut RenderCache,
     viewport: &mut ChatViewport,
     pending: Option<&InFlightTurn>,
+    meter: &ModelMeterSnapshot,
     frame: &mut ratatui::Frame,
 ) {
     if area.height == 0 {
@@ -1928,7 +1985,7 @@ fn render_chat(
     if cache.event_revision != events.len() || cache.width != width || cache.expansion_revision != 0
     {
         let document = reduce_events(events);
-        let rows = rendered_rows(&document, width, pending);
+        let rows = rendered_rows(&document, width, pending, meter);
         cache.rows = rows;
         cache.row_index = cache
             .rows
@@ -1973,6 +2030,9 @@ fn render_chat(
             }
         }
     }
+    if let Some(row) = cache.rows.iter_mut().find(|row| row.owner == "activity") {
+        row.line = activity_footer_line(meter);
+    }
     viewport.offset = viewport.offset.min(viewport.max_offset(cache.rows.len()));
     viewport.follow_tail = viewport.offset == viewport.max_offset(cache.rows.len());
     if viewport.follow_tail {
@@ -1993,6 +2053,7 @@ fn rendered_rows(
     entries: &[TimelineEntry],
     width: usize,
     pending: Option<&InFlightTurn>,
+    meter: &ModelMeterSnapshot,
 ) -> Vec<RenderedRow> {
     let mut rows = Vec::new();
     let user_style = Style::default()
@@ -2037,6 +2098,12 @@ fn rendered_rows(
             });
         }
     }
+    rows.push(RenderedRow {
+        key: "activity-0".into(),
+        owner: "activity".into(),
+        local_row: 0,
+        line: activity_footer_line(meter),
+    });
     rows
 }
 
@@ -2456,29 +2523,31 @@ fn render_context_sidebar(
         || cache.width != area.width as usize
         || cache.collapsed_revision != collapsed_revision
     {
-        let (rows, mut hits) =
-            context_rows(snapshot, area.width.saturating_sub(1) as usize, collapsed);
+        let (rows, hits) = context_rows(snapshot, area.width.saturating_sub(1) as usize, collapsed);
         cache.rows = rows;
         cache.revision = snapshot.revision;
         cache.width = area.width as usize;
         cache.collapsed_revision = collapsed_revision;
-        hits.iter_mut().for_each(|hit| hit.rect.x = area.x + 1);
-        hits.iter_mut().for_each(|hit| {
-            hit.rect.y = area.y
-                + hit
-                    .rect
-                    .y
-                    .saturating_sub(viewport.offset.min(u16::MAX as usize) as u16)
-        });
-        hits.push(HitRegion {
-            rect: Rect::new(area.x + area.width.saturating_sub(3), area.y, 3, 1),
-            target: HitTarget::ToggleDetails {
-                item_id: "context-close".into(),
-            },
-        });
-        cache.hit_regions = hits;
+        cache.logical_hit_regions = hits;
         viewport.offset = viewport.offset.min(viewport.max_offset(cache.rows.len()));
     }
+    cache.hit_regions = cache
+        .logical_hit_regions
+        .iter()
+        .filter_map(|hit| {
+            let y = (hit.rect.y as usize).checked_sub(viewport.offset)?;
+            (y < area.height as usize).then(|| HitRegion {
+                rect: Rect::new(area.x + 1, area.y + y as u16, hit.rect.width, 1),
+                target: hit.target.clone(),
+            })
+        })
+        .collect();
+    cache.hit_regions.push(HitRegion {
+        rect: Rect::new(area.x + area.width.saturating_sub(3), area.y, 3, 1),
+        target: HitTarget::ToggleDetails {
+            item_id: "context-close".into(),
+        },
+    });
     let lines: Vec<Line<'static>> = cache
         .rows
         .iter()
@@ -2682,13 +2751,7 @@ impl PromptEditor {
         }
     }
 
-    fn render(
-        &mut self,
-        prompt: Rect,
-        meter: &ModelMeterSnapshot,
-        animation_frame: usize,
-        frame: &mut ratatui::Frame,
-    ) {
+    fn render(&mut self, prompt: Rect, frame: &mut ratatui::Frame) {
         let Rect {
             x,
             y,
@@ -2721,7 +2784,6 @@ impl PromptEditor {
             Paragraph::new(visible).block(block.padding(Padding::horizontal(1))),
             Rect::new(x, y, width, height),
         );
-        render_meter(prompt, meter, animation_frame, frame);
         let cursor_x = rows.get(cursor).map_or(0, |row| {
             row.3
                 .chars()
@@ -2767,77 +2829,29 @@ impl PromptEditor {
     }
 }
 
-fn render_meter(
-    prompt: Rect,
-    meter: &ModelMeterSnapshot,
-    animation_frame: usize,
-    frame: &mut ratatui::Frame,
-) {
-    if prompt.width < 4 || prompt.height == 0 {
-        return;
-    }
-    let width = prompt.width.saturating_sub(2) as usize;
+fn activity_footer_line(meter: &ModelMeterSnapshot) -> Line<'static> {
     let dim = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
     let input_style = Style::default().fg(Color::Yellow);
     let output_style = Style::default().fg(Color::Green);
-    let (left, input, output, active) = if let Some(call) = &meter.active {
-        (
-            format!(
-                "{} {}",
-                SPINNER[animation_frame % SPINNER.len()],
-                call.purpose
-            ),
-            format_usage(call.input),
-            format_usage(call.output),
-            true,
-        )
+    let (input, output, active) = if let Some(call) = &meter.active {
+        (call.input, call.output, true)
     } else {
-        (
-            String::new(),
-            format_usage(meter.input_total),
-            format_usage(meter.output_total),
-            false,
-        )
+        (meter.input_total, meter.output_total, false)
     };
-    if !active && width < 24 {
-        return;
-    }
-    let medium = width < 42;
-    let left = if medium { String::new() } else { left };
     let prefix = if active { "" } else { "Σ " };
-    let right = format!("{prefix}↑ {input}  ↓ {output}");
-    if active && width < 16 {
-        frame.render_widget(
-            Paragraph::new(Span::styled(SPINNER[animation_frame % SPINNER.len()], dim)),
-            Rect::new(prompt.x + 1, prompt.y + prompt.height - 1, 2, 1),
-        );
-        return;
-    }
-    let gap = width.saturating_sub(display_width(&left) + display_width(&right));
-    let line = Line::from(vec![
-        Span::styled(left, dim),
-        Span::raw(" ".repeat(gap)),
+    Line::from(vec![
+        Span::styled(prefix, dim),
         Span::styled(
-            format!("{prefix}↑ {input}"),
+            format!("↑ {}", format_usage(input)),
             if active { input_style } else { dim },
         ),
         Span::styled(
-            format!("  ↓ {output}"),
+            format!("  ↓ {}", format_usage(output)),
             if active { output_style } else { dim },
         ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line),
-        Rect::new(
-            prompt.x + 1,
-            prompt.y + prompt.height - 1,
-            prompt.width.saturating_sub(2),
-            1,
-        ),
-    );
-    let _ = input_style;
+    ])
 }
 
 fn should_quit(event: Event) -> bool {
@@ -2867,6 +2881,15 @@ mod tests {
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
     }
 
     #[test]
@@ -2984,16 +3007,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_one_completes_demo_and_preserves_pending_draft() {
+    fn empty_enter_advances_demo_and_preserves_pending_draft() {
         let mut app = App::default();
         app.editor.insert('x');
         app.submit();
         app.editor.insert('d');
         assert!(!app.handle_event(key(KeyCode::Enter)));
         assert_eq!(app.editor.text(), "d");
-        assert!(app.handle_event(modified_key(KeyCode::Char('1'), KeyModifiers::CONTROL,)));
+        app.editor.reset();
+        assert!(app.handle_event(key(KeyCode::Enter)));
         assert!(app.pending.is_some());
-        assert_eq!(app.editor.text(), "d");
+        assert_eq!(app.editor.text(), "");
         for _ in 1..workflow_spec().nodes.len() {
             app.advance_demo();
         }
@@ -3001,7 +3025,7 @@ mod tests {
         assert!(
             matches!(app.timeline.last(), Some(TimelineEntry::Assistant(text)) if text.starts_with("Implemented"))
         );
-        assert!(!app.handle_event(modified_key(KeyCode::Char('1'), KeyModifiers::CONTROL,)));
+        assert!(!app.handle_event(key(KeyCode::Enter)));
     }
 
     #[test]
@@ -3091,6 +3115,32 @@ mod tests {
         assert!(
             timeline_lines(&[TimelineEntry::Assistant("x".into())], 100, None).len()
                 < timeline_lines(&[TimelineEntry::Assistant("x".into())], 20, None).len() + 2
+        );
+    }
+
+    #[test]
+    fn workflow_delegation_ends_the_parent_rail() {
+        let mut workflow = workflow_spec();
+        workflow.nodes[0].status = NodeStatus::Running;
+        workflow.nodes[0].outcome = Some("detail".into());
+        workflow.nodes[1].status = NodeStatus::Running;
+        let lines = workflow_block_lines(&WorkflowInstance { workflow }, 80, 0);
+        assert!(lines[1].to_string().starts_with("└─"));
+        assert!(lines[2].to_string().starts_with("   ·"));
+        assert!(lines[3].to_string().starts_with("   └─"));
+    }
+
+    #[test]
+    fn merge_nodes_attach_to_their_common_dependency_parent() {
+        let projection = workflow_projection(&workflow_spec());
+        let plan = projection
+            .nodes
+            .iter()
+            .find(|node| node.id == "plan")
+            .unwrap();
+        assert_eq!(
+            workflow_display_parent(&projection, plan).as_deref(),
+            Some("context")
         );
     }
 
@@ -3252,9 +3302,14 @@ mod tests {
     #[test]
     fn rendered_rows_keep_semantic_metadata_when_wrapping() {
         let entries = vec![TimelineEntry::User("a long message".into())];
-        let rows = rendered_rows(&entries, 8, None);
+        let meter = model_meter(&[]);
+        let rows = rendered_rows(&entries, 8, None, &meter);
         assert!(rows.len() > 3);
-        assert!(rows.iter().all(|row| row.owner == "user-0"));
+        assert!(
+            rows.iter()
+                .filter(|row| row.owner != "activity")
+                .all(|row| row.owner == "user-0")
+        );
         assert_eq!(rows[0].local_row, 0);
         assert_eq!(rows[0].key, "user-0-0");
     }
@@ -3283,19 +3338,88 @@ mod tests {
         app.editor.insert('x');
         app.submit();
         assert_eq!(app.active_tab, ActiveTab::Chat);
-        assert!(app.handle_event(modified_key(KeyCode::Right, KeyModifiers::CONTROL)));
+        assert!(app.handle_event(modified_key(KeyCode::Char('2'), KeyModifiers::CONTROL)));
         assert_eq!(app.active_tab, ActiveTab::Workflow);
         assert_eq!(app.editor.text(), "");
         for ch in "draft".chars() {
             app.editor.insert(ch);
         }
         assert!(app.handle_event(modified_key(KeyCode::Left, KeyModifiers::CONTROL)));
+        assert_eq!(app.active_tab, ActiveTab::Workflow);
+        assert!(app.handle_event(modified_key(KeyCode::Char('1'), KeyModifiers::CONTROL)));
         assert_eq!(app.active_tab, ActiveTab::Chat);
         assert_eq!(app.editor.text(), "draft");
         assert_eq!(
             app.workflow.as_ref().unwrap().workflow.nodes[0].status,
             NodeStatus::Running
         );
+    }
+
+    #[test]
+    fn mouse_targets_require_a_left_click() {
+        let mut app = App {
+            layout: LayoutMode::Chat,
+            tab_regions: vec![HitRegion {
+                rect: Rect::new(0, 0, 8, 1),
+                target: HitTarget::ToggleDetails {
+                    item_id: "workflow".into(),
+                },
+            }],
+            ..App::default()
+        };
+        assert!(!app.handle_event(mouse(MouseEventKind::Moved, 2, 0)));
+        assert_eq!(app.active_tab, ActiveTab::Chat);
+        assert!(app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0)));
+        assert_eq!(app.active_tab, ActiveTab::Workflow);
+
+        app.context_open = true;
+        app.context_area = Rect::new(10, 0, 10, 4);
+        app.context_cache.hit_regions = vec![HitRegion {
+            rect: Rect::new(11, 1, 8, 1),
+            target: HitTarget::ToggleDetails {
+                item_id: "section:Tokens".into(),
+            },
+        }];
+        assert!(!app.handle_event(mouse(MouseEventKind::Moved, 12, 1)));
+        assert!(app.collapsed_sections.is_empty());
+        assert!(app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), 12, 1)));
+        assert!(app.collapsed_sections.contains("Tokens"));
+    }
+
+    #[test]
+    fn sidebar_hit_regions_follow_the_viewport_offset() {
+        let snapshot = ContextSidebarSnapshot::default();
+        let mut cache = SidebarCache::default();
+        let mut viewport = ChatViewport {
+            height: 3,
+            ..ChatViewport::new()
+        };
+        let area = Rect::new(10, 4, 36, 3);
+        cache.rows = context_rows(&snapshot, 35, &HashSet::new()).0;
+        cache.revision = snapshot.revision;
+        cache.width = area.width as usize;
+        cache.collapsed_revision = 0;
+        cache.logical_hit_regions = context_rows(&snapshot, 35, &HashSet::new()).1;
+        viewport.set_offset(7, cache.rows.len());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_context_sidebar(
+                    area,
+                    &snapshot,
+                    &mut cache,
+                    &mut viewport,
+                    &HashSet::new(),
+                    0,
+                    frame,
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            hit_test(&cache.hit_regions, area.x + 2, area.y),
+            Some(HitTarget::ToggleDetails { item_id }) if item_id == "section:Selected context"
+        ));
     }
 
     #[test]
@@ -3398,11 +3522,70 @@ mod tests {
         let mut app = App::default();
         app.editor.insert('x');
         app.submit();
-        let before = model_meter(&app.events).active.unwrap().output;
+        let before = model_meter_with_live(&app.events, app.pending.as_ref())
+            .active
+            .unwrap()
+            .output;
+        let event_count = app.events.len();
         app.tick();
-        let after = model_meter(&app.events).active.unwrap().output;
+        let after = model_meter_with_live(&app.events, app.pending.as_ref())
+            .active
+            .unwrap()
+            .output;
+        assert_eq!(app.events.len(), event_count);
         assert!(
-            matches!((before, after), (UsageValue::Unknown, UsageValue::Estimated(value)) if value > 0)
+            matches!((before, after), (UsageValue::Estimated(0), UsageValue::Estimated(value)) if value > 0)
         );
+    }
+
+    #[test]
+    fn activity_footer_shows_usage_without_a_second_spinner() {
+        let meter = ModelMeterSnapshot {
+            active: Some(ModelCallSnapshot {
+                id: "call-1".into(),
+                purpose: "writing report (strong model)".into(),
+                input: UsageValue::Estimated(1_600),
+                output: UsageValue::Estimated(4_500),
+                cached_input: UsageValue::Unknown,
+                active: true,
+            }),
+            input_total: UsageValue::Unknown,
+            output_total: UsageValue::Unknown,
+        };
+        let line = activity_footer_line(&meter).to_string();
+        assert!(line.contains("↑ ≈1.6k"));
+        assert!(line.contains("↓ ≈4.5k"));
+        assert!(!line.contains("writing report"));
+        assert!(!line.contains(SPINNER[0]));
+    }
+
+    #[test]
+    fn final_report_ticks_do_not_append_repeated_events() {
+        let mut app = App::default();
+        app.editor.insert('x');
+        app.submit();
+        for _ in 0..workflow_spec().nodes.len() - 1 {
+            app.advance_demo();
+        }
+        assert!(matches!(
+            model_meter(&app.events).active,
+            Some(ModelCallSnapshot { ref purpose, .. }) if purpose.starts_with("writing report")
+        ));
+        let event_count = app.events.len();
+        for _ in 0..20 {
+            app.tick();
+        }
+        assert_eq!(app.events.len(), event_count);
+        assert!(app.advance_demo());
+        assert!(app.pending.is_none());
+        let final_text = app
+            .timeline
+            .last()
+            .and_then(|entry| match entry {
+                TimelineEntry::Assistant(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(final_text.matches("185 tests passed").count(), 1);
     }
 }
