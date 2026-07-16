@@ -273,6 +273,10 @@ fn decide(task: &TaskState, max_retries: usize) -> Result<NodeOp, StopReason> {
         return Err(StopReason::BudgetExhausted);
     }
 
+    if task.pending_approval.is_some() {
+        return Err(StopReason::Blocked);
+    }
+
     let Some(intent) = task.intent else {
         return Ok(NodeOp::ClassifyIntent);
     };
@@ -560,6 +564,8 @@ mod tests {
             patch_applied: false,
             patch_previewed: false,
             apply_requested: false,
+            patch_approval_granted: false,
+            command_approval_granted: false,
             terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,

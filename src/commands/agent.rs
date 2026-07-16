@@ -13,7 +13,7 @@ use crate::{
     cli::{AgentCommand, TaskTarget},
     code_context::{CodeContext, render_code_context},
     code_graph,
-    commands::{read_symbol, read_window, search, task, trace},
+    commands::{agent::engine::ApprovalRequest, read_symbol, read_window, search, task, trace},
     config::Config,
     context::{
         invocation,
@@ -656,7 +656,7 @@ fn execute_run_baseline(task: &mut task::TaskState) -> io::Result<StepResult> {
         });
     };
 
-    let exit_code = trace::run(command.as_vec(), None, Some(TaskTarget::Current));
+    let exit_code = trace::run_quiet(command.as_vec(), None, Some(TaskTarget::Current));
     // trace::run persists evidence via attach_current_run; reload to see it.
     *task = task::load_current()?;
 
@@ -1285,18 +1285,20 @@ fn execute_read_context(task: &mut task::TaskState) -> io::Result<StepResult> {
         }
     };
 
-    task.observations.push(task::Observation {
-        id: format!("obs{}", task.observations.len() + 1),
-        source: "agent:read_context".to_string(),
-        kind: "agent_read_context".to_string(),
-        summary: observation.clone(),
-        locations: Vec::new(),
-        tokens: task::ObservationTokens {
-            raw: estimate_tokens(observation.as_bytes()),
-            packet: estimate_tokens(observation.as_bytes()),
-        },
-    });
-    task.pending_agent_action = None;
+    if task.pending_approval.is_none() {
+        task.observations.push(task::Observation {
+            id: format!("obs{}", task.observations.len() + 1),
+            source: "agent:read_context".to_string(),
+            kind: "agent_read_context".to_string(),
+            summary: observation.clone(),
+            locations: Vec::new(),
+            tokens: task::ObservationTokens {
+                raw: estimate_tokens(observation.as_bytes()),
+                packet: estimate_tokens(observation.as_bytes()),
+            },
+        });
+        task.pending_agent_action = None;
+    }
 
     Ok(StepResult {
         summary: observation,
@@ -1575,8 +1577,9 @@ fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
     }
 
     let root = patch::project_root()?;
+    let patch_authorized = task.apply_requested || task.patch_approval_granted;
     let outcome = match task.patch_edits.as_deref() {
-        Some(edits) if !edits.is_empty() && task.apply_requested => {
+        Some(edits) if !edits.is_empty() && patch_authorized => {
             match patch::apply_edits(&root, edits, &task.inspected_digests) {
                 Ok(summary) => Ok(summary),
                 Err(error) if patch::is_conflict(&error) => Err(error),
@@ -1619,8 +1622,13 @@ fn execute_apply_patch(task: &mut task::TaskState) -> io::Result<StepResult> {
         }
     };
 
-    task.patch_applied = task.apply_requested && !summary.starts_with("no edits");
-    task.patch_previewed = !task.apply_requested && !summary.starts_with("no edits");
+    task.patch_applied = patch_authorized && !summary.starts_with("no edits");
+    task.patch_previewed = !patch_authorized && !summary.starts_with("no edits");
+    // Interactive approval grants exactly one proposed edit. `--apply` stays
+    // deliberately task-wide for the non-interactive CLI contract.
+    if task.patch_approval_granted {
+        task.patch_approval_granted = false;
+    }
     Ok(StepResult {
         summary,
         terminal: false,
@@ -1694,7 +1702,7 @@ fn execute_run_final_verification(task: &mut task::TaskState) -> io::Result<Step
     let mut results = Vec::with_capacity(plan.checks.len());
 
     for check in &plan.checks {
-        let exit_code = trace::run(check.command.as_vec(), None, Some(TaskTarget::Current));
+        let exit_code = trace::run_quiet(check.command.as_vec(), None, Some(TaskTarget::Current));
         *task = task::load_current()?;
 
         let passed = exit_code == 0;
@@ -1748,6 +1756,7 @@ fn execute_retry_fix(task: &mut task::TaskState) -> io::Result<StepResult> {
     task.patch_text = None;
     task.patch_edits = None;
     task.patch_applied = false;
+    task.patch_approval_granted = false;
     task.next_actions.clear();
     task.pending_agent_action = None;
 
@@ -2498,7 +2507,7 @@ fn agent_action_from_planner_action(action: &PlannerAction) -> AgentAction {
 /// approval-required commands are never executed — they come back as a
 /// planner-visible observation describing why, not a hard error.
 fn execute_run_command(
-    task: &task::TaskState,
+    task: &mut task::TaskState,
     program: &str,
     args: &[String],
 ) -> io::Result<String> {
@@ -2511,9 +2520,18 @@ fn execute_run_command(
             command_display.trim()
         ));
     }
-    if risk == command_policy::RiskTier::Medium && !task.apply_requested {
+    if risk == command_policy::RiskTier::Medium
+        && !task.apply_requested
+        && !task.command_approval_granted
+    {
+        task.pending_approval = Some(ApprovalRequest {
+            summary: format!(
+                "Run medium-risk command `{}`? It may modify tracked files or project state.",
+                command_display.trim()
+            ),
+        });
         return Ok(format!(
-            "command policy: `{}` classified medium risk and requires approval; rerun the agent with --apply to authorize, or run it manually",
+            "command policy: `{}` classified medium risk and awaits explicit approval",
             command_display.trim()
         ));
     }
@@ -2521,6 +2539,9 @@ fn execute_run_command(
     let cwd = patch::project_root().unwrap_or_else(|_| PathBuf::from("."));
     let timeout = command_policy::timeout_for(risk);
     let outcome = command_policy::run_with_timeout(program, args, &cwd, timeout)?;
+    if risk == command_policy::RiskTier::Medium && task.command_approval_granted {
+        task.command_approval_granted = false;
+    }
     let approved = match risk {
         command_policy::RiskTier::Low => "auto (low risk)",
         command_policy::RiskTier::Medium => "user (--apply)",
@@ -2898,6 +2919,8 @@ mod tests {
             patch_applied: false,
             patch_previewed: false,
             apply_requested: false,
+            patch_approval_granted: false,
+            command_approval_granted: false,
             terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,
@@ -3038,6 +3061,26 @@ mod tests {
         .unwrap();
         assert_eq!(assembled.request, legacy_request);
         assert!(assembled.manifest.comparison_json.is_none());
+    }
+
+    #[test]
+    fn medium_risk_command_waits_for_approval_without_losing_the_action() {
+        let mut task = task_fixture();
+        task.pending_agent_action = Some(AgentAction::RunCommand {
+            program: "cargo".to_string(),
+            args: vec!["add".to_string(), "serde".to_string()],
+        });
+
+        let observations_before = task.observations.len();
+        let result = execute_read_context(&mut task).unwrap();
+
+        assert!(result.summary.contains("awaits explicit approval"));
+        assert!(task.pending_approval.is_some());
+        assert!(matches!(
+            task.pending_agent_action,
+            Some(AgentAction::RunCommand { .. })
+        ));
+        assert_eq!(task.observations.len(), observations_before);
     }
 
     #[test]

@@ -69,8 +69,28 @@ pub fn run(
     compactor: Option<CompactorMode>,
     task_target: Option<TaskTarget>,
 ) -> i32 {
+    run_with_presentation(command, compactor, task_target, true)
+}
+
+/// Run the same capture/store pipeline without writing the human-oriented
+/// trace report to the controlling terminal. Interactive renderers own stdout
+/// themselves and consume the persisted run/task state instead.
+pub fn run_quiet(
+    command: Vec<String>,
+    compactor: Option<CompactorMode>,
+    task_target: Option<TaskTarget>,
+) -> i32 {
+    run_with_presentation(command, compactor, task_target, false)
+}
+
+fn run_with_presentation(
+    command: Vec<String>,
+    compactor: Option<CompactorMode>,
+    task_target: Option<TaskTarget>,
+    present: bool,
+) -> i32 {
     if let Err(error) = Config::load_from_current_dir() {
-        eprintln!("Error loading config: {error}");
+        present_error(present, format_args!("Error loading config: {error}"));
         return 1;
     }
 
@@ -82,41 +102,64 @@ pub fn run(
                         let evidence = match store_evidence(&trace, &artifacts, &packet) {
                             Ok(evidence) => evidence,
                             Err(error) => {
-                                eprintln!("Error building evidence packet: {error}");
+                                present_error(
+                                    present,
+                                    format_args!("Error building evidence packet: {error}"),
+                                );
                                 return 1;
                             }
                         };
 
                         if let Err(error) = store_run(&trace, &artifacts, &packet, &evidence) {
-                            eprintln!("Error storing trace run: {error}");
+                            present_error(
+                                present,
+                                format_args!("Error storing trace run: {error}"),
+                            );
                             return 1;
                         }
 
                         if task_target.is_some()
                             && let Err(error) = task::attach_current_run(&trace, &packet, &evidence)
                         {
-                            eprintln!("Error updating task: {error}");
+                            present_error(present, format_args!("Error updating task: {error}"));
                             return 1;
                         }
 
-                        print_trace(&trace, &artifacts, &packet);
+                        if present {
+                            print_trace(&trace, &artifacts, &packet);
+                        }
                     }
                     Err(error) => {
-                        eprintln!("Error compacting trace output: {error}");
+                        present_error(
+                            present,
+                            format_args!("Error compacting trace output: {error}"),
+                        );
                         return 1;
                     }
                 },
                 Err(error) => {
-                    eprintln!("Error storing trace artifacts: {error}");
+                    present_error(
+                        present,
+                        format_args!("Error storing trace artifacts: {error}"),
+                    );
                     return 1;
                 }
             }
             trace.exit_code
         }
         Err(error) => {
-            eprintln!("Error running command: {error}");
+            present_error(present, format_args!("Error running command: {error}"));
             1
         }
+    }
+}
+
+/// CLI trace commands present failures to stderr; renderers own the terminal
+/// and must consume their persisted state instead of allowing output to tear
+/// through an alternate screen.
+fn present_error(present: bool, message: std::fmt::Arguments<'_>) {
+    if present {
+        eprintln!("{message}");
     }
 }
 

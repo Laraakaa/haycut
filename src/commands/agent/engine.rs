@@ -81,6 +81,7 @@ pub enum ControlCommand {
 /// and MCP-style interface should all consume the same events.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum AgentEvent {
+    NodeStarted { node_id: String, op: NodeOp },
     Progress(String),
     ActionProposed(AgentAction),
     ApprovalRequired(ApprovalRequest),
@@ -109,43 +110,110 @@ impl AgentEngine {
         task: &mut TaskState,
         command: ControlCommand,
     ) -> io::Result<Vec<AgentEvent>> {
-        match command {
-            ControlCommand::Continue => self.run_until_blocked(task),
-            ControlCommand::Step => Ok(vec![self.advance_one(task)?]),
-            ControlCommand::Approve => Ok(self.approve(task)),
-            ControlCommand::Reject { reason } => Ok(self.reject(task, reason)),
-            ControlCommand::Steer { message } => Ok(self.steer(task, message)),
-            ControlCommand::Reply { message } => Ok(self.reply(task, message)),
-            ControlCommand::AddContext { target } => self.add_context(task, target),
-            ControlCommand::Verify { command } => self.verify(task, command),
-            ControlCommand::Stop => Ok(vec![self.stop(task)]),
+        if matches!(command, ControlCommand::Continue) {
+            return self.run_until_blocked(task);
         }
+        let mut events = Vec::new();
+        self.advance_streaming(task, command, |_, event| {
+            events.push(event);
+            true
+        })?;
+        Ok(events)
+    }
+
+    /// Execute a control decision while publishing each event at the workflow
+    /// boundary that produced it. Returning `false` from `emit` requests a
+    /// graceful stop after that boundary. Interactive frontends use this to
+    /// stay responsive while `Continue` runs several nodes; callers that only
+    /// need the completed batch should continue using [`Self::advance`].
+    pub fn advance_streaming<F>(
+        &mut self,
+        task: &mut TaskState,
+        command: ControlCommand,
+        mut emit: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&TaskState, AgentEvent) -> bool,
+    {
+        match command {
+            ControlCommand::Continue => loop {
+                let event = self.advance_one(task, |snapshot, event| emit(snapshot, event))?;
+                let blocked = matches!(
+                    event,
+                    AgentEvent::ApprovalRequired(_)
+                        | AgentEvent::Question(_)
+                        | AgentEvent::Finished(_)
+                        | AgentEvent::Stopped(_)
+                );
+                let keep_running = emit(task, event);
+                if blocked {
+                    return Ok(());
+                }
+                if !keep_running {
+                    let stopped = self.stop(task);
+                    emit(task, stopped);
+                    return Ok(());
+                }
+            },
+            ControlCommand::Step => {
+                let event = self.advance_one(task, |snapshot, event| emit(snapshot, event))?;
+                emit(task, event);
+            }
+            ControlCommand::Approve => {
+                for event in self.approve(task) {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::Reject { reason } => {
+                for event in self.reject(task, reason) {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::Steer { message } => {
+                for event in self.steer(task, message) {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::Reply { message } => {
+                for event in self.reply(task, message) {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::AddContext { target } => {
+                for event in self.add_context(task, target)? {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::Verify { command } => {
+                for event in self.verify(task, command)? {
+                    emit(task, event);
+                }
+            }
+            ControlCommand::Stop => {
+                let event = self.stop(task);
+                emit(task, event);
+            }
+        }
+        Ok(())
     }
 
     /// Continue until the task needs human input, approval, a risky command
     /// decision, or has finished.
     pub fn run_until_blocked(&mut self, task: &mut TaskState) -> io::Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
-        loop {
-            let event = self.advance_one(task)?;
-            let blocked = matches!(
-                event,
-                AgentEvent::ApprovalRequired(_)
-                    | AgentEvent::Question(_)
-                    | AgentEvent::Finished(_)
-                    | AgentEvent::Stopped(_)
-            );
+        self.advance_streaming(task, ControlCommand::Continue, |_, event| {
             events.push(event);
-            if blocked {
-                break;
-            }
-        }
+            true
+        })?;
         Ok(events)
     }
 
     /// Execute exactly one engine advance: either ask the graph what's next
     /// and run it, or interpret a stop decision into a specific event.
-    fn advance_one(&mut self, task: &mut TaskState) -> io::Result<AgentEvent> {
+    fn advance_one<F>(&mut self, task: &mut TaskState, mut emit: F) -> io::Result<AgentEvent>
+    where
+        F: FnMut(&TaskState, AgentEvent) -> bool,
+    {
         let mut workflow = task.workflow.clone();
         let (node_id, next) = match workflow::next_ready_node(&mut workflow, task, MAX_RETRIES) {
             Decision::Stop(reason) => return Ok(interpret_stop(task, reason)),
@@ -153,6 +221,16 @@ impl AgentEngine {
         };
         workflow.mark_running(&node_id);
         task.workflow = workflow;
+
+        if !emit(
+            task,
+            AgentEvent::NodeStarted {
+                node_id: node_id.clone(),
+                op: next,
+            },
+        ) {
+            return Ok(self.stop(task));
+        }
 
         let step_index = task.route.len() + 1;
         let action_event = if next == NodeOp::PlanContext {
@@ -212,9 +290,17 @@ impl AgentEngine {
 
     fn approve(&mut self, task: &mut TaskState) -> Vec<AgentEvent> {
         task.pending_approval = None;
-        task.apply_requested = true;
-        task.patch_previewed = false;
-        vec![AgentEvent::Progress("approved pending patch".to_string())]
+        if matches!(
+            task.pending_agent_action,
+            Some(AgentAction::RunCommand { .. })
+        ) {
+            task.command_approval_granted = true;
+            vec![AgentEvent::Progress("approved pending command".to_string())]
+        } else {
+            task.patch_approval_granted = true;
+            task.patch_previewed = false;
+            vec![AgentEvent::Progress("approved pending patch".to_string())]
+        }
     }
 
     fn reject(&mut self, task: &mut TaskState, reason: String) -> Vec<AgentEvent> {
@@ -222,6 +308,8 @@ impl AgentEngine {
         task.patch_text = None;
         task.patch_edits = None;
         task.patch_previewed = false;
+        task.patch_approval_granted = false;
+        task.command_approval_granted = false;
         task.pending_agent_action = None;
         task.messages.push(TaskMessage {
             role: MessageRole::User,
@@ -365,7 +453,7 @@ fn interpret_stop(task: &TaskState, reason: StopReason) -> AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::agent::workflow::Workflow;
+    use crate::commands::agent::workflow::{Node, NodeStatus, Workflow};
     use crate::commands::task::{
         CurrentFailure, ProjectCard, RouteEntry, TaskBudget, TaskIntent, VerificationCheck,
         VerificationPlan, VerificationScope,
@@ -420,6 +508,8 @@ mod tests {
             patch_applied: false,
             patch_previewed: false,
             apply_requested: false,
+            patch_approval_granted: false,
+            command_approval_granted: false,
             terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,
@@ -496,6 +586,75 @@ mod tests {
     }
 
     #[test]
+    fn streaming_advance_publishes_each_event_with_its_updated_task_snapshot() {
+        let mut task = base_task();
+        task.pending_interaction = Some(PendingInteraction {
+            question: "Which behaviour is correct?".to_string(),
+            asked_at: Utc::now(),
+        });
+        let mut engine = AgentEngine::new();
+        let mut snapshots = Vec::new();
+
+        engine
+            .advance_streaming(
+                &mut task,
+                ControlCommand::Reply {
+                    message: "the old one".to_string(),
+                },
+                |snapshot, event| {
+                    snapshots.push((snapshot.pending_interaction.is_none(), event));
+                    true
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            snapshots.as_slice(),
+            [(true, AgentEvent::Progress(_))]
+        ));
+    }
+
+    #[test]
+    fn streaming_continue_emits_node_started_before_executing_the_node() {
+        let mut task = base_task();
+        task.workflow = Workflow {
+            nodes: vec![Node {
+                id: "n1".to_string(),
+                op: NodeOp::DetectProject,
+                depends_on: Vec::new(),
+                status: NodeStatus::Pending,
+                produced_by: None,
+                outcome: None,
+            }],
+            seq: 1,
+        };
+        let mut engine = AgentEngine::new();
+        let mut events = Vec::new();
+
+        engine
+            .advance_streaming(&mut task, ControlCommand::Continue, |snapshot, event| {
+                let running = match &event {
+                    AgentEvent::NodeStarted { node_id, .. } => snapshot
+                        .workflow
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *node_id)
+                        .map(|node| node.status == NodeStatus::Running)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                events.push((running, event));
+                false
+            })
+            .unwrap();
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events[0].0);
+        assert!(matches!(&events[0].1, AgentEvent::NodeStarted { .. }));
+        assert!(matches!(events[1].1, AgentEvent::Stopped(_)));
+    }
+
+    #[test]
     fn reject_records_reason_and_returns_to_planning() {
         let mut task = base_task();
         task.patch_text = Some("change expected value".to_string());
@@ -518,6 +677,53 @@ mod tests {
                 .iter()
                 .any(|o| o.summary == "public API must remain unchanged")
         );
+    }
+
+    #[test]
+    fn pending_command_approval_blocks_then_grants_only_the_queued_command() {
+        let mut task = base_task();
+        task.pending_agent_action = Some(AgentAction::RunCommand {
+            program: "cargo".to_string(),
+            args: vec!["add".to_string(), "serde".to_string()],
+        });
+        task.pending_approval = Some(ApprovalRequest {
+            summary: "Run medium-risk command `cargo add serde`?".to_string(),
+        });
+
+        let mut engine = AgentEngine::new();
+        let events = engine.advance(&mut task, ControlCommand::Continue).unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ApprovalRequired(_)]
+        ));
+        assert!(matches!(
+            task.pending_agent_action,
+            Some(AgentAction::RunCommand { .. })
+        ));
+
+        engine.advance(&mut task, ControlCommand::Approve).unwrap();
+
+        assert!(task.pending_approval.is_none());
+        assert!(task.command_approval_granted);
+        assert!(matches!(
+            task.pending_agent_action,
+            Some(AgentAction::RunCommand { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_approval_does_not_enable_future_patches_globally() {
+        let mut task = base_task();
+        task.pending_approval = Some(ApprovalRequest {
+            summary: "Apply proposed patch?".to_string(),
+        });
+
+        let mut engine = AgentEngine::new();
+        engine.advance(&mut task, ControlCommand::Approve).unwrap();
+
+        assert!(task.patch_approval_granted);
+        assert!(!task.apply_requested);
     }
 
     #[test]
