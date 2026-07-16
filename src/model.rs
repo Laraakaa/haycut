@@ -21,6 +21,58 @@ pub trait ModelProvider {
     ) -> anyhow::Result<(String, serde_json::Value, ModelResponse)>;
 }
 
+/// Event-oriented companion for providers that can expose streaming output and
+/// usage without changing the buffered provider contract above.
+pub trait StreamingModelProvider {
+    fn stream(
+        &self,
+        request: ModelRequest,
+        events: &mut dyn FnMut(ModelStreamEvent),
+    ) -> anyhow::Result<()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamUsage {
+    Unknown,
+    Estimated(u64),
+    Reported(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelStreamEvent {
+    CallStarted {
+        id: String,
+        purpose: String,
+        input: StreamUsage,
+    },
+    TextDelta {
+        id: String,
+        text: String,
+    },
+    ToolCallDelta {
+        id: String,
+        text: String,
+    },
+    UsageUpdate {
+        id: String,
+        input: StreamUsage,
+        output: StreamUsage,
+        cached_input: StreamUsage,
+    },
+    CallCompleted {
+        id: String,
+        input: StreamUsage,
+        output: StreamUsage,
+        cached_input: StreamUsage,
+    },
+    Failed {
+        id: String,
+    },
+    Cancelled {
+        id: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelRequest {
     pub purpose: ModelPurpose,
