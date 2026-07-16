@@ -8,11 +8,13 @@ use crossterm::execute;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 const HORIZONTAL_MARGIN: u16 = 1;
 const TAGLINE: &str = "efficient coding harness";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_SHA: &str = env!("HAYCUT_BUILD_SHA");
 
 // ANSI Shadow-inspired artwork is deliberately kept here so the TUI has no
 // runtime font or asset dependency. Each pair is the Hay and Cut portion of a
@@ -32,6 +34,33 @@ enum LandingVariant {
     Full,
     Compact,
     Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    Landing,
+    Chat,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatMessage {
+    content: String,
+}
+
+struct App {
+    mode: LayoutMode,
+    editor: PromptEditor,
+    messages: Vec<ChatMessage>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            mode: LayoutMode::Landing,
+            editor: PromptEditor::default(),
+            messages: Vec::new(),
+        }
+    }
 }
 
 fn prompt_rect(area: Rect) -> Rect {
@@ -60,7 +89,24 @@ fn landing_variant(area: Rect) -> LandingVariant {
 }
 
 fn render_landing(area: Rect, frame: &mut ratatui::Frame) {
-    let variant = landing_variant(area);
+    if area.height == 0 {
+        return;
+    }
+    let metadata_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(metadata(true), metadata_style)))
+            .alignment(Alignment::Right),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let content_area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    let variant = landing_variant(content_area);
     if variant == LandingVariant::Hidden {
         return;
     }
@@ -103,11 +149,103 @@ fn render_landing(area: Rect, frame: &mut ratatui::Frame) {
         ),
         LandingVariant::Hidden => unreachable!(),
     };
-    let y = area.y + area.height.saturating_sub(height) / 2;
+    let y = content_area.y + content_area.height.saturating_sub(height) / 2;
     frame.render_widget(
         Paragraph::new(lines).alignment(Alignment::Center),
-        Rect::new(area.x, y, area.width, height),
+        Rect::new(content_area.x, y, content_area.width, height),
     );
+}
+
+fn metadata(include_sha: bool) -> String {
+    if include_sha {
+        format!("v{VERSION} · {BUILD_SHA}")
+    } else {
+        format!("v{VERSION}")
+    }
+}
+
+fn render_header(area: Rect, frame: &mut ratatui::Frame) {
+    if area.height == 0 {
+        return;
+    }
+    let full_width = (6 + 1 + metadata(true).chars().count()) as u16;
+    let right = metadata(area.width >= full_width);
+    let gap = area
+        .width
+        .saturating_sub((6 + right.chars().count()) as u16) as usize;
+    let line = Line::from(vec![
+        Span::styled("HayCut", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(
+            right,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(area.width as usize),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ))),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
+}
+
+fn render_chat(area: Rect, messages: &[ChatMessage], frame: &mut ratatui::Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "You",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(message.content.lines().map(Line::from));
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let line_count = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            usize::from(index > 0)
+                + 1
+                + message
+                    .content
+                    .lines()
+                    .map(|line| wrapped_line_count(line, area.width as usize))
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let scroll = line_count.saturating_sub(area.height as usize) as u16;
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+}
+
+fn wrapped_line_count(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1;
+    let mut cells = 0;
+    for ch in line.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if cells > 0 && cells + char_width > width {
+            rows += 1;
+            cells = 0;
+        }
+        cells += char_width;
+    }
+    rows
 }
 
 pub fn run() -> i32 {
@@ -141,17 +279,66 @@ pub fn run() -> i32 {
 }
 
 fn run_editor(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
-    let mut editor = PromptEditor::default();
-    terminal.draw(|frame| editor.render(frame.area(), frame))?;
+    let mut app = App::default();
+    terminal.draw(|frame| app.render(frame.area(), frame))?;
 
     loop {
         let event = event::read()?;
         if should_quit(event.clone()) {
             return Ok(());
         }
-        if editor.handle_event(event) {
-            terminal.draw(|frame| editor.render(frame.area(), frame))?;
+        if app.handle_event(event) {
+            terminal.draw(|frame| app.render(frame.area(), frame))?;
         }
+    }
+}
+
+impl App {
+    fn handle_event(&mut self, event: Event) -> bool {
+        if let Event::Key(key) = &event {
+            if key.kind == crossterm::event::KeyEventKind::Press
+                && key.code == KeyCode::Enter
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                return self.submit();
+            }
+        }
+        self.editor.handle_event(event)
+    }
+
+    fn submit(&mut self) -> bool {
+        let content = self.editor.text();
+        if content.trim().is_empty() {
+            return false;
+        }
+        self.messages.push(ChatMessage { content });
+        self.editor = PromptEditor::default();
+        self.mode = LayoutMode::Chat;
+        true
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
+        let prompt = prompt_rect(area);
+        match self.mode {
+            LayoutMode::Landing => {
+                let landing =
+                    Rect::new(area.x, area.y, area.width, prompt.y.saturating_sub(area.y));
+                render_landing(landing, frame);
+            }
+            LayoutMode::Chat => {
+                let header = Rect::new(area.x, area.y, area.width, area.height.min(2));
+                render_header(header, frame);
+                let viewport_y = header.y + header.height;
+                let viewport = Rect::new(
+                    area.x,
+                    viewport_y,
+                    area.width,
+                    prompt.y.saturating_sub(viewport_y),
+                );
+                render_chat(viewport, &self.messages, frame);
+            }
+        }
+        self.editor.render_prompt(prompt, area, frame);
     }
 }
 
@@ -205,6 +392,10 @@ impl PromptEditor {
             }
             _ => false,
         }
+    }
+
+    fn text(&self) -> String {
+        self.lines.join("\n")
     }
 
     fn insert(&mut self, ch: char) -> bool {
@@ -316,10 +507,7 @@ impl PromptEditor {
         }
     }
 
-    fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
-        let prompt = prompt_rect(area);
-        let landing = Rect::new(area.x, area.y, area.width, prompt.y.saturating_sub(area.y));
-        render_landing(landing, frame);
+    fn render_prompt(&mut self, prompt: Rect, area: Rect, frame: &mut ratatui::Frame) {
         let Rect {
             x,
             y,
@@ -420,6 +608,43 @@ mod tests {
     }
     fn editor() -> PromptEditor {
         PromptEditor::default()
+    }
+
+    #[test]
+    fn empty_submit_keeps_landing_and_editor() {
+        let mut app = App::default();
+        assert!(!app.submit());
+        assert_eq!(app.mode, LayoutMode::Landing);
+        assert!(app.messages.is_empty());
+        app.editor.lines[0] = "  \n".into();
+        assert!(!app.submit());
+        assert_eq!(app.editor.text(), "  \n");
+    }
+
+    #[test]
+    fn submit_preserves_newlines_and_resets_editor() {
+        let mut app = App::default();
+        app.editor.lines = vec!["first".into(), " second".into()];
+        assert!(app.handle_event(key(KeyCode::Enter)));
+        assert_eq!(app.mode, LayoutMode::Chat);
+        assert_eq!(
+            app.messages,
+            vec![ChatMessage {
+                content: "first\n second".into()
+            }]
+        );
+        assert_eq!(app.editor.text(), "");
+        app.editor.lines = vec!["next".into(), "line".into()];
+        app.handle_event(key(KeyCode::Enter));
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[1].content, "next\nline");
+    }
+
+    #[test]
+    fn header_drops_only_sha_when_narrow() {
+        assert_eq!(metadata(false), "v0.1.0");
+        assert!(metadata(true).contains(" · "));
+        assert!(wrapped_line_count("abcdefgh", 3) >= 3);
     }
 
     #[test]
