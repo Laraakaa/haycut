@@ -672,6 +672,9 @@ const PATCH_GUARD_SOURCE: &str = "agent:patch_guard";
 /// Observation source tag for a body injected via the strong planner's `pull`
 /// tool.
 const PULLED_CONTEXT_SOURCE: &str = "agent:pulled_context";
+/// Observation source tag for the compact, diagnostic-only test-to-helper
+/// path preserved for patch planning.
+const FAILURE_PATH_SOURCE: &str = "agent:failure_path";
 
 /// Bound on how many hops the deterministic call-stack follow takes from the
 /// failure site before giving up on a branch.
@@ -753,6 +756,10 @@ fn execute_select_context(task: &mut task::TaskState, step_index: usize) -> io::
         }
     }
 
+    if let Some(path_observation) = failure_path_observation(&failure, task) {
+        task.observations.push(path_observation);
+    }
+
     let eager_summary = maybe_eager_load_context(task);
 
     Ok(StepResult {
@@ -761,6 +768,69 @@ fn execute_select_context(task: &mut task::TaskState, step_index: usize) -> io::
         }),
         terminal: false,
     })
+}
+
+/// Preserve only the source frames that explain how the failing assertion
+/// reaches a selected helper. This is diagnostic context, never an edit
+/// target; the selected helper remains separately available as the edit
+/// target. If either the failure location or the selected call path cannot be
+/// resolved, return no observation and let the normal failure/context prompt
+/// render unchanged.
+fn failure_path_observation(
+    failure: &task::CurrentFailure,
+    task: &task::TaskState,
+) -> Option<task::Observation> {
+    let target = task
+        .available_context
+        .iter()
+        .find(|candidate| candidate.relevant == Some(true))?;
+    let graph = code_graph::CodeGraph::build(Path::new(".")).ok()?;
+
+    for location in failure.locations.iter().take(3) {
+        let Some((path, line)) = parse_location(location) else {
+            continue;
+        };
+        let Some(frames) = graph.call_path_to(
+            &path,
+            line,
+            &target.path,
+            &target.symbol,
+            MAX_CANDIDATE_DEPTH,
+        ) else {
+            continue;
+        };
+        if frames.len() < 2 {
+            continue;
+        }
+
+        let mut summary = format!(
+            "Diagnostic failure path (not an edit target); selected helper: {}@{}\n",
+            target.symbol, target.path
+        );
+        for frame in frames.iter().take(frames.len() - 1) {
+            summary.push_str(&format!(
+                "\n{}@{}:{}\n```rust\n{}\n```\n",
+                frame.symbol,
+                frame.path,
+                frame.start_line,
+                truncate(&frame.code, 1_500)
+            ));
+        }
+
+        return Some(task::Observation {
+            id: format!("obs{}", task.observations.len() + 1),
+            source: FAILURE_PATH_SOURCE.to_string(),
+            kind: "diagnostic_failure_path".to_string(),
+            locations: vec![location.clone()],
+            tokens: task::ObservationTokens {
+                raw: estimate_tokens(summary.as_bytes()),
+                packet: estimate_tokens(summary.as_bytes()),
+            },
+            summary,
+        });
+    }
+
+    None
 }
 
 /// Bound on how many relevant candidates the eager-load gate will pull
@@ -2274,7 +2344,14 @@ fn attach_context_comparison(
 }
 
 fn patch_plan_prompt(task: &task::TaskState) -> String {
-    let observations: Vec<_> = task.observations.iter().rev().take(8).rev().collect();
+    let observations: Vec<_> = task
+        .observations
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .filter(|observation| observation.source != FAILURE_PATH_SOURCE)
+        .collect();
     let mut prompt = String::from(
         "Fix the failure with the minimal set of exact edits. Fix the bug at its source: \
          if the failing code delegates to a helper shown in context, edit that helper — \
@@ -2304,6 +2381,17 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
         }
         failure.summary.as_str()
     });
+    let failure_paths: Vec<_> = task
+        .observations
+        .iter()
+        .filter(|observation| observation.source == FAILURE_PATH_SOURCE)
+        .collect();
+    if !failure_paths.is_empty() {
+        prompt.push_str("\nDiagnostic failure path (not an edit target):\n");
+        for observation in failure_paths {
+            prompt.push_str(&format!("{}\n", compact_observation(&observation.summary)));
+        }
+    }
     let observations: Vec<_> = observations
         .into_iter()
         .filter(|observation| Some(observation.summary.as_str()) != failure_summary)
@@ -2919,6 +3007,64 @@ mod tests {
         let prompt = patch_plan_prompt(&task);
 
         assert!(!prompt.contains("Observed failure detail"));
+    }
+
+    #[test]
+    fn failure_path_prompt_keeps_assertion_forwarding_helper_and_diff() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("evals/cases/split_context_off_by_one_rs/repo");
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo).unwrap();
+
+        let mut task = task_fixture();
+        task.current_failure = Some(task::CurrentFailure {
+            kind: "test_failure".to_string(),
+            summary: "ten_units_qualifies_for_bulk_discount failed".to_string(),
+            locations: vec!["src/cart.rs:13".to_string()],
+            detail: Some(
+                "assertion `left == right` failed\n  left: 1000\n right: 900".to_string(),
+            ),
+        });
+        task.available_context = vec![task::AvailableContext {
+            id: "c1".to_string(),
+            symbol: "apply_bulk_discount".to_string(),
+            path: "src/pricing.rs".to_string(),
+            start_line: 1,
+            body: "pub fn apply_bulk_discount(quantity: u32, unit_price_cents: i64) -> i64 {\n    quantity as i64 * unit_price_cents\n}"
+                .to_string(),
+            file_digest: None,
+            relevant: Some(true),
+        }];
+        let path = failure_path_observation(task.current_failure.as_ref().unwrap(), &task)
+            .expect("selected helper should have a resolvable diagnostic path");
+        task.observations.push(path);
+        execute_pull_context(&mut task, "c1").unwrap();
+
+        let prompt = patch_plan_prompt(&task);
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(prompt.contains("assert_eq!(total_for(10, 100), 900)"));
+        assert!(prompt.contains("apply_bulk_discount(quantity, unit_price_cents)"));
+        assert!(prompt.contains("pub fn apply_bulk_discount"));
+        assert!(prompt.contains("left: 1000"));
+        assert!(!prompt.contains("describe_order"));
+        assert!(!prompt.contains("unrelated_test"));
+    }
+
+    #[test]
+    fn failure_path_prompt_falls_back_without_precise_location() {
+        let mut task = task_fixture();
+        task.current_failure.as_mut().unwrap().locations = vec!["unknown".to_string()];
+        task.available_context = vec![context_candidate("c1", Some(true), "fn helper() {}")];
+
+        assert!(
+            failure_path_observation(task.current_failure.as_ref().unwrap(), &task).is_none()
+        );
+        execute_pull_context(&mut task, "c1").unwrap();
+        let prompt = patch_plan_prompt(&task);
+        assert!(prompt.contains("Current failure:"));
+        assert!(prompt.contains("fn helper() {}"));
+        assert!(!prompt.contains("Diagnostic failure path"));
     }
 
     #[test]
