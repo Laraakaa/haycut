@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::commands;
@@ -147,6 +147,9 @@ pub enum Commands {
         #[arg(long, default_value = "evals/results")]
         results_dir: PathBuf,
     },
+
+    /// Launch the interactive terminal UI
+    Tui,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -296,15 +299,25 @@ impl Cli {
             },
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             Some(Commands::View { port, results_dir }) => commands::view::run(port, results_dir),
-            None => {
-                let mut command = Self::command();
-                if let Err(error) = command.print_help() {
-                    eprintln!("Error printing help: {error}");
-                    return 1;
-                }
-                println!();
-                2
-            }
+            Some(Commands::Tui) | None => commands::tui::run(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_explicit_tui_command() {
+        assert!(matches!(
+            Cli::try_parse_from(["haycut", "tui"]).unwrap().command,
+            Some(Commands::Tui)
+        ));
+    }
+
+    #[test]
+    fn bare_command_uses_default_route() {
+        assert!(Cli::try_parse_from(["haycut"]).unwrap().command.is_none());
     }
 }
