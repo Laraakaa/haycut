@@ -49,7 +49,7 @@ enum ActiveTab {
 }
 
 fn prompt_rect_for(area: Rect, content_rows: usize) -> Rect {
-    let margin = if area.width >= HORIZONTAL_MARGIN * 2 + 1 {
+    let margin = if area.width > HORIZONTAL_MARGIN * 2 {
         HORIZONTAL_MARGIN
     } else {
         0
@@ -352,7 +352,7 @@ enum UiEvent {
         id: usize,
         text: String,
     },
-    ContextSnapshot(ContextSidebarSnapshot),
+    ContextSnapshot(Box<ContextSidebarSnapshot>),
     AssistantDelta {
         id: usize,
         text: String,
@@ -825,7 +825,7 @@ fn latest_context_snapshot(events: &[UiEvent]) -> ContextSidebarSnapshot {
         .iter()
         .rev()
         .find_map(|event| match event {
-            UiEvent::ContextSnapshot(snapshot) => Some(snapshot.clone()),
+            UiEvent::ContextSnapshot(snapshot) => Some((**snapshot).clone()),
             _ => None,
         })
         .unwrap_or_default()
@@ -1060,54 +1060,54 @@ impl App {
         if matches!(event, Event::Resize(_, _)) {
             return true;
         }
-        if let Event::Mouse(mouse) = &event {
-            if self.context_open && self.context_area.contains((mouse.column, mouse.row).into()) {
-                if let Some(HitTarget::ToggleDetails { item_id }) =
-                    hit_test(&self.context_cache.hit_regions, mouse.column, mouse.row)
-                {
-                    if item_id == "context-close" {
-                        self.context_open = false;
-                        self.context_focus = false;
-                        return true;
-                    }
-                    if let Some(section) = item_id.strip_prefix("section:") {
-                        if !self.collapsed_sections.insert(section.to_string()) {
-                            self.collapsed_sections.remove(section);
-                        }
-                        self.collapsed_revision += 1;
-                        return true;
-                    }
-                }
-                self.context_focus = true;
-                if matches!(
-                    mouse.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                ) {
-                    self.context_viewport.scroll_by(
-                        if mouse.kind == MouseEventKind::ScrollUp {
-                            -3
-                        } else {
-                            3
-                        },
-                        self.context_cache.rows.len(),
-                    );
+        if let Event::Mouse(mouse) = &event
+            && self.context_open
+            && self.context_area.contains((mouse.column, mouse.row).into())
+        {
+            if let Some(HitTarget::ToggleDetails { item_id }) =
+                hit_test(&self.context_cache.hit_regions, mouse.column, mouse.row)
+            {
+                if item_id == "context-close" {
+                    self.context_open = false;
+                    self.context_focus = false;
                     return true;
                 }
-                return false;
+                if let Some(section) = item_id.strip_prefix("section:") {
+                    if !self.collapsed_sections.insert(section.to_string()) {
+                        self.collapsed_sections.remove(section);
+                    }
+                    self.collapsed_revision += 1;
+                    return true;
+                }
             }
+            self.context_focus = true;
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                self.context_viewport.scroll_by(
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        -3
+                    } else {
+                        3
+                    },
+                    self.context_cache.rows.len(),
+                );
+                return true;
+            }
+            return false;
         }
         if let Event::Mouse(mouse) = event {
-            if self.layout == LayoutMode::Chat {
-                if let Some(HitTarget::ToggleDetails { item_id }) =
+            if self.layout == LayoutMode::Chat
+                && let Some(HitTarget::ToggleDetails { item_id }) =
                     hit_test(&self.tab_regions, mouse.column, mouse.row)
-                {
-                    self.active_tab = if item_id == "chat" {
-                        ActiveTab::Chat
-                    } else {
-                        ActiveTab::Workflow
-                    };
-                    return true;
-                }
+            {
+                self.active_tab = if item_id == "chat" {
+                    ActiveTab::Chat
+                } else {
+                    ActiveTab::Workflow
+                };
+                return true;
             }
             if self.chat_area.contains((mouse.column, mouse.row).into()) {
                 let delta = match mouse.kind {
@@ -1259,21 +1259,22 @@ impl App {
                 return true;
             }
         }
-        if key.modifiers.contains(KeyModifiers::ALT) && self.active_tab == ActiveTab::Workflow {
-            if matches!(key.code, KeyCode::Up | KeyCode::Down) {
-                let count = self
-                    .workflow
-                    .as_ref()
-                    .map_or(0, |workflow| workflow.workflow.nodes.len());
-                if count > 0 {
-                    let current = self.selected_node.unwrap_or(0);
-                    self.selected_node = Some(if key.code == KeyCode::Up {
-                        current.saturating_sub(1)
-                    } else {
-                        (current + 1).min(count - 1)
-                    });
-                    return true;
-                }
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && self.active_tab == ActiveTab::Workflow
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            let count = self
+                .workflow
+                .as_ref()
+                .map_or(0, |workflow| workflow.workflow.nodes.len());
+            if count > 0 {
+                let current = self.selected_node.unwrap_or(0);
+                self.selected_node = Some(if key.code == KeyCode::Up {
+                    current.saturating_sub(1)
+                } else {
+                    (current + 1).min(count - 1)
+                });
+                return true;
             }
         }
         if key.code == KeyCode::Char('1')
@@ -1416,7 +1417,9 @@ impl App {
                 self.selected_node = Some(12);
             }
         }
-        self.append_event(UiEvent::ContextSnapshot(self.mock_context_snapshot()));
+        self.append_event(UiEvent::ContextSnapshot(Box::new(
+            self.mock_context_snapshot(),
+        )));
         true
     }
 
@@ -1504,13 +1507,7 @@ impl App {
             },
             selected_items: selected,
             available_items: if selected > 0 { selected + 3 } else { 0 },
-            compiled_context_tokens: if final_state {
-                1_800
-            } else if step >= 6 {
-                1_800
-            } else {
-                0
-            },
+            compiled_context_tokens: if step >= 6 { 1_800 } else { 0 },
             sources,
             model: if step >= 7 {
                 "strong model".into()
@@ -1911,7 +1908,7 @@ fn render_chat(
     if area.height == 0 {
         return;
     }
-    let margin = if area.width >= HORIZONTAL_MARGIN * 2 + 1 {
+    let margin = if area.width > HORIZONTAL_MARGIN * 2 {
         HORIZONTAL_MARGIN
     } else {
         0
@@ -2183,11 +2180,12 @@ fn render_workflow_view(
         .iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            (index >= viewport.offset
+            if index >= viewport.offset
                 && index < viewport.offset + viewport.height
                 && row.local_row == 0
-                && row.owner != "workflow")
-                .then(|| HitRegion {
+                && row.owner != "workflow"
+            {
+                Some(HitRegion {
                     rect: Rect::new(
                         area.x,
                         area.y + (index - viewport.offset) as u16,
@@ -2198,6 +2196,9 @@ fn render_workflow_view(
                         item_id: row.owner.clone(),
                     },
                 })
+            } else {
+                None
+            }
         })
         .collect();
     let visible: Vec<Line<'static>> = cache
@@ -2515,7 +2516,7 @@ impl Default for PromptEditor {
 
 impl PromptEditor {
     fn desired_content_rows(&self, area: Rect) -> usize {
-        let margin = if area.width >= HORIZONTAL_MARGIN * 2 + 1 {
+        let margin = if area.width > HORIZONTAL_MARGIN * 2 {
             HORIZONTAL_MARGIN
         } else {
             0
