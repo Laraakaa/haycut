@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -8,7 +9,7 @@ use crossterm::execute;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 const HORIZONTAL_MARGIN: u16 = 1;
@@ -16,18 +17,12 @@ const TAGLINE: &str = "efficient coding harness";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_SHA: &str = env!("HAYCUT_BUILD_SHA");
 
-// ANSI Shadow-inspired artwork is deliberately kept here so the TUI has no
-// runtime font or asset dependency. Each pair is the Hay and Cut portion of a
-// row, respectively; keeping the split explicit lets the two words have
-// independent colors without relying on terminal escape sequences in artwork.
-const WORDMARK: [(&str, &str); 6] = [
-    ("██╗  ██╗ █████╗ ██╗   ██╗ ", " ██████╗██╗   ██╗████████╗"),
-    ("██║  ██║██╔══██╗╚██╗ ██╔╝ ", "██╔════╝██║   ██║╚══██╔══╝"),
-    ("███████║███████║ ╚████╔╝  ", "██║     ██║   ██║   ██║   "),
-    ("██╔══██║██╔══██║  ╚██╔╝   ", "██║     ██║   ██║   ██║   "),
-    ("██║  ██║██║  ██║   ██║    ", "╚██████╗╚██████╔╝   ██║   "),
-    ("╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ", " ╚═════╝ ╚═════╝    ╚═╝   "),
+const ANSI_COMPACT: [(&str, &str); 3] = [
+    ("██  ██  ▄▄▄  ", "▄▄ ▄▄ ▄█████ ▄▄ ▄▄ ▄▄▄▄▄▄ "),
+    ("██████ ██▀██ ", "▀███▀ ██     ██ ██   ██   "),
+    ("██  ██ ██▀██ ", "  █   ▀█████ ▀███▀   ██  "),
 ];
+const LOGO_CANVAS_HEIGHT: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LandingVariant {
@@ -42,27 +37,6 @@ enum LayoutMode {
     Chat,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ChatMessage {
-    content: String,
-}
-
-struct App {
-    mode: LayoutMode,
-    editor: PromptEditor,
-    messages: Vec<ChatMessage>,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            mode: LayoutMode::Landing,
-            editor: PromptEditor::default(),
-            messages: Vec::new(),
-        }
-    }
-}
-
 fn prompt_rect(area: Rect) -> Rect {
     let width = area.width.saturating_sub(HORIZONTAL_MARGIN * 2).max(1);
     let height = ((area.height / 2).max(3)).min(area.height.max(1));
@@ -72,14 +46,14 @@ fn prompt_rect(area: Rect) -> Rect {
 }
 
 fn landing_variant(area: Rect) -> LandingVariant {
-    let full_width = WORDMARK
+    let full_width = ANSI_COMPACT
         .iter()
         .map(|(hay, cut)| hay.chars().count() + cut.chars().count())
         .max()
         .unwrap_or(0) as u16;
-    let full_height = WORDMARK.len() as u16 + 2;
-    let compact_width = TAGLINE.len().max("HayCut".len()) as u16;
-    if area.height < 2 || area.width < compact_width {
+    let full_height = 1 + LOGO_CANVAS_HEIGHT + 1;
+    let compact_width = "HayCut".chars().count() as u16;
+    if area.height < 3 || area.width < compact_width {
         LandingVariant::Hidden
     } else if area.width >= full_width && area.height >= full_height {
         LandingVariant::Full
@@ -88,7 +62,25 @@ fn landing_variant(area: Rect) -> LandingVariant {
     }
 }
 
-fn render_landing(area: Rect, frame: &mut ratatui::Frame) {
+fn ansi_logo_lines() -> Vec<Line<'static>> {
+    let hay_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let cut_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    ANSI_COMPACT
+        .iter()
+        .map(|(hay, cut)| {
+            Line::from(vec![
+                Span::styled(*hay, hay_style),
+                Span::styled(*cut, cut_style),
+            ])
+        })
+        .collect()
+}
+
+fn render_branding(area: Rect, frame: &mut ratatui::Frame) {
     if area.height == 0 {
         return;
     }
@@ -96,64 +88,45 @@ fn render_landing(area: Rect, frame: &mut ratatui::Frame) {
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(metadata(true), metadata_style)))
-            .alignment(Alignment::Right),
+        Paragraph::new(Span::styled(metadata(true), metadata_style)).alignment(Alignment::Right),
         Rect::new(area.x, area.y, area.width, 1),
     );
-    let content_area = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    let variant = landing_variant(content_area);
+    let variant = landing_variant(area);
     if variant == LandingVariant::Hidden {
         return;
     }
-    let hay_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let cut_style = Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD);
     let tagline_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
-    let (height, lines): (u16, Vec<Line<'static>>) = match variant {
-        LandingVariant::Full => (
-            WORDMARK.len() as u16 + 2,
-            WORDMARK
-                .iter()
-                .map(|(hay, cut)| {
-                    Line::from(vec![
-                        Span::styled(*hay, hay_style),
-                        Span::styled(*cut, cut_style),
-                    ])
-                })
-                .chain(std::iter::once(Line::from("")))
-                .chain(std::iter::once(Line::from(Span::styled(
-                    TAGLINE,
-                    tagline_style,
-                ))))
-                .collect(),
-        ),
-        LandingVariant::Compact => (
-            2,
-            vec![
-                Line::from(vec![
-                    Span::styled("Hay", hay_style),
-                    Span::styled("Cut", cut_style),
-                ]),
-                Line::from(Span::styled(TAGLINE, tagline_style)),
-            ],
-        ),
+    match variant {
+        LandingVariant::Full => {
+            frame.render_widget(
+                Paragraph::new(ansi_logo_lines()).alignment(Alignment::Center),
+                Rect::new(area.x, area.y + 1, area.width, LOGO_CANVAS_HEIGHT),
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(TAGLINE, tagline_style)).alignment(Alignment::Center),
+                Rect::new(area.x, area.y + 1 + LOGO_CANVAS_HEIGHT, area.width, 1),
+            );
+        }
+        LandingVariant::Compact => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "HayCut",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+                Rect::new(area.x, area.y + 1, area.width, 1),
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(TAGLINE, tagline_style)).alignment(Alignment::Center),
+                Rect::new(area.x, area.y + 2, area.width, 1),
+            );
+        }
         LandingVariant::Hidden => unreachable!(),
-    };
-    let y = content_area.y + content_area.height.saturating_sub(height) / 2;
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        Rect::new(content_area.x, y, content_area.width, height),
-    );
+    }
 }
 
 fn metadata(include_sha: bool) -> String {
@@ -200,54 +173,6 @@ fn render_header(area: Rect, frame: &mut ratatui::Frame) {
     }
 }
 
-fn render_chat(area: Rect, messages: &[ChatMessage], frame: &mut ratatui::Frame) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let mut lines = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::from(""));
-        }
-        lines.push(Line::from(Span::styled(
-            "You",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.extend(message.content.lines().map(Line::from));
-    }
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let line_count = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            usize::from(index > 0)
-                + 1
-                + message
-                    .content
-                    .lines()
-                    .map(|line| wrapped_line_count(line, area.width as usize))
-                    .sum::<usize>()
-        })
-        .sum::<usize>();
-    let scroll = line_count.saturating_sub(area.height as usize) as u16;
-    frame.render_widget(paragraph.scroll((scroll, 0)), area);
-}
-
-fn wrapped_line_count(line: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 1;
-    let mut cells = 0;
-    for ch in line.chars() {
-        let char_width = ch.width().unwrap_or(0);
-        if cells > 0 && cells + char_width > width {
-            rows += 1;
-            cells = 0;
-        }
-        cells += char_width;
-    }
-    rows
-}
-
 pub fn run() -> i32 {
     match ratatui::run(|terminal| -> io::Result<()> {
         let mut stdout = io::stdout();
@@ -283,7 +208,17 @@ fn run_editor(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     terminal.draw(|frame| app.render(frame.area(), frame))?;
 
     loop {
-        let event = event::read()?;
+        let event = if app.pending.is_some() {
+            if event::poll(Duration::from_millis(120))? {
+                event::read()?
+            } else {
+                app.tick();
+                terminal.draw(|frame| app.render(frame.area(), frame))?;
+                continue;
+            }
+        } else {
+            event::read()?
+        };
         if should_quit(event.clone()) {
             return Ok(());
         }
@@ -293,36 +228,151 @@ fn run_editor(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TimelineEntry {
+    User(String),
+    Assistant(String),
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoEvent {
+    ResponseStarted,
+    AssistantMessage,
+}
+
+#[derive(Default)]
+struct DemoDriver {
+    scenario: usize,
+}
+
+impl DemoDriver {
+    fn start(&mut self) -> DemoEvent {
+        self.scenario = 0;
+        DemoEvent::ResponseStarted
+    }
+
+    fn advance(&mut self) -> Option<DemoEvent> {
+        if self.scenario == 0 {
+            self.scenario = 1;
+            Some(DemoEvent::AssistantMessage)
+        } else {
+            None
+        }
+    }
+}
+
+struct InFlightTurn {
+    animation_frame: usize,
+}
+
+struct App {
+    layout: LayoutMode,
+    editor: PromptEditor,
+    timeline: Vec<TimelineEntry>,
+    pending: Option<InFlightTurn>,
+    demo: DemoDriver,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            layout: LayoutMode::Landing,
+            editor: PromptEditor::default(),
+            timeline: Vec::new(),
+            pending: None,
+            demo: DemoDriver::default(),
+        }
+    }
+}
+
 impl App {
     fn handle_event(&mut self, event: Event) -> bool {
-        if let Event::Key(key) = &event
-            && key.kind == crossterm::event::KeyEventKind::Press
-            && key.code == KeyCode::Enter
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        if matches!(event, Event::Resize(_, _)) {
+            return true;
+        }
+        let Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return false;
+        }
+        if key.code == KeyCode::Char('1')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            return self.advance_demo();
+        }
+        if key.code == KeyCode::Enter
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             return self.submit();
         }
-        self.editor.handle_event(event)
+        self.editor.handle_event(Event::Key(key))
     }
 
     fn submit(&mut self) -> bool {
-        let content = self.editor.text();
-        if content.trim().is_empty() {
+        if self.pending.is_some() {
             return false;
         }
-        self.messages.push(ChatMessage { content });
-        self.editor = PromptEditor::default();
-        self.mode = LayoutMode::Chat;
+        let prompt = self.editor.text();
+        if prompt.trim().is_empty() {
+            return false;
+        }
+        self.timeline.push(TimelineEntry::User(prompt));
+        self.editor.reset();
+        self.layout = LayoutMode::Chat;
+        let event = self.demo.start();
+        self.apply_demo_event(event)
+    }
+
+    fn advance_demo(&mut self) -> bool {
+        let Some(event) = self.demo.advance() else {
+            return false;
+        };
+        self.apply_demo_event(event)
+    }
+
+    fn apply_demo_event(&mut self, event: DemoEvent) -> bool {
+        match event {
+            DemoEvent::ResponseStarted => {
+                self.timeline.push(TimelineEntry::Pending);
+                self.pending = Some(InFlightTurn { animation_frame: 0 });
+            }
+            DemoEvent::AssistantMessage => {
+                if let Some(last) = self.timeline.last_mut() {
+                    if !matches!(last, TimelineEntry::Pending) {
+                        return false;
+                    }
+                    *last = TimelineEntry::Assistant("hello world".to_string());
+                    self.pending = None;
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn tick(&mut self) -> bool {
+        let Some(turn) = self.pending.as_mut() else {
+            return false;
+        };
+        turn.animation_frame = (turn.animation_frame + 1) % SPINNER.len();
         true
     }
 
     fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
         let prompt = prompt_rect(area);
-        match self.mode {
+        match self.layout {
             LayoutMode::Landing => {
                 let landing =
                     Rect::new(area.x, area.y, area.width, prompt.y.saturating_sub(area.y));
-                render_landing(landing, frame);
+                render_branding(landing, frame);
             }
             LayoutMode::Chat => {
                 let header = Rect::new(area.x, area.y, area.width, area.height.min(2));
@@ -334,11 +384,88 @@ impl App {
                     area.width,
                     prompt.y.saturating_sub(viewport_y),
                 );
-                render_chat(viewport, &self.messages, frame);
+                render_chat(viewport, &self.timeline, self.pending.as_ref(), frame);
             }
         }
-        self.editor.render_prompt(prompt, area, frame);
+        self.editor.render(prompt, frame);
     }
+}
+
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    text.lines()
+        .flat_map(|line| {
+            let chars: Vec<char> = line.chars().collect();
+            if chars.is_empty() {
+                return vec![String::new()];
+            }
+            chars
+                .chunks(width)
+                .map(|chunk| chunk.iter().collect())
+                .collect()
+        })
+        .collect()
+}
+
+fn timeline_lines(
+    entries: &[TimelineEntry],
+    width: usize,
+    pending: Option<&InFlightTurn>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let user_style = Style::default().fg(Color::Yellow);
+    let assistant_style = Style::default().fg(Color::Green);
+    let pending_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    for (index, entry) in entries.iter().enumerate() {
+        let (label, text, style) = match entry {
+            TimelineEntry::User(text) => ("You  ".to_string(), text.clone(), user_style),
+            TimelineEntry::Assistant(text) => {
+                ("HayCut  ".to_string(), text.clone(), assistant_style)
+            }
+            TimelineEntry::Pending => (
+                "HayCut  ".to_string(),
+                format!(
+                    "{} thinking",
+                    SPINNER[pending.map_or(0, |turn| turn.animation_frame)]
+                ),
+                pending_style,
+            ),
+        };
+        let wrapped = wrap_text(&text, width.saturating_sub(label.chars().count()));
+        for (line_index, content) in wrapped.into_iter().enumerate() {
+            let prefix = if line_index == 0 {
+                label.clone()
+            } else {
+                "       ".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(content, style),
+            ]));
+        }
+        if index + 1 < entries.len() {
+            lines.push(Line::from(""));
+        }
+    }
+    lines
+}
+
+fn render_chat(
+    area: Rect,
+    entries: &[TimelineEntry],
+    pending: Option<&InFlightTurn>,
+    frame: &mut ratatui::Frame,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let lines = timeline_lines(entries, area.width.saturating_sub(2) as usize, pending);
+    let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
 
 struct PromptEditor {
@@ -360,6 +487,13 @@ impl Default for PromptEditor {
 }
 
 impl PromptEditor {
+    fn reset(&mut self) {
+        self.lines = vec![String::new()];
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.vertical_scroll = 0;
+    }
+
     fn handle_event(&mut self, event: Event) -> bool {
         let Event::Key(key) = event else {
             return matches!(event, Event::Resize(_, _));
@@ -506,7 +640,7 @@ impl PromptEditor {
         }
     }
 
-    fn render_prompt(&mut self, prompt: Rect, area: Rect, frame: &mut ratatui::Frame) {
+    fn render(&mut self, prompt: Rect, frame: &mut ratatui::Frame) {
         let Rect {
             x,
             y,
@@ -547,8 +681,8 @@ impl PromptEditor {
                 .sum::<usize>()
         }) as u16;
         if width > 0 && height > 0 {
-            let max_x = area.x + area.width.saturating_sub(1);
-            let max_y = area.y + area.height.saturating_sub(1);
+            let max_x = prompt.x + prompt.width.saturating_sub(1);
+            let max_y = prompt.y + prompt.height.saturating_sub(1);
             frame.set_cursor_position((
                 (x + 1 + cursor_x.min(inner_width as u16)).min(max_x),
                 (y + 1 + cursor.saturating_sub(self.vertical_scroll) as u16).min(max_y),
@@ -609,41 +743,8 @@ mod tests {
         PromptEditor::default()
     }
 
-    #[test]
-    fn empty_submit_keeps_landing_and_editor() {
-        let mut app = App::default();
-        assert!(!app.submit());
-        assert_eq!(app.mode, LayoutMode::Landing);
-        assert!(app.messages.is_empty());
-        app.editor.lines[0] = "  \n".into();
-        assert!(!app.submit());
-        assert_eq!(app.editor.text(), "  \n");
-    }
-
-    #[test]
-    fn submit_preserves_newlines_and_resets_editor() {
-        let mut app = App::default();
-        app.editor.lines = vec!["first".into(), " second".into()];
-        assert!(app.handle_event(key(KeyCode::Enter)));
-        assert_eq!(app.mode, LayoutMode::Chat);
-        assert_eq!(
-            app.messages,
-            vec![ChatMessage {
-                content: "first\n second".into()
-            }]
-        );
-        assert_eq!(app.editor.text(), "");
-        app.editor.lines = vec!["next".into(), "line".into()];
-        app.handle_event(key(KeyCode::Enter));
-        assert_eq!(app.messages.len(), 2);
-        assert_eq!(app.messages[1].content, "next\nline");
-    }
-
-    #[test]
-    fn header_drops_only_sha_when_narrow() {
-        assert_eq!(metadata(false), "v0.1.0");
-        assert!(metadata(true).contains(" · "));
-        assert!(wrapped_line_count("abcdefgh", 3) >= 3);
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
     }
 
     #[test]
@@ -720,40 +821,121 @@ mod tests {
     }
 
     #[test]
-    fn wordmark_artwork_has_six_rows_and_consistent_spacing() {
-        assert_eq!(WORDMARK.len(), 6);
-        let widths: Vec<_> = WORDMARK
+    fn non_empty_enter_starts_chat_and_preserves_multiline_message() {
+        let mut app = App::default();
+        app.handle_event(key(KeyCode::Char('a')));
+        app.handle_event(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_event(key(KeyCode::Char('b')));
+        assert!(app.handle_event(key(KeyCode::Enter)));
+        assert_eq!(app.layout, LayoutMode::Chat);
+        assert_eq!(app.editor.text(), "");
+        assert_eq!(
+            app.timeline,
+            vec![TimelineEntry::User("a\nb".into()), TimelineEntry::Pending]
+        );
+        assert!(app.pending.is_some());
+    }
+
+    #[test]
+    fn whitespace_enter_is_ignored_and_shift_enter_still_inserts_newline() {
+        let mut app = App::default();
+        app.handle_event(key(KeyCode::Char(' ')));
+        assert!(!app.handle_event(key(KeyCode::Enter)));
+        assert_eq!(app.layout, LayoutMode::Landing);
+        app.handle_event(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.editor.lines, vec![" ".to_string(), String::new()]);
+    }
+
+    #[test]
+    fn spinner_only_advances_while_pending() {
+        let mut app = App::default();
+        assert!(!app.tick());
+        app.editor.insert('x');
+        app.submit();
+        assert!(app.tick());
+        assert_eq!(app.pending.as_ref().unwrap().animation_frame, 1);
+        app.advance_demo();
+        assert!(!app.tick());
+    }
+
+    #[test]
+    fn ctrl_one_completes_demo_and_preserves_pending_draft() {
+        let mut app = App::default();
+        app.editor.insert('x');
+        app.submit();
+        app.editor.insert('d');
+        assert!(!app.handle_event(key(KeyCode::Enter)));
+        assert_eq!(app.editor.text(), "d");
+        assert!(app.handle_event(modified_key(KeyCode::Char('1'), KeyModifiers::CONTROL,)));
+        assert!(app.pending.is_none());
+        assert_eq!(app.editor.text(), "d");
+        assert_eq!(
+            app.timeline.last(),
+            Some(&TimelineEntry::Assistant("hello world".into()))
+        );
+        assert!(!app.handle_event(modified_key(KeyCode::Char('1'), KeyModifiers::CONTROL,)));
+    }
+
+    #[test]
+    fn completed_turn_can_start_another_demo() {
+        let mut app = App::default();
+        app.editor.insert('x');
+        app.submit();
+        app.advance_demo();
+        app.editor.insert('y');
+        assert!(app.handle_event(key(KeyCode::Enter)));
+        assert!(app.pending.is_some());
+        assert_eq!(app.timeline.len(), 4);
+        assert_eq!(app.timeline[2], TimelineEntry::User("y".into()));
+    }
+
+    #[test]
+    fn ansi_logo_has_three_rows_and_stable_spacing() {
+        assert_eq!(ANSI_COMPACT.len(), 3);
+        let widths: Vec<_> = ANSI_COMPACT
             .iter()
             .map(|(hay, cut)| hay.chars().count() + cut.chars().count())
             .collect();
-        assert!(widths.iter().all(|width| *width == widths[0]));
+        let canvas_width = *widths.iter().max().unwrap();
+        assert!(widths.iter().all(|width| *width <= canvas_width));
         assert!(widths[0] > TAGLINE.chars().count());
+        assert_eq!(ansi_logo_lines().len(), LOGO_CANVAS_HEIGHT as usize);
     }
 
     #[test]
     fn landing_variants_switch_at_size_boundaries() {
-        let full_width =
-            WORDMARK[0].0.chars().count() as u16 + WORDMARK[0].1.chars().count() as u16;
+        let full_width = ANSI_COMPACT
+            .iter()
+            .map(|(hay, cut)| hay.chars().count() + cut.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
         assert_eq!(
-            landing_variant(Rect::new(0, 0, full_width, 8)),
+            landing_variant(Rect::new(0, 0, full_width, 5)),
             LandingVariant::Full
         );
         assert_eq!(
-            landing_variant(Rect::new(0, 0, full_width.saturating_sub(1), 8)),
+            landing_variant(Rect::new(0, 0, full_width.saturating_sub(1), 5)),
             LandingVariant::Compact
         );
         assert_eq!(
-            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16, 2)),
+            landing_variant(Rect::new(0, 0, "HayCut".chars().count() as u16, 3)),
             LandingVariant::Compact
         );
         assert_eq!(
-            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16, 1)),
+            landing_variant(Rect::new(0, 0, "HayCut".chars().count() as u16 - 1, 3)),
             LandingVariant::Hidden
         );
         assert_eq!(
-            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16 - 1, 2)),
+            landing_variant(Rect::new(0, 0, "HayCut".chars().count() as u16, 2)),
             LandingVariant::Hidden
         );
+    }
+
+    #[test]
+    fn metadata_is_versioned_and_fixed_width() {
+        assert_eq!(metadata(false), "v0.1.0");
+        assert!(metadata(true).contains(" · "));
+        assert_eq!(BUILD_SHA.chars().count(), 8);
     }
 
     #[test]
@@ -761,9 +943,10 @@ mod tests {
         let area = Rect::new(0, 0, 81, 21);
         let prompt = prompt_rect(area);
         let landing = Rect::new(area.x, area.y, area.width, prompt.y - area.y);
-        let height = WORDMARK.len() as u16 + 2;
-        let landing_y = landing.y + landing.height.saturating_sub(height) / 2;
-        assert!(landing_y + height <= prompt.y);
+        let content = Rect::new(landing.x, landing.y + 1, landing.width, landing.height - 1);
+        let height = ANSI_COMPACT.len() as u16 + 2;
+        let branding_y = content.y + content.height.saturating_sub(height) / 2;
+        assert!(branding_y + height <= prompt.y);
         assert_eq!(landing.width, area.width);
     }
 }
