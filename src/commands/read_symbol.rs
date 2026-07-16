@@ -7,7 +7,7 @@ use std::{
 use ignore::{DirEntry, WalkBuilder};
 
 use crate::{
-    code_context::{render_code_context, CodeContext},
+    code_context::{CodeContext, render_code_context},
     project_path,
     symbols::{Symbol, SymbolLanguage, parse_symbols},
     util::estimate_tokens,

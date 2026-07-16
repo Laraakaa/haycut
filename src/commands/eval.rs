@@ -351,7 +351,11 @@ pub fn evaluate(case: &EvalCase, evidence: &EvalEvidence) -> Vec<CheckResult> {
 /// on an ask-user block — since that's an incomplete run for a legitimate
 /// reason, not a run that finished and failed a check.
 pub fn check_verification_plan(task: &TaskState) -> CheckResult {
-    let Some(plan) = task.verification.as_ref().filter(|plan| !plan.checks.is_empty()) else {
+    let Some(plan) = task
+        .verification
+        .as_ref()
+        .filter(|plan| !plan.checks.is_empty())
+    else {
         return CheckResult {
             name: "verification_plan".to_string(),
             verdict: Verdict::Pass,
@@ -376,7 +380,11 @@ pub fn check_verification_plan(task: &TaskState) -> CheckResult {
         .map(|result| {
             format!(
                 "{} `{}` exited {} ({})",
-                if result.required { "required" } else { "optional" },
+                if result.required {
+                    "required"
+                } else {
+                    "optional"
+                },
                 result.command.display(),
                 result.exit_code,
                 if result.passed { "pass" } else { "fail" }
@@ -391,7 +399,11 @@ pub fn check_verification_plan(task: &TaskState) -> CheckResult {
 
     CheckResult {
         name: "verification_plan".to_string(),
-        verdict: if required_failed { Verdict::Fail } else { Verdict::Pass },
+        verdict: if required_failed {
+            Verdict::Fail
+        } else {
+            Verdict::Pass
+        },
         reasons,
     }
 }
@@ -1249,7 +1261,10 @@ mod tests {
 
     fn verification_check(program: &str, required: bool) -> VerificationCheck {
         VerificationCheck {
-            command: VerificationCommand { program: program.to_string(), args: Vec::new() },
+            command: VerificationCommand {
+                program: program.to_string(),
+                args: Vec::new(),
+            },
             required,
             scope: VerificationScope::FullProject,
         }
@@ -1257,7 +1272,10 @@ mod tests {
 
     fn verification_result(program: &str, required: bool, passed: bool) -> VerificationCheckResult {
         VerificationCheckResult {
-            command: VerificationCommand { program: program.to_string(), args: Vec::new() },
+            command: VerificationCommand {
+                program: program.to_string(),
+                args: Vec::new(),
+            },
             required,
             scope: VerificationScope::FullProject,
             exit_code: if passed { 0 } else { 1 },
@@ -1287,11 +1305,16 @@ mod tests {
     fn verification_plan_fails_when_a_required_check_fails() {
         let mut task = base_task();
         task.verification = Some(VerificationPlan {
-            checks: vec![verification_check("cargo test", true), verification_check("cargo fmt", false)],
+            checks: vec![
+                verification_check("cargo test", true),
+                verification_check("cargo fmt", false),
+            ],
             expected_baseline_exit: None,
         });
-        task.verification_results =
-            vec![verification_result("cargo test", true, false), verification_result("cargo fmt", false, true)];
+        task.verification_results = vec![
+            verification_result("cargo test", true, false),
+            verification_result("cargo fmt", false, true),
+        ];
         let result = check_verification_plan(&task);
         assert_eq!(result.verdict, Verdict::Fail);
     }
@@ -1300,11 +1323,16 @@ mod tests {
     fn verification_plan_passes_when_only_optional_check_fails() {
         let mut task = base_task();
         task.verification = Some(VerificationPlan {
-            checks: vec![verification_check("cargo test", true), verification_check("cargo fmt", false)],
+            checks: vec![
+                verification_check("cargo test", true),
+                verification_check("cargo fmt", false),
+            ],
             expected_baseline_exit: None,
         });
-        task.verification_results =
-            vec![verification_result("cargo test", true, true), verification_result("cargo fmt", false, false)];
+        task.verification_results = vec![
+            verification_result("cargo test", true, true),
+            verification_result("cargo fmt", false, false),
+        ];
         let result = check_verification_plan(&task);
         assert_eq!(result.verdict, Verdict::Pass);
     }

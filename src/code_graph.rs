@@ -34,6 +34,22 @@ pub struct Candidate {
     pub code: String,
 }
 
+struct CallPathTraversal<'a> {
+    target_path: &'a str,
+    target_symbol: &'a str,
+    max_depth: usize,
+    visited: HashSet<NodeId>,
+    result: Vec<Candidate>,
+}
+
+struct CalleeTraversal {
+    depth: usize,
+    max_candidates: usize,
+    max_depth: usize,
+    visited: HashSet<NodeId>,
+    candidates: Vec<Candidate>,
+}
+
 /// In-memory graph of symbol definitions (nodes) and resolved call edges,
 /// built once per `select_context` step. Not persisted — the agent mutates
 /// files during a run, so a rebuild avoids staleness.
@@ -115,19 +131,16 @@ impl CodeGraph {
             return Vec::new();
         };
 
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut candidates = Vec::new();
-        self.walk_callees(
-            start,
-            0,
+        let mut traversal = CalleeTraversal {
+            depth: 0,
             max_candidates,
             max_depth,
-            &mut visited,
-            &mut candidates,
-        );
+            visited: HashSet::from([start]),
+            candidates: Vec::new(),
+        };
+        self.walk_callees(start, &mut traversal);
 
-        candidates
+        traversal.candidates
     }
 
     /// Return the source-grounded call path from the symbol enclosing a
@@ -143,112 +156,83 @@ impl CodeGraph {
         max_depth: usize,
     ) -> Option<Vec<Candidate>> {
         let start = self.enclosing(path, line)?;
-        let mut visited = HashSet::new();
-        visited.insert(start);
-        let mut result = Vec::new();
-        self.find_call_path(
-            start,
-            0,
+        let mut traversal = CallPathTraversal {
             target_path,
             target_symbol,
             max_depth,
-            &mut visited,
-            &mut result,
-        )
-        .then_some(result)
+            visited: HashSet::from([start]),
+            result: Vec::new(),
+        };
+        self.find_call_path(start, 0, &mut traversal)
+            .then_some(traversal.result)
     }
 
     fn find_call_path(
         &self,
         node_id: NodeId,
         depth: usize,
-        target_path: &str,
-        target_symbol: &str,
-        max_depth: usize,
-        visited: &mut HashSet<NodeId>,
-        result: &mut Vec<Candidate>,
+        traversal: &mut CallPathTraversal<'_>,
     ) -> bool {
         let node = &self.nodes[node_id];
         let Some(code) = self.slice(&node.path, node.symbol.start_byte, node.symbol.end_byte)
         else {
             return false;
         };
-        result.push(Candidate {
+        traversal.result.push(Candidate {
             symbol: node.name.clone(),
             path: node.path.clone(),
             start_line: node.symbol.start_line,
             code,
         });
 
-        if node.path == target_path && node.name == target_symbol {
+        if node.path == traversal.target_path && node.name == traversal.target_symbol {
             return true;
         }
-        if depth >= max_depth {
-            result.pop();
+        if depth >= traversal.max_depth {
+            traversal.result.pop();
             return false;
         }
 
         for &callee_id in &node.calls {
-            if !visited.insert(callee_id) {
+            if !traversal.visited.insert(callee_id) {
                 continue;
             }
-            if self.find_call_path(
-                callee_id,
-                depth + 1,
-                target_path,
-                target_symbol,
-                max_depth,
-                visited,
-                result,
-            ) {
+            if self.find_call_path(callee_id, depth + 1, traversal) {
                 return true;
             }
-            visited.remove(&callee_id);
-            result.truncate(1 + depth);
+            traversal.visited.remove(&callee_id);
+            traversal.result.truncate(1 + depth);
         }
 
-        result.pop();
+        traversal.result.pop();
         false
     }
 
-    fn walk_callees(
-        &self,
-        node_id: NodeId,
-        depth: usize,
-        max_candidates: usize,
-        max_depth: usize,
-        visited: &mut HashSet<NodeId>,
-        candidates: &mut Vec<Candidate>,
-    ) {
-        if depth >= max_depth {
+    fn walk_callees(&self, node_id: NodeId, traversal: &mut CalleeTraversal) {
+        if traversal.depth >= traversal.max_depth {
             return;
         }
 
         let node = &self.nodes[node_id];
         for &callee_id in &node.calls {
-            if candidates.len() >= max_candidates {
+            if traversal.candidates.len() >= traversal.max_candidates {
                 return;
             }
-            if !visited.insert(callee_id) {
+            if !traversal.visited.insert(callee_id) {
                 continue;
             }
 
             let callee = &self.nodes[callee_id];
             if callee.path == node.path {
-                self.walk_callees(
-                    callee_id,
-                    depth + 1,
-                    max_candidates,
-                    max_depth,
-                    visited,
-                    candidates,
-                );
+                traversal.depth += 1;
+                self.walk_callees(callee_id, traversal);
+                traversal.depth -= 1;
             } else if let Some(code) = self.slice(
                 &callee.path,
                 callee.symbol.start_byte,
                 callee.symbol.end_byte,
             ) {
-                candidates.push(Candidate {
+                traversal.candidates.push(Candidate {
                     symbol: callee.name.clone(),
                     path: callee.path.clone(),
                     start_line: callee.symbol.start_line,
@@ -487,7 +471,8 @@ mod tests {
             path.iter()
                 .map(|node| node.symbol.as_str())
                 .collect::<Vec<_>>(),
-            vec!["test_total", "total_for", "apply_bulk_discount"]);
+            vec!["test_total", "total_for", "apply_bulk_discount"]
+        );
         assert!(path[0].code.contains("assert_eq!(total_for(10, 100), 900)"));
         assert!(
             path[1]

@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::agent::workflow::{self, Decision, NodeOp, StopReason};
 use crate::commands::agent::{AgentAction, execute_step, record_route};
-use crate::commands::task::{self, TaskState};
 /// Re-exported so callers (REPL, dashboard) use the same verification
 /// command type the structured `VerificationPlan` is built from, instead of
 /// engine.rs maintaining its own duplicate shape.
 pub use crate::commands::task::VerificationCommand;
+use crate::commands::task::{self, TaskState};
 
 const MAX_RETRIES: usize = 2;
 
@@ -104,7 +104,11 @@ impl AgentEngine {
     }
 
     /// Execute exactly one control decision and return the events it produced.
-    pub fn advance(&mut self, task: &mut TaskState, command: ControlCommand) -> io::Result<Vec<AgentEvent>> {
+    pub fn advance(
+        &mut self,
+        task: &mut TaskState,
+        command: ControlCommand,
+    ) -> io::Result<Vec<AgentEvent>> {
         match command {
             ControlCommand::Continue => self.run_until_blocked(task),
             ControlCommand::Step => Ok(vec![self.advance_one(task)?]),
@@ -152,7 +156,9 @@ impl AgentEngine {
 
         let step_index = task.route.len() + 1;
         let action_event = if next == NodeOp::PlanContext {
-            task.pending_agent_action.clone().map(AgentEvent::ActionProposed)
+            task.pending_agent_action
+                .clone()
+                .map(AgentEvent::ActionProposed)
         } else {
             None
         };
@@ -164,7 +170,8 @@ impl AgentEngine {
                 return Err(error);
             }
         };
-        task.workflow.complete(node_id, next, outcome.summary.clone());
+        task.workflow
+            .complete(node_id, next, outcome.summary.clone());
         record_route(task, &next, &outcome);
 
         if next == NodeOp::AskUser {
@@ -172,7 +179,10 @@ impl AgentEngine {
                 Some(AgentAction::AskUser { question }) => question.clone(),
                 _ => outcome.summary.clone(),
             };
-            let interaction = PendingInteraction { question: question.clone(), asked_at: Utc::now() };
+            let interaction = PendingInteraction {
+                question: question.clone(),
+                asked_at: Utc::now(),
+            };
             task.pending_interaction = Some(interaction);
             task.messages.push(TaskMessage {
                 role: MessageRole::Agent,
@@ -181,7 +191,9 @@ impl AgentEngine {
             });
         }
         if next == NodeOp::ApplyPatch && task.patch_previewed && !task.patch_applied {
-            task.pending_approval = Some(ApprovalRequest { summary: outcome.summary.clone() });
+            task.pending_approval = Some(ApprovalRequest {
+                summary: outcome.summary.clone(),
+            });
         }
 
         // `ActionProposed` for context/patch/finish/ask decisions is more
@@ -191,7 +203,11 @@ impl AgentEngine {
             return Ok(action_event);
         }
 
-        Ok(AgentEvent::Progress(format!("{}: {}", next.name(), outcome.summary)))
+        Ok(AgentEvent::Progress(format!(
+            "{}: {}",
+            next.name(),
+            outcome.summary
+        )))
     }
 
     fn approve(&mut self, task: &mut TaskState) -> Vec<AgentEvent> {
@@ -220,7 +236,9 @@ impl AgentEngine {
             locations: Vec::new(),
             tokens: task::ObservationTokens { raw: 0, packet: 0 },
         });
-        vec![AgentEvent::Progress("rejected pending patch; returning to planning".to_string())]
+        vec![AgentEvent::Progress(
+            "rejected pending patch; returning to planning".to_string(),
+        )]
     }
 
     fn steer(&mut self, task: &mut TaskState, message: String) -> Vec<AgentEvent> {
@@ -230,7 +248,9 @@ impl AgentEngine {
             content: format!("steer: {message}"),
             created_at: Utc::now(),
         });
-        vec![AgentEvent::Progress(format!("steering recorded: {message}"))]
+        vec![AgentEvent::Progress(format!(
+            "steering recorded: {message}"
+        ))]
     }
 
     fn reply(&mut self, task: &mut TaskState, message: String) -> Vec<AgentEvent> {
@@ -259,7 +279,11 @@ impl AgentEngine {
     ) -> io::Result<Vec<AgentEvent>> {
         task.pending_agent_action = Some(match target {
             ContextTarget::Symbol(target) => AgentAction::ReadSymbol { target },
-            ContextTarget::Window { path, line } => AgentAction::ReadWindow { path, line, radius: 20 },
+            ContextTarget::Window { path, line } => AgentAction::ReadWindow {
+                path,
+                line,
+                radius: 20,
+            },
             ContextTarget::Search(query) => AgentAction::Search { query },
         });
         let step_index = task.route.len() + 1;
@@ -284,14 +308,18 @@ impl AgentEngine {
         // `verify <command>` both runs the check immediately and augments
         // the structured plan, so a later `RunFinalVerification` also
         // exercises it instead of only ever running it once, ad hoc.
-        let plan = task.verification.get_or_insert_with(task::VerificationPlan::default);
+        let plan = task
+            .verification
+            .get_or_insert_with(task::VerificationPlan::default);
         plan.checks.push(task::VerificationCheck {
             command,
             required: false,
             scope: task::VerificationScope::Targeted,
         });
 
-        Ok(vec![AgentEvent::VerificationCompleted { summary: outcome.summary }])
+        Ok(vec![AgentEvent::VerificationCompleted {
+            summary: outcome.summary,
+        }])
     }
 
     fn stop(&mut self, task: &mut TaskState) -> AgentEvent {
@@ -323,7 +351,10 @@ fn interpret_stop(task: &TaskState, reason: StopReason) -> AgentEvent {
             .unwrap_or(false)
         {
             return AgentEvent::Finished(TaskOutcome {
-                summary: task.patch_text.clone().unwrap_or_else(|| "task complete".to_string()),
+                summary: task
+                    .patch_text
+                    .clone()
+                    .unwrap_or_else(|| "task complete".to_string()),
                 patch_applied: task.patch_applied,
             });
         }
@@ -418,7 +449,11 @@ mod tests {
     fn ask_user_persists_pending_interaction_and_stops() {
         let mut task = base_task();
         push_route(&mut task, NodeOp::RunBaseline, "fail exit 101");
-        push_route(&mut task, NodeOp::ExtractEvidence, "assertion left 13 right 12");
+        push_route(
+            &mut task,
+            NodeOp::ExtractEvidence,
+            "assertion left 13 right 12",
+        );
         push_route(&mut task, NodeOp::SelectContext, "no off-site symbols");
         push_route(&mut task, NodeOp::PlanContext, "ask user");
         task.pending_agent_action = Some(AgentAction::AskUser {
@@ -430,7 +465,9 @@ mod tests {
 
         assert!(matches!(events.last(), Some(AgentEvent::Question(_))));
         assert_eq!(
-            task.pending_interaction.as_ref().map(|i| i.question.clone()),
+            task.pending_interaction
+                .as_ref()
+                .map(|i| i.question.clone()),
             Some("Which behaviour is correct?".to_string())
         );
     }
@@ -445,7 +482,12 @@ mod tests {
 
         let mut engine = AgentEngine::new();
         let events = engine
-            .advance(&mut task, ControlCommand::Reply { message: "the old one".to_string() })
+            .advance(
+                &mut task,
+                ControlCommand::Reply {
+                    message: "the old one".to_string(),
+                },
+            )
             .unwrap();
 
         assert!(!events.is_empty());
@@ -463,7 +505,9 @@ mod tests {
         engine
             .advance(
                 &mut task,
-                ControlCommand::Reject { reason: "public API must remain unchanged".to_string() },
+                ControlCommand::Reject {
+                    reason: "public API must remain unchanged".to_string(),
+                },
             )
             .unwrap();
 
@@ -483,7 +527,9 @@ mod tests {
         engine
             .advance(
                 &mut task,
-                ControlCommand::Steer { message: "check overflow of the generation counter".to_string() },
+                ControlCommand::Steer {
+                    message: "check overflow of the generation counter".to_string(),
+                },
             )
             .unwrap();
 

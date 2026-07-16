@@ -128,7 +128,8 @@ pub struct TaskState {
     /// current content still matches the digest recorded here, and is
     /// refused as a recoverable conflict if it doesn't.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub inspected_digests: std::collections::HashMap<String, crate::commands::agent::patch::FileDigest>,
+    pub inspected_digests:
+        std::collections::HashMap<String, crate::commands::agent::patch::FileDigest>,
     /// Structured, per-check outcomes from the most recent
     /// `RunFinalVerification` step: one entry per `VerificationCheck` in
     /// `verification.checks`, in order, so callers (eval harness, dashboard)

@@ -796,7 +796,11 @@ mod tests {
             })
         );
 
-        push_route(&mut task, NodeOp::AskUser, "ask user: Which behaviour is correct?");
+        push_route(
+            &mut task,
+            NodeOp::AskUser,
+            "ask user: Which behaviour is correct?",
+        );
         assert_eq!(decision(&task, 2), Decision::Stop(StopReason::Blocked));
     }
 

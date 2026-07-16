@@ -1,6 +1,10 @@
 use std::{fs, io, path::PathBuf};
 
-use crate::{code_context::{CodeContext, render_code_context}, project_path, util::estimate_tokens};
+use crate::{
+    code_context::{CodeContext, render_code_context},
+    project_path,
+    util::estimate_tokens,
+};
 
 pub const DEFAULT_RADIUS: usize = 20;
 const MAX_WINDOW_LINES: usize = 400;
