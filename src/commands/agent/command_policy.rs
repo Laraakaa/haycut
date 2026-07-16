@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 /// How risky a `(program, args)` pair is judged to be.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize, serde::Serialize,
@@ -192,12 +195,15 @@ pub fn run_with_timeout(
     timeout: Duration,
 ) -> io::Result<CommandOutcome> {
     let start = Instant::now();
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -210,6 +216,14 @@ pub fn run_with_timeout(
             Some(status) => break Some(status),
             None => {
                 if start.elapsed() >= timeout {
+                    #[cfg(unix)]
+                    // The command may have spawned descendants that still own
+                    // the output pipes. Kill the whole group before joining
+                    // the drain threads so timeout cleanup cannot wait for
+                    // those descendants to finish naturally.
+                    unsafe {
+                        let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     timed_out = true;

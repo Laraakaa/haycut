@@ -878,6 +878,7 @@ dependencies = [
  "directories",
  "ignore",
  "insta",
+ "libc",
  "minijinja",
  "ratatui",
  "rusqlite",
