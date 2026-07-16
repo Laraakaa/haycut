@@ -295,13 +295,12 @@ fn run_editor(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
 
 impl App {
     fn handle_event(&mut self, event: Event) -> bool {
-        if let Event::Key(key) = &event {
-            if key.kind == crossterm::event::KeyEventKind::Press
-                && key.code == KeyCode::Enter
-                && !key.modifiers.contains(KeyModifiers::SHIFT)
-            {
-                return self.submit();
-            }
+        if let Event::Key(key) = &event
+            && key.kind == crossterm::event::KeyEventKind::Press
+            && key.code == KeyCode::Enter
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return self.submit();
         }
         self.editor.handle_event(event)
     }
