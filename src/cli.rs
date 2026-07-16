@@ -149,7 +149,11 @@ pub enum Commands {
     },
 
     /// Launch the interactive terminal UI
-    Tui,
+    Tui {
+        /// Run the scripted TUI demonstration instead of a real agent task
+        #[arg(long)]
+        demo: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -299,7 +303,8 @@ impl Cli {
             },
             Some(Commands::Search { limit, query }) => commands::search::run(query, limit),
             Some(Commands::View { port, results_dir }) => commands::view::run(port, results_dir),
-            Some(Commands::Tui) | None => commands::tui::run(),
+            Some(Commands::Tui { demo }) => commands::tui::run(demo),
+            None => commands::tui::run(false),
         }
     }
 }
@@ -312,7 +317,17 @@ mod tests {
     fn parses_explicit_tui_command() {
         assert!(matches!(
             Cli::try_parse_from(["haycut", "tui"]).unwrap().command,
-            Some(Commands::Tui)
+            Some(Commands::Tui { demo: false })
+        ));
+    }
+
+    #[test]
+    fn parses_tui_demo_mode() {
+        assert!(matches!(
+            Cli::try_parse_from(["haycut", "tui", "--demo"])
+                .unwrap()
+                .command,
+            Some(Commands::Tui { demo: true })
         ));
     }
 

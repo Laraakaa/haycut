@@ -172,6 +172,9 @@ fn drive(
 
 fn print_event(event: &AgentEvent) {
     match event {
+        AgentEvent::NodeStarted { node_id, op } => {
+            println!("[agent] started {} ({node_id})", op.name())
+        }
         AgentEvent::Progress(summary) => println!("[agent] {summary}"),
         AgentEvent::ActionProposed(action) => {
             println!("[agent] wants to {}", describe_action(action))
@@ -303,6 +306,8 @@ mod tests {
             patch_applied: false,
             patch_previewed: false,
             apply_requested: false,
+            patch_approval_granted: false,
+            command_approval_granted: false,
             terminal_reason: None,
             retry_count: 0,
             last_failure_signature: None,

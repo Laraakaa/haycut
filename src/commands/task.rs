@@ -83,6 +83,15 @@ pub struct TaskState {
     /// Mutation must be explicitly authorized by `agent run --apply`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub apply_requested: bool,
+    /// One patch approved interactively for the current proposed edit.
+    /// Unlike `apply_requested`, this is consumed after that patch is applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub patch_approval_granted: bool,
+    /// One medium-risk command approved interactively for the current action.
+    /// This is intentionally separate from `apply_requested`, which is the
+    /// durable CLI-wide `--apply` authorization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_approval_granted: bool,
     /// Final agent outcome, recorded when the workflow reaches a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<crate::commands::agent::StopReason>,
@@ -524,6 +533,8 @@ pub fn start_current(title: String, verify: Option<String>) -> io::Result<TaskSt
         patch_applied: false,
         patch_previewed: false,
         apply_requested: false,
+        patch_approval_granted: false,
+        command_approval_granted: false,
         terminal_reason: None,
         retry_count: 0,
         last_failure_signature: None,
