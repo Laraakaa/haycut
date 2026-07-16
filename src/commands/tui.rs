@@ -5,12 +5,110 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 const HORIZONTAL_MARGIN: u16 = 1;
+const TAGLINE: &str = "efficient coding harness";
+
+// ANSI Shadow-inspired artwork is deliberately kept here so the TUI has no
+// runtime font or asset dependency. Each pair is the Hay and Cut portion of a
+// row, respectively; keeping the split explicit lets the two words have
+// independent colors without relying on terminal escape sequences in artwork.
+const WORDMARK: [(&str, &str); 6] = [
+    ("██╗  ██╗ █████╗ ██╗   ██╗ ", " ██████╗██╗   ██╗████████╗"),
+    ("██║  ██║██╔══██╗╚██╗ ██╔╝ ", "██╔════╝██║   ██║╚══██╔══╝"),
+    ("███████║███████║ ╚████╔╝  ", "██║     ██║   ██║   ██║   "),
+    ("██╔══██║██╔══██║  ╚██╔╝   ", "██║     ██║   ██║   ██║   "),
+    ("██║  ██║██║  ██║   ██║    ", "╚██████╗╚██████╔╝   ██║   "),
+    ("╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ", " ╚═════╝ ╚═════╝    ╚═╝   "),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandingVariant {
+    Full,
+    Compact,
+    Hidden,
+}
+
+fn prompt_rect(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(HORIZONTAL_MARGIN * 2).max(1);
+    let height = ((area.height / 2).max(3)).min(area.height.max(1));
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height);
+    Rect::new(x, y, width, height)
+}
+
+fn landing_variant(area: Rect) -> LandingVariant {
+    let full_width = WORDMARK
+        .iter()
+        .map(|(hay, cut)| hay.chars().count() + cut.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let full_height = WORDMARK.len() as u16 + 2;
+    let compact_width = TAGLINE.len().max("HayCut".len()) as u16;
+    if area.height < 2 || area.width < compact_width {
+        LandingVariant::Hidden
+    } else if area.width >= full_width && area.height >= full_height {
+        LandingVariant::Full
+    } else {
+        LandingVariant::Compact
+    }
+}
+
+fn render_landing(area: Rect, frame: &mut ratatui::Frame) {
+    let variant = landing_variant(area);
+    if variant == LandingVariant::Hidden {
+        return;
+    }
+    let hay_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let cut_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let tagline_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let (height, lines): (u16, Vec<Line<'static>>) = match variant {
+        LandingVariant::Full => (
+            WORDMARK.len() as u16 + 2,
+            WORDMARK
+                .iter()
+                .map(|(hay, cut)| {
+                    Line::from(vec![
+                        Span::styled(*hay, hay_style),
+                        Span::styled(*cut, cut_style),
+                    ])
+                })
+                .chain(std::iter::once(Line::from("")))
+                .chain(std::iter::once(Line::from(Span::styled(
+                    TAGLINE,
+                    tagline_style,
+                ))))
+                .collect(),
+        ),
+        LandingVariant::Compact => (
+            2,
+            vec![
+                Line::from(vec![
+                    Span::styled("Hay", hay_style),
+                    Span::styled("Cut", cut_style),
+                ]),
+                Line::from(Span::styled(TAGLINE, tagline_style)),
+            ],
+        ),
+        LandingVariant::Hidden => unreachable!(),
+    };
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        Rect::new(area.x, y, area.width, height),
+    );
+}
 
 pub fn run() -> i32 {
     match ratatui::run(|terminal| -> io::Result<()> {
@@ -219,10 +317,15 @@ impl PromptEditor {
     }
 
     fn render(&mut self, area: Rect, frame: &mut ratatui::Frame) {
-        let width = area.width.saturating_sub(HORIZONTAL_MARGIN * 2).max(1);
-        let height = ((area.height / 2).max(3)).min(area.height.max(1));
-        let x = area.x + area.width.saturating_sub(width) / 2;
-        let y = area.y + area.height.saturating_sub(height);
+        let prompt = prompt_rect(area);
+        let landing = Rect::new(area.x, area.y, area.width, prompt.y.saturating_sub(area.y));
+        render_landing(landing, frame);
+        let Rect {
+            x,
+            y,
+            width,
+            height,
+        } = prompt;
         let inner_width = width.saturating_sub(2).max(1) as usize;
         let rows = self.visual_rows(inner_width);
         let content_height = height.saturating_sub(2).max(1) as usize;
@@ -390,5 +493,53 @@ mod tests {
         let viewport = 3;
         e.vertical_scroll = (cursor + 1 - viewport).min(rows.len() - viewport);
         assert_eq!(e.vertical_scroll, 7);
+    }
+
+    #[test]
+    fn wordmark_artwork_has_six_rows_and_consistent_spacing() {
+        assert_eq!(WORDMARK.len(), 6);
+        let widths: Vec<_> = WORDMARK
+            .iter()
+            .map(|(hay, cut)| hay.chars().count() + cut.chars().count())
+            .collect();
+        assert!(widths.iter().all(|width| *width == widths[0]));
+        assert!(widths[0] > TAGLINE.chars().count());
+    }
+
+    #[test]
+    fn landing_variants_switch_at_size_boundaries() {
+        let full_width =
+            WORDMARK[0].0.chars().count() as u16 + WORDMARK[0].1.chars().count() as u16;
+        assert_eq!(
+            landing_variant(Rect::new(0, 0, full_width, 8)),
+            LandingVariant::Full
+        );
+        assert_eq!(
+            landing_variant(Rect::new(0, 0, full_width.saturating_sub(1), 8)),
+            LandingVariant::Compact
+        );
+        assert_eq!(
+            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16, 2)),
+            LandingVariant::Compact
+        );
+        assert_eq!(
+            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16, 1)),
+            LandingVariant::Hidden
+        );
+        assert_eq!(
+            landing_variant(Rect::new(0, 0, TAGLINE.len() as u16 - 1, 2)),
+            LandingVariant::Hidden
+        );
+    }
+
+    #[test]
+    fn landing_is_centered_in_space_above_prompt_for_odd_resize() {
+        let area = Rect::new(0, 0, 81, 21);
+        let prompt = prompt_rect(area);
+        let landing = Rect::new(area.x, area.y, area.width, prompt.y - area.y);
+        let height = WORDMARK.len() as u16 + 2;
+        let landing_y = landing.y + landing.height.saturating_sub(height) / 2;
+        assert!(landing_y + height <= prompt.y);
+        assert_eq!(landing.width, area.width);
     }
 }
