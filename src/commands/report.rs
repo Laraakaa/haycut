@@ -2,7 +2,7 @@ use std::{io, path::Path};
 
 use crate::{
     budget::{BudgetStatus, BudgetUsage},
-    code_context::{render_code_context, CodeContext},
+    code_context::{CodeContext, render_code_context},
     commands::{
         read_symbol::{self, SymbolMatch},
         run_context::RunContext,

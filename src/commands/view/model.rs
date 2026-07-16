@@ -148,7 +148,7 @@ impl From<&WorkflowSpec> for WorkflowSpecView {
                     dependencies: node.dependencies.clone(),
                     guard: node.guard,
                 })
-                .collect()
+                .collect(),
         }
     }
 }
@@ -474,7 +474,11 @@ impl EvalReportFile {
             messages: Vec::new(),
             available_context: Vec::new(),
             workflow_spec: self.workflow_spec,
-            manifests: self.requests.into_iter().map(EvalRequestFile::into_view).collect(),
+            manifests: self
+                .requests
+                .into_iter()
+                .map(EvalRequestFile::into_view)
+                .collect(),
             primitives: primitive_registry_view(),
         }
     }
@@ -599,7 +603,10 @@ pub fn task_to_detail(
         messages: task.messages.clone(),
         available_context,
         workflow_spec: task.workflow_spec.as_ref().map(WorkflowSpecView::from),
-        manifests: manifests.into_iter().map(RequestManifestView::from).collect(),
+        manifests: manifests
+            .into_iter()
+            .map(RequestManifestView::from)
+            .collect(),
         primitives: primitive_registry_view(),
     }
 }
@@ -751,6 +758,10 @@ mod tests {
         assert!(detail.workflow_spec.is_some());
         assert_eq!(detail.manifests.len(), 1);
         assert_eq!(detail.manifests[0].id, "req1");
-        assert!(detail.workflow_spec.unwrap().nodes[0].dependencies.is_empty());
+        assert!(
+            detail.workflow_spec.unwrap().nodes[0]
+                .dependencies
+                .is_empty()
+        );
     }
 }
