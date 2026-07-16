@@ -15,21 +15,22 @@ right: "useful source excerpt" (src/commands/packet.rs:612:9)
 Files mentioned:
   src/commands/packet.rs:612:9
 Suggested context:
-  src/commands/packet.rs:602-622  reason: Primary test failure location
-  <excerpt lines 602-622>
-     602 | // filler line 602
-     603 | // filler line 603
-     604 | // filler line 604
-     605 | // filler line 605
-     606 | // filler line 606
-     607 | // filler line 607
-     608 | // filler line 608
-     609 | // filler line 609
-     610 | #[test]
-     611 | fn renders_packet() {
-     612 |     assert_eq!(actual.source(), "useful source excerpt");
-     613 | }
-  </excerpt>
+window@src/commands/packet.rs:602
+```rust
+// filler line 602
+// filler line 603
+// filler line 604
+// filler line 605
+// filler line 606
+// filler line 607
+// filler line 608
+// filler line 609
+#[test]
+fn renders_packet() {
+    assert_eq!(actual.source(), "useful source excerpt");
+}
+```
+reason: Primary test failure location
 Context budget:
   packet tokens: 319
 Budget:  soft: 40,000  hard: 80,000

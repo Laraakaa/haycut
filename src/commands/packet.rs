@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     budget::BudgetUsage,
+    code_context::{render_code_context, CodeContext},
     commands::{run_context::RunContext, trace::RunManifest},
     compactor::{CompactPacket, OutputSource},
     config::{Config, TokenConfig},
@@ -171,20 +172,19 @@ impl EvidencePacket {
                 let SourceRef::CodeWindow {
                     path,
                     start_line,
-                    end_line,
+                    end_line: _,
                 } = &item.source
                 else {
                     continue;
                 };
-                output.push_str(&format!(
-                    "  {path}:{start_line}-{end_line}  reason: {}\n",
-                    item.reason
-                ));
-                output.push_str(&format!("  <excerpt lines {start_line}-{end_line}>\n"));
-                for (offset, line) in item.content.lines().enumerate() {
-                    output.push_str(&format!("    {:>4} | {}\n", start_line + offset, line));
-                }
-                output.push_str("  </excerpt>\n");
+                output.push_str(&render_code_context(CodeContext {
+                    symbol: Some("window"),
+                    path: Some(path),
+                    start_line: Some(*start_line),
+                    source: &item.content,
+                    semantic_label: None,
+                }));
+                output.push_str(&format!("reason: {}\n", item.reason));
             }
         }
 
@@ -701,10 +701,10 @@ mod tests {
         assert!(rendered.contains("Suggested context:"));
         assert!(
             rendered.contains(
-                "  tests/auth/session_test.rs:3-5  reason: Primary test failure location"
+                "window@tests/auth/session_test.rs:3\n```rust\n"
             )
         );
-        assert!(rendered.contains("<excerpt lines 3-5>"));
+        assert!(rendered.contains("reason: Primary test failure location"));
         assert!(rendered.contains("assert!(validate_session(session).is_err());"));
         assert!(rendered.contains("packet tokens:"));
         assert!(rendered.contains("Budget:  soft: 40,000  hard: 80,000"));
@@ -771,9 +771,9 @@ mod tests {
         let rendered = packet.render(&token_config());
 
         assert_eq!(packet.token_estimate, 45);
-        assert!(rendered.contains("src/high.rs:1-1"));
-        assert!(rendered.contains("src/medium.rs:1-1"));
-        assert!(!rendered.contains("src/low.rs:1-1"));
+        assert!(rendered.contains("window@src/high.rs:1\n```rust\n"));
+        assert!(rendered.contains("window@src/medium.rs:1\n```rust\n"));
+        assert!(!rendered.contains("window@src/low.rs:1\n```rust\n"));
         assert!(rendered.contains("Omitted:"));
         assert!(rendered.contains(
             "source: src/low.rs lines 1-1  tokens: 10  reason: over budget; nearby source context"

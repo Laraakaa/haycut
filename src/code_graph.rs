@@ -130,6 +130,87 @@ impl CodeGraph {
         candidates
     }
 
+    /// Return the source-grounded call path from the symbol enclosing a
+    /// failure location to a selected target. The target is included so the
+    /// caller can identify the resolved endpoint, but callers may omit its
+    /// body when rendering diagnostic context alongside the selected helper.
+    pub fn call_path_to(
+        &self,
+        path: &str,
+        line: usize,
+        target_path: &str,
+        target_symbol: &str,
+        max_depth: usize,
+    ) -> Option<Vec<Candidate>> {
+        let start = self.enclosing(path, line)?;
+        let mut visited = HashSet::new();
+        visited.insert(start);
+        let mut result = Vec::new();
+        self.find_call_path(
+            start,
+            0,
+            target_path,
+            target_symbol,
+            max_depth,
+            &mut visited,
+            &mut result,
+        )
+        .then_some(result)
+    }
+
+    fn find_call_path(
+        &self,
+        node_id: NodeId,
+        depth: usize,
+        target_path: &str,
+        target_symbol: &str,
+        max_depth: usize,
+        visited: &mut HashSet<NodeId>,
+        result: &mut Vec<Candidate>,
+    ) -> bool {
+        let node = &self.nodes[node_id];
+        let Some(code) = self.slice(&node.path, node.symbol.start_byte, node.symbol.end_byte)
+        else {
+            return false;
+        };
+        result.push(Candidate {
+            symbol: node.name.clone(),
+            path: node.path.clone(),
+            start_line: node.symbol.start_line,
+            code,
+        });
+
+        if node.path == target_path && node.name == target_symbol {
+            return true;
+        }
+        if depth >= max_depth {
+            result.pop();
+            return false;
+        }
+
+        for &callee_id in &node.calls {
+            if !visited.insert(callee_id) {
+                continue;
+            }
+            if self.find_call_path(
+                callee_id,
+                depth + 1,
+                target_path,
+                target_symbol,
+                max_depth,
+                visited,
+                result,
+            ) {
+                return true;
+            }
+            visited.remove(&callee_id);
+            result.truncate(1 + depth);
+        }
+
+        result.pop();
+        false
+    }
+
     fn walk_callees(
         &self,
         node_id: NodeId,
@@ -377,6 +458,42 @@ mod tests {
         );
         assert_eq!(candidates[0].symbol, "apply_bulk_discount");
         assert_eq!(candidates[0].path, "src/pricing.rs");
+
+        fs::remove_dir_all(root).expect("test repo should be removed");
+    }
+
+    #[test]
+    fn call_path_to_preserves_assertion_and_forwarding_body() {
+        let root = temp_repo_root("call-path");
+        let src = root.join("src");
+        fs::create_dir_all(&src).expect("src should be created");
+        fs::write(
+            src.join("cart.rs"),
+            "fn total_for(quantity: u32, unit_price_cents: i64) -> i64 {\n    apply_bulk_discount(quantity, unit_price_cents)\n}\n\nfn test_total() {\n    assert_eq!(total_for(10, 100), 900);\n}\n",
+        )
+        .expect("cart.rs should be written");
+        fs::write(
+            src.join("pricing.rs"),
+            "pub fn apply_bulk_discount(quantity: u32, unit_price_cents: i64) -> i64 {\n    quantity as i64 * unit_price_cents\n}\n",
+        )
+        .expect("pricing.rs should be written");
+
+        let graph = CodeGraph::build(&root).expect("graph should build");
+        let path = graph
+            .call_path_to("src/cart.rs", 6, "src/pricing.rs", "apply_bulk_discount", 3)
+            .expect("selected helper should be reachable");
+
+        assert_eq!(
+            path.iter()
+                .map(|node| node.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test_total", "total_for", "apply_bulk_discount"]);
+        assert!(path[0].code.contains("assert_eq!(total_for(10, 100), 900)"));
+        assert!(
+            path[1]
+                .code
+                .contains("apply_bulk_discount(quantity, unit_price_cents)")
+        );
 
         fs::remove_dir_all(root).expect("test repo should be removed");
     }
