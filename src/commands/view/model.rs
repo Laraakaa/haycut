@@ -118,6 +118,7 @@ pub struct WorkflowNodeSpecView {
     pub id: String,
     pub primitive_id: PrimitiveId,
     pub primitive_version: PrimitiveVersion,
+    #[serde(default)]
     pub dependencies: Vec<String>,
     pub guard: Option<WorkflowGuard>,
 }
@@ -714,7 +715,11 @@ mod tests {
                 "schema_version": 1,
                 "compiler_version": "v1",
                 "entrypoints": ["n1"],
-                "nodes": []
+                "nodes": [{
+                    "id": "n1",
+                    "primitive_id": "classify_intent",
+                    "primitive_version": 1
+                }]
             },
             "requests": [
                 {
@@ -746,5 +751,6 @@ mod tests {
         assert!(detail.workflow_spec.is_some());
         assert_eq!(detail.manifests.len(), 1);
         assert_eq!(detail.manifests[0].id, "req1");
+        assert!(detail.workflow_spec.unwrap().nodes[0].dependencies.is_empty());
     }
 }

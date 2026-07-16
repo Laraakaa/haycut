@@ -372,6 +372,17 @@ body {
   padding: 12px 14px;
 }
 
+.stat-card-primary {
+  border-color: var(--straw);
+  background: linear-gradient(135deg, rgba(226, 172, 63, 0.16), var(--bg-panel) 65%);
+  box-shadow: inset 3px 0 0 var(--straw), 0 0 22px rgba(226, 172, 63, 0.08);
+}
+
+.stat-card-primary .stat-value {
+  font-size: 28px;
+  text-shadow: 0 0 16px rgba(255, 206, 92, 0.24);
+}
+
 .stat-card .stat-value {
   font-size: 22px;
   font-weight: 700;

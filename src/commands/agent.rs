@@ -2294,6 +2294,14 @@ fn patch_plan_prompt(task: &task::TaskState) -> String {
             "Current failure: {} — {}\n",
             failure.kind, failure.summary
         ));
+        // The summary is often just a test name/label; the assertion diff in
+        // `detail` (expected vs actual) is the actual ground truth about the
+        // bug's behavior — without it the model has to guess intent from
+        // labels alone, the same failure mode the context-ranking prompt
+        // warns the weak model away from.
+        if let Some(detail) = failure.detail.as_deref().filter(|d| !d.is_empty()) {
+            prompt.push_str(&format!("Observed failure detail:\n```\n{detail}\n```\n"));
+        }
         failure.summary.as_str()
     });
     let observations: Vec<_> = observations
@@ -2887,6 +2895,30 @@ mod tests {
         // The observation summary is identical to the current failure summary,
         // so it should not be repeated under "Known context".
         assert_eq!(prompt.matches("already existsabc").count(), 1);
+    }
+
+    #[test]
+    fn patch_plan_prompt_includes_failure_detail_when_present() {
+        let mut task = task_fixture();
+        task.current_failure.as_mut().unwrap().detail =
+            Some("assertion `left == right` failed\n  left: 1000\n right: 900".to_string());
+
+        let prompt = patch_plan_prompt(&task);
+
+        assert!(
+            prompt.contains("left: 1000"),
+            "expected the assertion diff to reach the patch-plan prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn patch_plan_prompt_omits_detail_section_when_absent() {
+        let task = task_fixture();
+        assert!(task.current_failure.as_ref().unwrap().detail.is_none());
+
+        let prompt = patch_plan_prompt(&task);
+
+        assert!(!prompt.contains("Observed failure detail"));
     }
 
     #[test]

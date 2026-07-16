@@ -6,5 +6,6 @@
 /evals/results/
 evals/cases/*/repo/Cargo.lock
 .claude
+.codex
 
 CLAUDE.local.md

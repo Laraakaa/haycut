@@ -144,24 +144,38 @@ function renderDetail(detail) {
 
 function renderStatCards(detail) {
   const ts = detail.token_summary;
+  const billedTokens = (detail.steps || [])
+    .filter((step) => step.billed)
+    .reduce(
+      (sum, step) =>
+        sum +
+        (step.reported_input_tokens ?? step.estimated_input_tokens) +
+        (step.reported_output_tokens ?? step.estimated_output_tokens),
+      0
+    );
   const cards = [
-    ["Model input", ts.model_input_tokens],
-    ["Model output", ts.model_output_tokens],
-    ["Total model", ts.total_model_tokens],
-    ["Packet input", ts.packet_input_tokens],
-    ["Total context", ts.total_context_tokens],
-    ["Budget used", `${detail.budget.packet_tokens_used} / ${detail.budget.hard_tokens}`],
+    ["Billed tokens", billedTokens, "stat-card-primary"],
+    ["Model input", ts.model_input_tokens, ""],
+    ["Model output", ts.model_output_tokens, ""],
+    ["Total model", ts.total_model_tokens, ""],
+    ["Packet input", ts.packet_input_tokens, ""],
+    ["Total context", ts.total_context_tokens, ""],
+    ["Budget used", `${detail.budget.packet_tokens_used} / ${detail.budget.hard_tokens}`, ""],
   ];
   const row = document.getElementById("stat-cards");
   row.innerHTML = cards
     .map(
-      ([label, value]) => `
-      <div class="stat-card">
-        <div class="stat-value">${escapeHtml(String(value))}</div>
+      ([label, value, className]) => `
+      <div class="stat-card ${className}">
+        <div class="stat-value">${escapeHtml(formatTokens(value))}</div>
         <div class="stat-label">${escapeHtml(label)}</div>
       </div>`
     )
     .join("");
+}
+
+function formatTokens(value) {
+  return typeof value === "number" ? value.toLocaleString() : String(value);
 }
 
 // primitiveIndex looks up executor/phase for a primitive_id from the
