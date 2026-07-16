@@ -315,6 +315,92 @@ pub struct RunDetail {
     pub primitives: Vec<PrimitiveSpecView>,
 }
 
+/// One typed context segment inside an eval report's request manifest.
+/// Mirrors `RequestSegmentReport` in `src/commands/eval.rs`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct EvalRequestSegmentFile {
+    pub id: String,
+    pub position: i64,
+    pub role: String,
+    pub category: String,
+    pub representation: String,
+    pub producer_id: String,
+    pub producer_version: i64,
+    pub content_digest: String,
+    pub byte_size: i64,
+    pub estimated_tokens: i64,
+    pub cache_policy: String,
+}
+
+/// One request manifest inside an eval report. Mirrors `RequestReport` in
+/// `src/commands/eval.rs`, which has no `prepared_at`/`completed_at`
+/// timestamps (only `StoredRequestManifest` does).
+#[derive(Clone, Debug, Deserialize)]
+pub struct EvalRequestFile {
+    pub id: String,
+    pub step_index: i64,
+    pub node_id: Option<String>,
+    pub primitive_id: String,
+    pub primitive_version: i64,
+    pub phase: String,
+    pub model: String,
+    pub purpose: String,
+    pub status: String,
+    pub estimated_input_tokens: i64,
+    pub estimated_output_tokens: i64,
+    pub reported_input_tokens: Option<i64>,
+    pub reported_output_tokens: Option<i64>,
+    pub billed: bool,
+    pub error_summary: Option<String>,
+    pub latency_ms: Option<i64>,
+    pub segments: Vec<EvalRequestSegmentFile>,
+    pub comparison: Option<ContextCompilationComparison>,
+}
+
+impl EvalRequestFile {
+    fn into_view(self) -> RequestManifestView {
+        RequestManifestView {
+            id: self.id,
+            step_index: self.step_index,
+            node_id: self.node_id,
+            primitive_id: self.primitive_id,
+            primitive_version: self.primitive_version,
+            phase: self.phase,
+            model: self.model,
+            purpose: self.purpose,
+            status: self.status,
+            estimated_input_tokens: self.estimated_input_tokens,
+            estimated_output_tokens: self.estimated_output_tokens,
+            reported_input_tokens: self.reported_input_tokens,
+            reported_output_tokens: self.reported_output_tokens,
+            billed: self.billed,
+            error_summary: self.error_summary,
+            latency_ms: self.latency_ms,
+            prepared_at: String::new(),
+            completed_at: None,
+            segments: self
+                .segments
+                .into_iter()
+                .map(|segment| RequestManifestSegmentView {
+                    segment_id: segment.id,
+                    position: segment.position,
+                    role: segment.role,
+                    category: segment.category,
+                    representation: segment.representation,
+                    producer_id: segment.producer_id,
+                    producer_version: segment.producer_version,
+                    content_digest: segment.content_digest,
+                    dependency_digests_json: "{}".to_string(),
+                    byte_size: segment.byte_size,
+                    estimated_tokens: segment.estimated_tokens,
+                    cache_policy: segment.cache_policy,
+                })
+                .collect(),
+            comparison: self.comparison,
+        }
+    }
+}
+
 /// Deserialize mirror of the private `EvalReport` written by `haycut eval
 /// run` (see `src/commands/eval.rs`). Kept separate from `EvalReport` itself
 /// so the eval writer isn't coupled to the viewer's needs.
@@ -336,6 +422,10 @@ pub struct EvalReportFile {
     pub route: Vec<RouteEntry>,
     #[serde(default)]
     pub workflow: Workflow,
+    #[serde(default)]
+    pub workflow_spec: Option<WorkflowSpecView>,
+    #[serde(default)]
+    pub requests: Vec<EvalRequestFile>,
     #[serde(default)]
     pub terminal_reason: Option<crate::commands::agent::StopReason>,
     pub budget: BudgetView,
@@ -382,8 +472,8 @@ impl EvalReportFile {
             pending_approval: None,
             messages: Vec::new(),
             available_context: Vec::new(),
-            workflow_spec: None,
-            manifests: Vec::new(),
+            workflow_spec: self.workflow_spec,
+            manifests: self.requests.into_iter().map(EvalRequestFile::into_view).collect(),
             primitives: primitive_registry_view(),
         }
     }
@@ -603,4 +693,58 @@ fn aggregate_model_usage(steps: &[StepView]) -> Vec<ModelUsageView> {
     }
 
     usage
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_report_file_surfaces_requests_and_workflow_spec() {
+        let json = r#"{
+            "case": "example_rs",
+            "started_at": "2026-07-16T00:00:00Z",
+            "goal": "fix it",
+            "verify": "cargo test",
+            "max_steps": 10,
+            "budget": {"packet_tokens_used": 0, "soft_tokens": 100, "hard_tokens": 200, "max_tokens": null},
+            "token_summary": {"packet_input_tokens": 0, "model_input_tokens": 0, "model_output_tokens": 0, "total_model_tokens": 0, "total_context_tokens": 0},
+            "overall": "pass",
+            "workflow_spec": {
+                "schema_version": 1,
+                "compiler_version": "v1",
+                "entrypoints": ["n1"],
+                "nodes": []
+            },
+            "requests": [
+                {
+                    "id": "req1",
+                    "step_index": 0,
+                    "node_id": null,
+                    "primitive_id": "plan_patch",
+                    "primitive_version": 1,
+                    "phase": "patch",
+                    "model": "strong",
+                    "purpose": "patch_generation",
+                    "status": "completed",
+                    "estimated_input_tokens": 10,
+                    "estimated_output_tokens": 5,
+                    "reported_input_tokens": null,
+                    "reported_output_tokens": null,
+                    "billed": true,
+                    "error_summary": null,
+                    "latency_ms": null,
+                    "segments": [],
+                    "comparison": null
+                }
+            ]
+        }"#;
+
+        let file: EvalReportFile = serde_json::from_str(json).expect("deserializes");
+        let detail = file.into_detail("run-1".to_string());
+
+        assert!(detail.workflow_spec.is_some());
+        assert_eq!(detail.manifests.len(), 1);
+        assert_eq!(detail.manifests[0].id, "req1");
+    }
 }

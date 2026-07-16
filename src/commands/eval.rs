@@ -614,6 +614,7 @@ pub struct EvalReport {
     max_steps: usize,
     route: Vec<RouteEntry>,
     workflow: crate::commands::agent::workflow::Workflow,
+    workflow_spec: crate::commands::agent::workflow_spec::WorkflowSpec,
     terminal_reason: Option<crate::commands::agent::StopReason>,
     budget: BudgetReport,
     token_summary: TokenSummary,
@@ -638,7 +639,7 @@ pub fn build_report(
     let overall = overall_verdict(&checks);
 
     EvalReport {
-        schema_version: 2,
+        schema_version: 3,
         case: case.name.clone(),
         started_at: started_at.to_rfc3339(),
         finished_at: Utc::now().to_rfc3339(),
@@ -648,6 +649,9 @@ pub fn build_report(
         max_steps: case.max_steps,
         route: evidence.task.route.clone(),
         workflow: evidence.task.workflow.clone(),
+        workflow_spec: evidence.task.workflow_spec.clone().unwrap_or_else(|| {
+            crate::commands::agent::workflow_spec::compile_compatibility_spec(&evidence.task)
+        }),
         terminal_reason: evidence.task.terminal_reason,
         budget: BudgetReport {
             packet_tokens_used: evidence.task.budget.packet_tokens_used,

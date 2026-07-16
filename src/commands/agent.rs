@@ -753,10 +753,62 @@ fn execute_select_context(task: &mut task::TaskState, step_index: usize) -> io::
         }
     }
 
+    let eager_summary = maybe_eager_load_context(task);
+
     Ok(StepResult {
-        summary: format!("surfaced available off-site context: {listing}"),
+        summary: eager_summary.unwrap_or_else(|| {
+            format!("surfaced available off-site context: {listing}")
+        }),
         terminal: false,
     })
+}
+
+/// Bound on how many relevant candidates the eager-load gate will pull
+/// deterministically before generating a patch. Reuses `MAX_CANDIDATES`'s
+/// scale — a small, weak-model-confident set is cheap to just load rather
+/// than hand back to a strong `plan_context` call to re-decide.
+const EAGER_CONTEXT_MAX: usize = 3;
+
+/// If `SelectContext` surfaced a small, confident, in-budget set of relevant
+/// candidates, pull them all in immediately and queue `PlanPatch` — skipping
+/// the strong `plan_context` hop that would otherwise just re-decide what the
+/// weak ranking already confidently decided. Falls through to the normal
+/// `PlanContext` path (by leaving `pending_agent_action` untouched) when the
+/// set is large, low-confidence (`relevant` all `None`), or over budget.
+fn maybe_eager_load_context(task: &mut task::TaskState) -> Option<String> {
+    let relevant_ids: Vec<String> = task
+        .available_context
+        .iter()
+        .filter(|candidate| candidate.relevant == Some(true))
+        .map(|candidate| candidate.id.clone())
+        .collect();
+
+    if relevant_ids.is_empty() || relevant_ids.len() > EAGER_CONTEXT_MAX {
+        return None;
+    }
+
+    let combined_tokens: usize = task
+        .available_context
+        .iter()
+        .filter(|candidate| relevant_ids.contains(&candidate.id))
+        .map(|candidate| estimate_tokens(candidate.body.as_bytes()))
+        .sum();
+    if combined_tokens > CANDIDATE_LISTING_TOKEN_BUDGET {
+        return None;
+    }
+
+    let mut pulled = Vec::new();
+    for id in &relevant_ids {
+        if let Ok(result) = execute_pull_context(task, id) {
+            pulled.push(result.summary);
+        }
+    }
+    task.pending_agent_action = Some(AgentAction::PlanPatch);
+
+    Some(format!(
+        "eager-loaded confident context ({}); queued plan_patch",
+        pulled.join(", ")
+    ))
 }
 
 /// Build a `CodeGraph` over the workspace and traverse call edges from the
@@ -3224,6 +3276,74 @@ mod tests {
                 .iter()
                 .map(|c| (&c.symbol, &c.path))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn context_candidate(id: &str, relevant: Option<bool>, body: &str) -> task::AvailableContext {
+        task::AvailableContext {
+            id: id.to_string(),
+            symbol: format!("symbol_{id}"),
+            path: "src/lib.rs".to_string(),
+            start_line: 1,
+            body: body.to_string(),
+            file_digest: None,
+            relevant,
+        }
+    }
+
+    #[test]
+    fn eager_load_pulls_small_confident_set_and_queues_plan_patch() {
+        let mut task = task_fixture();
+        task.available_context = vec![
+            context_candidate("c1", Some(true), "fn apply_bulk_discount() {}"),
+            context_candidate("c2", Some(false), "fn unrelated() {}"),
+        ];
+
+        let summary = maybe_eager_load_context(&mut task);
+
+        assert!(summary.is_some());
+        assert_eq!(task.pending_agent_action, Some(AgentAction::PlanPatch));
+        // The relevant candidate was pulled (removed from available_context)
+        // and turned into an observation; the irrelevant one is left alone.
+        assert!(!task.available_context.iter().any(|c| c.id == "c1"));
+        assert!(task.available_context.iter().any(|c| c.id == "c2"));
+        assert!(
+            task.observations
+                .iter()
+                .any(|obs| obs.source == PULLED_CONTEXT_SOURCE)
+        );
+    }
+
+    #[test]
+    fn eager_load_skips_when_no_relevant_candidates() {
+        let mut task = task_fixture();
+        task.available_context = vec![
+            context_candidate("c1", None, "fn maybe() {}"),
+            context_candidate("c2", Some(false), "fn unrelated() {}"),
+        ];
+
+        let summary = maybe_eager_load_context(&mut task);
+
+        assert!(summary.is_none());
+        assert_eq!(task.pending_agent_action, None);
+        assert_eq!(task.available_context.len(), 2);
+    }
+
+    #[test]
+    fn eager_load_skips_when_relevant_set_too_large() {
+        let mut task = task_fixture();
+        task.available_context = (1..=EAGER_CONTEXT_MAX + 1)
+            .map(|n| context_candidate(&format!("c{n}"), Some(true), "fn f() {}"))
+            .collect();
+
+        let summary = maybe_eager_load_context(&mut task);
+
+        assert!(summary.is_none());
+        assert_eq!(task.pending_agent_action, None);
+        assert_eq!(
+            task.available_context.len(),
+            EAGER_CONTEXT_MAX + 1,
+            "nothing should be pulled when the relevant set exceeds the threshold"
         );
     }
 }
