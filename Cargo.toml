@@ -26,6 +26,7 @@ uuid = { version = "1.10.0", features = ["v4"] }
 tiny_http = "0.12.0"
 ratatui = "0.30"
 crossterm = "0.29"
+unicode-width = "0.2"
 
 [features]
 test-utils = []
