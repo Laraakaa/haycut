@@ -23,6 +23,8 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23"
 uuid = { version = "1.10.0", features = ["v4"] }
 tiny_http = "0.12.0"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [features]
 test-utils = []
